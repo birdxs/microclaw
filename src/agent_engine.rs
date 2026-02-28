@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::embedding::EmbeddingProvider;
 use crate::hooks::HookOutcome;
@@ -475,11 +475,25 @@ pub(crate) async fn process_with_agent_impl(
     event_tx: Option<&UnboundedSender<AgentEvent>>,
 ) -> anyhow::Result<String> {
     let chat_id = context.chat_id;
+    let request_start = std::time::Instant::now();
+    info!(
+        chat_id,
+        channel = context.caller_channel,
+        chat_type = context.chat_type,
+        has_override_prompt = override_prompt.is_some(),
+        has_image = image_data.is_some(),
+        "Agent request started"
+    );
 
     if let Some(reply) =
         maybe_handle_explicit_memory_command(state, chat_id, override_prompt, image_data.clone())
             .await?
     {
+        info!(
+            chat_id,
+            fast_path = "explicit_memory",
+            "Agent request completed via fast path"
+        );
         return Ok(reply);
     }
 
@@ -493,6 +507,7 @@ pub(crate) async fn process_with_agent_impl(
 
         if session_messages.is_empty() {
             // Corrupted session, fall back to DB history
+            info!(chat_id, "Session corrupted, falling back to DB history");
             load_messages_from_db(state, chat_id, context.chat_type, context.caller_channel).await?
         } else {
             // Get new user messages since session was last saved
@@ -501,6 +516,12 @@ pub(crate) async fn process_with_agent_impl(
                 db.get_new_user_messages_since(chat_id, &updated_at_cloned)
             })
             .await?;
+            info!(
+                chat_id,
+                session_messages = session_messages.len(),
+                new_messages = new_msgs.len(),
+                "Session resumed"
+            );
             for stored_msg in &new_msgs {
                 if run_control::is_aborted_source_message(
                     context.caller_channel,
@@ -534,6 +555,7 @@ pub(crate) async fn process_with_agent_impl(
         }
     } else {
         // No session — build from DB history
+        info!(chat_id, "No existing session, building from DB history");
         load_messages_from_db(state, chat_id, context.chat_type, context.caller_channel).await?
     };
 
@@ -592,6 +614,7 @@ pub(crate) async fn process_with_agent_impl(
         &memory_context,
         chat_id,
         &skills_catalog,
+        &state.config.timezone,
         soul_content.as_deref(),
     );
     let plugin_context = crate::plugins::collect_plugin_context_injections(
@@ -602,6 +625,15 @@ pub(crate) async fn process_with_agent_impl(
     )
     .await;
     append_plugin_context_sections(&mut system_prompt, &plugin_context);
+
+    debug!(
+        chat_id,
+        system_prompt_len = system_prompt.len(),
+        memory_context_len = memory_context.len(),
+        skills_catalog_len = skills_catalog.len(),
+        plugin_context_len = plugin_context.len(),
+        "System prompt constructed"
+    );
 
     // If image_data is present, convert the last user message to a blocks-based message with the image
     if let Some((base64_data, media_type)) = image_data {
@@ -633,6 +665,7 @@ pub(crate) async fn process_with_agent_impl(
 
     // Compact if messages exceed threshold
     if messages.len() > state.config.max_session_messages {
+        let msg_count_before = messages.len();
         archive_conversation(
             &state.config.data_dir,
             context.caller_channel,
@@ -647,6 +680,12 @@ pub(crate) async fn process_with_agent_impl(
             state.config.compact_keep_recent,
         )
         .await;
+        info!(
+            chat_id,
+            messages_before = msg_count_before,
+            messages_after = messages.len(),
+            "Context compacted"
+        );
     }
 
     let tool_defs = state.tools.definitions().to_vec();
@@ -768,11 +807,19 @@ pub(crate) async fn process_with_agent_impl(
         }
 
         let stop_reason = response.stop_reason.as_deref().unwrap_or("end_turn");
+        let (in_tok, out_tok) = response
+            .usage
+            .as_ref()
+            .map(|u| (u.input_tokens, u.output_tokens))
+            .unwrap_or((0, 0));
+
         info!(
-            "Agent iteration {} stop_reason={} chat_id={}",
-            iteration + 1,
+            chat_id,
+            iteration = iteration + 1,
             stop_reason,
-            chat_id
+            input_tokens = in_tok,
+            output_tokens = out_tok,
+            "Agent iteration completed"
         );
 
         if stop_reason == "end_turn" || stop_reason == "max_tokens" {
@@ -785,6 +832,15 @@ pub(crate) async fn process_with_agent_impl(
                 })
                 .collect::<Vec<_>>()
                 .join("");
+
+            if text.contains("<think>") {
+                let stripped_len = strip_thinking(&text).len();
+                let thinking_chars = text.len().saturating_sub(stripped_len);
+                debug!(
+                    chat_id,
+                    thinking_chars, "AI thinking content received at end of turn"
+                );
+            }
 
             // Strip <think> blocks unless show_thinking is enabled
             let display_text = if state.config.show_thinking {
@@ -858,6 +914,14 @@ pub(crate) async fn process_with_agent_impl(
                     text: final_text.clone(),
                 });
             }
+            info!(
+                chat_id,
+                channel = context.caller_channel,
+                iterations = iteration + 1,
+                duration_ms = request_start.elapsed().as_millis(),
+                response_len = final_text.len(),
+                "Agent request completed"
+            );
             return Ok(final_text);
         }
 
@@ -867,6 +931,14 @@ pub(crate) async fn process_with_agent_impl(
                 .iter()
                 .filter_map(|block| match block {
                     ResponseContentBlock::Text { text } => {
+                        if text.contains("<think>") {
+                            let stripped_len = strip_thinking(text).len();
+                            let thinking_chars = text.len().saturating_sub(stripped_len);
+                            debug!(
+                                chat_id,
+                                thinking_chars, "AI thinking content received during tool use turn"
+                            );
+                        }
                         Some(ContentBlock::Text { text: text.clone() })
                     }
                     ResponseContentBlock::ToolUse { id, name, input } => {
@@ -938,7 +1010,12 @@ pub(crate) async fn process_with_agent_impl(
                             input: effective_input.clone(),
                         });
                     }
-                    info!("Executing tool: {} (iteration {})", name, iteration + 1);
+                    info!(
+                        chat_id,
+                        tool = %name,
+                        iteration = iteration + 1,
+                        "Executing tool"
+                    );
                     let started = std::time::Instant::now();
                     let mut executed_input = effective_input.clone();
                     let mut result = state
@@ -1052,9 +1129,11 @@ pub(crate) async fn process_with_agent_impl(
                             result.content.clone()
                         };
                         warn!(
-                            "Tool '{}' failed (iteration {}): {}",
-                            name,
-                            iteration + 1,
+                            chat_id,
+                            tool = %name,
+                            iteration = iteration + 1,
+                            error_type = ?result.error_type,
+                            "Tool execution failed: {}",
                             preview
                         );
                     }
@@ -1420,8 +1499,19 @@ pub(crate) fn build_system_prompt(
     memory_context: &str,
     chat_id: i64,
     skills_catalog: &str,
+    configured_timezone: &str,
     soul_content: Option<&str>,
 ) -> String {
+    let now_utc = chrono::Utc::now();
+    let tz_label = configured_timezone
+        .parse::<chrono_tz::Tz>()
+        .map(|tz| tz.to_string())
+        .unwrap_or_else(|_| "UTC".to_string());
+    let now_local = configured_timezone
+        .parse::<chrono_tz::Tz>()
+        .map(|tz| now_utc.with_timezone(&tz).to_rfc3339())
+        .unwrap_or_else(|_| now_utc.to_rfc3339());
+
     // If a SOUL.md is provided, use it as the identity preamble instead of the default
     let identity = if let Some(soul) = soul_content {
         format!(
@@ -1447,6 +1537,9 @@ You have access to the following capabilities:
 - Search file contents using regex (`grep`)
 - Read and write persistent memory (`memory_read`, `memory_write`)
 - Search the web (`web_search`) and fetch web pages (`web_fetch`)
+- Get current date/time with timezone awareness (`get_current_time`)
+- Compare two timestamps and compute their delta (`compare_time`)
+- Evaluate basic arithmetic expressions (`calculate`)
 - Send messages mid-conversation (`send_message`) — use this to send intermediate updates
 - Schedule tasks (`schedule_task`, `list_scheduled_tasks`, `pause/resume/cancel_scheduled_task`, `get_task_history`)
 - Export chat history to markdown (`export_chat`)
@@ -1471,6 +1564,10 @@ Example of what TO do:
 
 The current chat_id is {chat_id}. Use this when calling send_message, schedule, export_chat, memory(chat scope), or todo tools.
 Permission model: you may only operate on the current chat unless this chat is configured as a control chat. If you try cross-chat operations without permission, tools will return a permission error.
+Current runtime time context:
+- configured_timezone: {tz_label}
+- current_local_time: {now_local}
+- current_utc_time: {now_utc}
 
 For complex, multi-step tasks: use todo_write to create a plan first, then execute each step and update the todo list as you go. This helps you stay organized and lets the user see progress.
 
@@ -1496,12 +1593,16 @@ Execution reliability requirements:
 Built-in execution playbook:
 - For actionable requests (send/capture/create/update/run), prefer tool execution over capability discussion.
 - For simple, low-risk, read-only requests (for example: current time, weather, exchange rates, stock quotes, schedules), if a tool can provide the answer, call the tool immediately and return the result directly.
+- For time/date requests, always prefer `get_current_time` and report both local timezone time and UTC when relevant.
+- For time comparison or "how long until/since" requests, use `compare_time` instead of guessing.
+- For numeric calculation requests, use `calculate` for arithmetic instead of mental math.
 - Do not ask confirmation questions like "Want me to check?" before calling a tool for simple read-only requests.
 - Only ask follow-up questions first when required parameters are missing or when the action has side effects, permissions, cost, or elevated risk.
 - Apply the same behavior across Telegram/Discord/Web unless a tool returns a channel-specific error.
 - Do not answer with "I can't from this runtime" unless a concrete tool attempt failed in this turn.
 - Always prefer absolute paths for files passed between tools (especially attachment_path).
 - For bash/file tools, treat the current chat working directory as the default workspace. Prefer relative paths under that workspace and avoid `/tmp` unless the user explicitly asks for it.
+- For coding tasks, follow this loop: inspect code (`read_file`/`grep`/`glob`) -> edit (`edit_file`/`write_file`) -> validate (`bash` tests/build) -> summarize concrete changes/results.
 - If you will call any tool or activate any skill in this turn, you must start by calling todo_write to create a concise task list before the first tool/skill call.
 - This requirement includes activate_skill: plan the work in todo_write first, then activate and execute.
 - If no tools/skills are needed, do not create a todo list.
@@ -2570,7 +2671,8 @@ mod tests {
     #[test]
     fn test_build_system_prompt_with_soul() {
         let soul = "I am a friendly pirate assistant. I speak in pirate lingo and love adventure.";
-        let prompt = super::build_system_prompt("testbot", "telegram", "", 42, "", Some(soul));
+        let prompt =
+            super::build_system_prompt("testbot", "telegram", "", 42, "", "UTC", Some(soul));
         assert!(prompt.contains("<soul>"));
         assert!(prompt.contains("pirate"));
         assert!(prompt.contains("</soul>"));
@@ -2581,14 +2683,14 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_without_soul() {
-        let prompt = super::build_system_prompt("testbot", "telegram", "", 42, "", None);
+        let prompt = super::build_system_prompt("testbot", "telegram", "", 42, "", "UTC", None);
         assert!(!prompt.contains("<soul>"));
         assert!(prompt.contains("a helpful AI assistant across chat channels"));
     }
 
     #[test]
     fn test_build_system_prompt_mentions_direct_tool_calls_for_simple_read_only_requests() {
-        let prompt = super::build_system_prompt("testbot", "telegram", "", 42, "", None);
+        let prompt = super::build_system_prompt("testbot", "telegram", "", 42, "", "UTC", None);
         assert!(prompt.contains("simple, low-risk, read-only requests"));
         assert!(prompt.contains("call the tool immediately and return the result directly"));
         assert!(prompt.contains("Do not ask confirmation questions"));
@@ -2596,7 +2698,7 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_prefers_chat_working_dir_over_tmp() {
-        let prompt = super::build_system_prompt("testbot", "telegram", "", 42, "", None);
+        let prompt = super::build_system_prompt("testbot", "telegram", "", 42, "", "UTC", None);
         assert!(prompt.contains("current chat working directory"));
         assert!(prompt.contains("avoid `/tmp` unless the user explicitly asks for it"));
     }
@@ -2655,7 +2757,7 @@ mod tests {
 
     #[test]
     fn test_append_plugin_context_sections_splits_prompt_and_documents() {
-        let mut prompt = super::build_system_prompt("testbot", "web", "", 1, "", None);
+        let mut prompt = super::build_system_prompt("testbot", "web", "", 1, "", "UTC", None);
         let injections = vec![
             crate::plugins::PluginContextInjection {
                 plugin_name: "p1".to_string(),
