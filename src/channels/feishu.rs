@@ -1529,41 +1529,41 @@ async fn run_ws_connection(
 
                 let msg_type = frame.header("type").unwrap_or("").to_string();
 
-                if frame.method == FRAME_METHOD_DATA && msg_type == MSG_TYPE_EVENT {
-                    // Parse event payload
-                    let payload_str = String::from_utf8_lossy(&frame.payload).to_string();
-                    let event: serde_json::Value = match serde_json::from_str(&payload_str) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!("Feishu WS: failed to parse event payload: {e}");
-                            // Still send ACK
-                            send_ack(&write, &frame).await;
-                            continue;
-                        }
-                    };
-
-                    // Send ACK immediately
+                if frame.method == FRAME_METHOD_DATA {
+                    // ACK every DATA frame immediately to avoid server retries.
                     send_ack(&write, &frame).await;
 
-                    // Dispatch message handling
-                    let state = app_state.clone();
-                    let bot_id = bot_open_id.to_string();
-                    let cfg = feishu_cfg.clone();
-                    let base = base_url.to_string();
-                    let runtime_ctx = runtime.clone();
-                    let client_clone = http_client.clone();
-                    tokio::spawn(async move {
-                        handle_feishu_event(
-                            state,
-                            client_clone,
-                            runtime_ctx,
-                            &cfg,
-                            &base,
-                            &bot_id,
-                            &event,
-                        )
-                        .await;
-                    });
+                    if msg_type == MSG_TYPE_EVENT {
+                        // Parse event payload
+                        let payload_str = String::from_utf8_lossy(&frame.payload).to_string();
+                        let event: serde_json::Value = match serde_json::from_str(&payload_str) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!("Feishu WS: failed to parse event payload: {e}");
+                                continue;
+                            }
+                        };
+
+                        // Dispatch message handling
+                        let state = app_state.clone();
+                        let bot_id = bot_open_id.to_string();
+                        let cfg = feishu_cfg.clone();
+                        let base = base_url.to_string();
+                        let runtime_ctx = runtime.clone();
+                        let client_clone = http_client.clone();
+                        tokio::spawn(async move {
+                            handle_feishu_event(
+                                state,
+                                client_clone,
+                                runtime_ctx,
+                                &cfg,
+                                &base,
+                                &bot_id,
+                                &event,
+                            )
+                            .await;
+                        });
+                    }
                 } else if frame.method == FRAME_METHOD_CONTROL {
                     // pong or other control frames — no action needed
                 }
@@ -1587,22 +1587,25 @@ async fn run_ws_connection(
 }
 
 async fn send_ack(write: &WsSink, request_frame: &pb::Frame) {
-    let resp_payload = serde_json::json!({ "StatusCode": 0 }).to_string();
+    // Feishu long-connection ACK payload follows HTTP semantics in official SDKs:
+    // {"code":200}. Returning {"code":0} can be treated as failed delivery.
+    let resp_payload = serde_json::json!({ "code": 200 }).to_string();
+    let headers: Vec<pb::Header> = request_frame
+        .headers
+        .iter()
+        .map(|h| pb::Header {
+            key: h.key.clone(),
+            value: h.value.clone(),
+        })
+        .collect();
     let ack_frame = pb::Frame {
         seq_id: request_frame.seq_id,
         log_id: request_frame.log_id,
         service: request_frame.service,
         method: request_frame.method,
-        headers: request_frame
-            .headers
-            .iter()
-            .map(|h| pb::Header {
-                key: h.key.clone(),
-                value: h.value.clone(),
-            })
-            .collect(),
-        payload_encoding: String::new(),
-        payload_type: String::new(),
+        headers,
+        payload_encoding: request_frame.payload_encoding.clone(),
+        payload_type: request_frame.payload_type.clone(),
         payload: resp_payload.into_bytes(),
         log_id_new: request_frame.log_id_new.clone(),
     };
