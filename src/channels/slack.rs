@@ -233,6 +233,14 @@ fn slack_chat_title(channel: &str, thread_ts: Option<&str>) -> String {
     }
 }
 
+fn should_skip_slack_message_subtype(subtype: Option<&str>) -> bool {
+    match subtype {
+        None => false,
+        Some("thread_broadcast") | Some("reply_broadcast") => false,
+        Some(_) => true,
+    }
+}
+
 impl SlackAdapter {
     pub fn new(name: String, bot_token: String) -> Self {
         SlackAdapter {
@@ -576,8 +584,9 @@ async fn run_socket_mode(
                     if event_type == "message" || event_type == "app_mention" {
                         let event = &envelope["payload"]["event"];
 
-                        // Skip bot messages, message_changed, etc.
-                        if event.get("subtype").is_some() {
+                        // Skip system/edit variants, but keep user-visible thread broadcasts.
+                        let subtype = event.get("subtype").and_then(|v| v.as_str());
+                        if should_skip_slack_message_subtype(subtype) {
                             continue;
                         }
                         // Skip messages from ourselves
@@ -923,5 +932,18 @@ commands:
     fn test_slack_chat_id_and_title_ignore_blank_thread_ts() {
         assert_eq!(slack_external_chat_id("D123", Some("   ")), "D123");
         assert_eq!(slack_chat_title("D123", Some("   ")), "slack-D123");
+    }
+
+    #[test]
+    fn test_should_skip_slack_message_subtype_allows_thread_broadcast_variants() {
+        assert!(!should_skip_slack_message_subtype(None));
+        assert!(!should_skip_slack_message_subtype(Some("thread_broadcast")));
+        assert!(!should_skip_slack_message_subtype(Some("reply_broadcast")));
+    }
+
+    #[test]
+    fn test_should_skip_slack_message_subtype_skips_other_variants() {
+        assert!(should_skip_slack_message_subtype(Some("message_changed")));
+        assert!(should_skip_slack_message_subtype(Some("bot_message")));
     }
 }
