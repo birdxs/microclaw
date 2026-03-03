@@ -69,8 +69,7 @@ download_release_json() {
 extract_asset_url() {
   # Match assets like:
   #   microclaw-0.0.5-aarch64-apple-darwin.tar.gz
-  #   microclaw-v0.0.5-aarch64-unknown-linux-gnu.tar.gz
-  # and keep fallback matching looser suffixes.
+  #   microclaw-0.0.5-aarch64-linux-gnu.tar.gz
   local release_json="$1"
   local os="$2"
   local arch="$3"
@@ -78,7 +77,7 @@ extract_asset_url() {
 
   case "$os" in
     darwin) os_regex="apple-darwin|darwin" ;;
-    linux) os_regex="unknown-linux-gnu|unknown-linux-musl|linux" ;;
+    linux) os_regex="linux-gnu|linux-musl|linux" ;;
     *)
       err "Unsupported OS for release matching: $os"
       return 1
@@ -97,7 +96,7 @@ extract_asset_url() {
   printf '%s\n' "$release_json" \
     | grep -Eo 'https://[^"]+' \
     | grep '/releases/download/' \
-    | grep -E "/${BIN_NAME}-v?[0-9]+\.[0-9]+\.[0-9]+-.*(apple-darwin|unknown-linux-gnu|unknown-linux-musl|pc-windows-msvc)\.(tar\.gz|zip)$" \
+    | grep -E "/${BIN_NAME}-[0-9]+\.[0-9]+\.[0-9]+-.*(apple-darwin|linux-gnu|linux-musl|windows-msvc)\.(tar\.gz|zip)$" \
     | grep -Ei "(${arch_regex}).*(${os_regex})|(${os_regex}).*(${arch_regex})" \
     | head -n1
 }

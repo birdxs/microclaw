@@ -74,44 +74,6 @@ contains_digit_four() {
   [[ "$1" == *4* ]]
 }
 
-build_release_notes() {
-  local prev_tag="$1"
-  local new_tag="$2"
-  local out_file="$3"
-  local compare_url="https://github.com/$GITHUB_REPO/compare"
-  local changes
-
-  if [ -n "$prev_tag" ]; then
-    changes="$(git log --no-merges --pretty=format:'%s' "$prev_tag..HEAD" \
-      | grep -vE '^bump version to ' \
-      | head -n 30 || true)"
-  else
-    changes="$(git log --no-merges --pretty=format:'%s' \
-      | grep -vE '^bump version to ' \
-      | head -n 30 || true)"
-  fi
-
-  {
-    echo "MicroClaw $new_tag"
-    echo
-    echo "## Change log"
-    if [ -n "$changes" ]; then
-      while IFS= read -r line; do
-        [ -n "$line" ] && echo "- $line"
-      done <<< "$changes"
-    else
-      echo "- Internal maintenance and release packaging updates"
-    fi
-    echo
-    echo "## Compare"
-    if [ -n "$prev_tag" ]; then
-      echo "$compare_url/$prev_tag...$new_tag"
-    else
-      echo "N/A (first tagged release)"
-    fi
-  } > "$out_file"
-}
-
 require_cmd cargo
 require_cmd git
 require_cmd gh

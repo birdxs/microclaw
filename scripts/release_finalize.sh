@@ -93,6 +93,28 @@ wait_for_ci_success() {
   return 1
 }
 
+previous_release_tag() {
+  local current_tag="$1"
+  git tag --list 'v*' --sort=-version:refname | awk -v current="$current_tag" '$0 != current { print; exit }'
+}
+
+write_generated_release_notes() {
+  local repo="$1"
+  local tag="$2"
+  local previous_tag="$3"
+  local notes_file="$4"
+  local args=(
+    gh api -X POST "repos/$repo/releases/generate-notes"
+    -f "tag_name=$tag"
+  )
+
+  if [ -n "$previous_tag" ]; then
+    args+=(-f "previous_tag_name=$previous_tag")
+  fi
+
+  "${args[@]}" --jq '.body' > "$notes_file"
+}
+
 REPO_DIR=""
 TAP_DIR=""
 TAP_REPO=""
@@ -162,15 +184,29 @@ else
   echo "Pushed tag: $TAG"
 fi
 
+PREV_TAG="$(previous_release_tag "$TAG")"
+if [ -n "$PREV_TAG" ]; then
+  echo "Generating release notes from range: $PREV_TAG..$TAG"
+else
+  echo "Generating release notes without a previous tag (first release or missing tags)"
+fi
+RELEASE_NOTES_FILE="$(mktemp)"
+trap 'rm -f "$RELEASE_NOTES_FILE"' EXIT
+write_generated_release_notes "$GITHUB_REPO" "$TAG" "$PREV_TAG" "$RELEASE_NOTES_FILE"
+
 if gh release view "$TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
-  echo "Release $TAG exists. Uploading/overwriting asset."
+  echo "Release $TAG exists. Updating notes and uploading/overwriting asset."
+  gh release edit "$TAG" \
+    --repo "$GITHUB_REPO" \
+    -t "$TAG" \
+    --notes-file "$RELEASE_NOTES_FILE"
   gh release upload "$TAG" "$TARBALL_PATH" --repo "$GITHUB_REPO" --clobber
 else
-  echo "Release $TAG does not exist. Creating release and uploading asset."
+  echo "Release $TAG does not exist. Creating release with generated notes and uploading asset."
   gh release create "$TAG" "$TARBALL_PATH" \
     --repo "$GITHUB_REPO" \
     -t "$TAG" \
-    -n "MicroClaw $TAG"
+    --notes-file "$RELEASE_NOTES_FILE"
 fi
 
 echo "Resetting tap workspace: $TAP_DIR"

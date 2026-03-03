@@ -74,11 +74,13 @@ jobs:
             os: ubuntu-latest
             bin: microclaw
             target_triple: x86_64-unknown-linux-gnu
+            asset_triple: x86_64-linux-gnu
             archive_ext: tar.gz
           - label: windows-x86_64
             os: windows-latest
             bin: microclaw.exe
             target_triple: x86_64-pc-windows-msvc
+            asset_triple: x86_64-windows-msvc
             archive_ext: zip
 
     steps:
@@ -109,7 +111,8 @@ jobs:
         if: matrix.archive_ext == 'tar.gz'
         shell: bash
         run: |
-          ASSET_NAME="microclaw-${RELEASE_TAG}-${{ matrix.target_triple }}.tar.gz"
+          RELEASE_VERSION="${RELEASE_TAG#v}"
+          ASSET_NAME="microclaw-${RELEASE_VERSION}-${{ matrix.asset_triple }}.tar.gz"
           tar -czf "$ASSET_NAME" -C target/release "${{ matrix.bin }}"
           echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
 
@@ -117,7 +120,8 @@ jobs:
         if: matrix.archive_ext == 'zip'
         shell: pwsh
         run: |
-          $assetName = "microclaw-${env:RELEASE_TAG}-${{ matrix.target_triple }}.zip"
+          $releaseVersion = $env:RELEASE_TAG -replace '^v', ''
+          $assetName = "microclaw-${releaseVersion}-${{ matrix.asset_triple }}.zip"
           Compress-Archive -Path "target/release/${{ matrix.bin }}" -DestinationPath $assetName -Force
           "ASSET_NAME=$assetName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -136,6 +140,13 @@ jobs:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
 
     steps:
+      - name: Checkout tag (full history for tag range)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -146,12 +157,36 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          PREV_TAG="$(git tag --list 'v*' --sort=-version:refname | awk -v current="${RELEASE_TAG}" '$0 != current { print; exit }')"
+          if [[ -n "${PREV_TAG}" ]]; then
+            echo "Generating release notes from range: ${PREV_TAG}..${RELEASE_TAG}"
+          else
+            echo "Generating release notes without a previous tag (first release or missing tags)"
+          fi
+
+          NOTES_FILE="$(mktemp)"
+          GENERATE_ARGS=(
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes"
+            -f "tag_name=${RELEASE_TAG}"
+          )
+          if [[ -n "${PREV_TAG}" ]]; then
+            GENERATE_ARGS+=(-f "previous_tag_name=${PREV_TAG}")
+          fi
+          "${GENERATE_ARGS[@]}" --jq '.body' > "${NOTES_FILE}"
+
           if ! gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               -t "${RELEASE_TAG}" \
-              -n "MicroClaw ${RELEASE_TAG}"
+              --notes-file "${NOTES_FILE}"
+          else
+            gh release edit "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              -t "${RELEASE_TAG}" \
+              --notes-file "${NOTES_FILE}"
           fi
+
+          rm -f "${NOTES_FILE}"
 
       - name: Upload assets
         env:
