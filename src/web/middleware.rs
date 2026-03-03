@@ -241,7 +241,7 @@ pub(super) async fn require_scope(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .is_some();
-    if state.legacy_auth_token.is_none() && !has_password {
+    if !has_password {
         #[cfg(test)]
         {
             let id = AuthIdentity {
@@ -263,23 +263,6 @@ pub(super) async fn require_scope(
     }
 
     if let Some(provided) = auth_token_from_headers(headers) {
-        if let Some(expected) = state.legacy_auth_token.as_deref() {
-            if provided == expected {
-                let id = AuthIdentity {
-                    scopes: vec![
-                        "operator.read".to_string(),
-                        "operator.write".to_string(),
-                        "operator.admin".to_string(),
-                        "operator.approvals".to_string(),
-                    ],
-                    actor: "legacy-token".to_string(),
-                };
-                if id.allows(required) {
-                    return Ok(id);
-                }
-            }
-        }
-
         let key_hash = sha256_hex(&provided);
         if let Some((key_id, scopes)) = call_blocking(state.app_state.db.clone(), move |db| {
             db.validate_api_key_hash(&key_hash)

@@ -76,9 +76,8 @@ Fields to include:
 
 ## Backward Compatibility
 
-- Keep `web_auth_token` as temporary fallback behind config switch:
-  - `auth_legacy_token_fallback = true` (default true in first release)
-- Emit startup warning when fallback path is used.
+- Legacy `web_auth_token` fallback is removed.
+- Existing configs that still include `web_auth_token` / `channels.web.auth_token` are ignored with a warning.
 
 ## Security Considerations
 
@@ -89,7 +88,7 @@ Fields to include:
 ## Migration Plan
 
 1. Create tables and indexes with idempotent migration.
-2. Deploy middleware with fallback enabled.
+2. Deploy middleware with legacy static token fallback disabled.
 3. Expose API key/session APIs.
 4. Disable fallback in a later minor release.
 

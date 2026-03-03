@@ -42,7 +42,7 @@ pub(super) async fn api_auth_set_password(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .is_some();
-    let bootstrap_mode = state.legacy_auth_token.is_none() && !has_password;
+    let bootstrap_mode = !has_password;
     let actor = if bootstrap_mode {
         let provided = bootstrap_token_from_headers(&headers).ok_or((
             StatusCode::UNAUTHORIZED,

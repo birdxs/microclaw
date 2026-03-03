@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::codex_auth::{
     codex_auth_file_has_access_token, is_openai_codex_provider, provider_allows_empty_api_key,
@@ -177,11 +178,6 @@ impl Default for ClawHubConfig {
         }
     }
 }
-fn is_local_web_host(host: &str) -> bool {
-    let h = host.trim().to_ascii_lowercase();
-    h == "127.0.0.1" || h == "localhost" || h == "::1"
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelPrice {
     pub model: String,
@@ -270,8 +266,6 @@ pub struct Config {
     pub web_host: String,
     #[serde(default = "default_web_port")]
     pub web_port: u16,
-    #[serde(default)]
-    pub web_auth_token: Option<String>,
     #[serde(default = "default_web_max_inflight_per_session")]
     pub web_max_inflight_per_session: usize,
     #[serde(default = "default_web_max_requests_per_window")]
@@ -568,7 +562,6 @@ impl Config {
             web_enabled: true,
             web_host: "127.0.0.1".into(),
             web_port: 10961,
-            web_auth_token: None,
             web_max_inflight_per_session: 2,
             web_max_requests_per_window: 8,
             web_rate_window_seconds: 10,
@@ -708,6 +701,31 @@ impl Config {
             let path_str = path.to_string_lossy().to_string();
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| MicroClawError::Config(format!("Failed to read {path_str}: {e}")))?;
+            if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                if let Some(map) = raw.as_mapping() {
+                    let old_top_level = map
+                        .get(serde_yaml::Value::String("web_auth_token".to_string()))
+                        .is_some();
+                    let old_channel_level = map
+                        .get(serde_yaml::Value::String("channels".to_string()))
+                        .and_then(|v| v.as_mapping())
+                        .and_then(|channels| {
+                            channels.get(serde_yaml::Value::String("web".to_string()))
+                        })
+                        .and_then(|v| v.as_mapping())
+                        .map(|web| {
+                            web.contains_key(serde_yaml::Value::String("auth_token".to_string()))
+                        })
+                        .unwrap_or(false);
+                    if old_top_level || old_channel_level {
+                        warn!(
+                            "Deprecated web auth token config detected in {}. \
+`web_auth_token` / `channels.web.auth_token` are ignored; migrate to operator password + API keys.",
+                            path_str
+                        );
+                    }
+                }
+            }
             let mut config: Config = serde_yaml::from_str(&content)
                 .map_err(|e| MicroClawError::Config(format!("Failed to parse {path_str}: {e}")))?;
             config.post_deserialize()?;
@@ -783,11 +801,6 @@ impl Config {
         if self.web_host.trim().is_empty() {
             self.web_host = default_web_host();
         }
-        if let Some(token) = &self.web_auth_token {
-            if token.trim().is_empty() {
-                self.web_auth_token = None;
-            }
-        }
         if let Some(provider) = &self.embedding_provider {
             let p = provider.trim().to_lowercase();
             self.embedding_provider = if p.is_empty() { None } else { Some(p) };
@@ -811,17 +824,20 @@ impl Config {
                 self.embedding_dim = None;
             }
         }
-        let web_enabled_effective = self
-            .explicit_channel_enabled("web")
-            .unwrap_or(self.web_enabled);
-        if web_enabled_effective
-            && !is_local_web_host(&self.web_host)
-            && self.web_auth_token.is_none()
+        if let Some(web_cfg) = self
+            .channels
+            .get_mut("web")
+            .and_then(|v| v.as_mapping_mut())
         {
-            return Err(MicroClawError::Config(
-                "web_auth_token is required when web channel is enabled and web_host is not local"
-                    .into(),
-            ));
+            if web_cfg
+                .remove(serde_yaml::Value::String("auth_token".to_string()))
+                .is_some()
+            {
+                warn!(
+                    "Deprecated `channels.web.auth_token` detected and ignored. \
+Use operator password + API keys for Web auth."
+                );
+            }
         }
         if self.web_max_inflight_per_session == 0 {
             self.web_max_inflight_per_session = default_web_max_inflight_per_session();
@@ -954,7 +970,6 @@ impl Config {
                         "enabled": true,
                         "host": self.web_host,
                         "port": self.web_port,
-                        "auth_token": self.web_auth_token,
                     }))
                     .unwrap(),
                 );
@@ -1773,21 +1788,24 @@ openai_compat_body_overrides_by_model:
     }
 
     #[test]
-    fn test_post_deserialize_web_non_local_requires_token() {
+    fn test_post_deserialize_web_non_local_no_token_required() {
         let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nweb_enabled: true\nweb_host: 0.0.0.0\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = config.post_deserialize().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("web_auth_token is required when web channel is enabled"));
+        config.post_deserialize().unwrap();
     }
 
     #[test]
-    fn test_post_deserialize_web_non_local_with_token_ok() {
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nweb_enabled: true\nweb_host: 0.0.0.0\nweb_auth_token: token123\n";
+    fn test_post_deserialize_web_channel_auth_token_is_removed() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nweb_enabled: true\nweb_host: 0.0.0.0\nchannels:\n  web:\n    enabled: true\n    auth_token: token123\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
-        assert_eq!(config.web_auth_token.as_deref(), Some("token123"));
+        let has_auth_token = config
+            .channels
+            .get("web")
+            .and_then(|v| v.as_mapping())
+            .map(|map| map.contains_key(serde_yaml::Value::String("auth_token".to_string())))
+            .unwrap_or(false);
+        assert!(!has_auth_token);
     }
 
     #[test]

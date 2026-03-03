@@ -164,7 +164,6 @@ function warningDocUrl(code?: string): string {
     case 'sandbox_mount_allowlist_missing':
       return `${DOCS_BASE}/configuration#sandbox`
     case 'auth_password_not_configured':
-    case 'legacy_auth_token_enabled':
     case 'web_host_not_loopback':
       return `${DOCS_BASE}/permissions`
     case 'web_rate_limit_too_high':

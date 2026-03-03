@@ -183,22 +183,10 @@ pub(super) async fn api_config_self_check(
         })
     });
 
-    if state.legacy_auth_token.is_some() {
-        warnings.push(ConfigWarning {
-            code: "legacy_auth_token_enabled",
-            severity: "medium",
-            message: "Legacy auth token is enabled. Prefer session cookie + scoped API keys."
-                .to_string(),
-        });
-    }
     if !has_password {
         warnings.push(ConfigWarning {
             code: "auth_password_not_configured",
-            severity: if state.legacy_auth_token.is_none() {
-                "high"
-            } else {
-                "medium"
-            },
+            severity: "high",
             message: "Operator password is not configured.".to_string(),
         });
     }
@@ -646,9 +634,6 @@ pub(super) async fn api_update_config(
     }
     if let Some(v) = body.web_port {
         cfg.web_port = v;
-    }
-    if let Some(v) = body.web_auth_token {
-        cfg.web_auth_token = v;
     }
     if let Some(v) = body.web_max_inflight_per_session {
         cfg.web_max_inflight_per_session = v;
