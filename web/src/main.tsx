@@ -284,7 +284,7 @@ interface DynChannelField {
   /** If true, field value is a secret (not pre-filled from server config) */
   secret: boolean
   /** Value type for payload encoding */
-  valueType?: 'string' | 'bool'
+  valueType?: 'string' | 'bool' | 'number'
 }
 interface DynChannelDef {
   /** Channel name, e.g. "slack" */
@@ -319,6 +319,8 @@ const DYNAMIC_CHANNELS: DynChannelDef[] = [
       { yamlKey: 'app_token', label: 'slack_app_token', placeholder: 'xapp-...', description: 'App-level token (xapp-) for Socket Mode connection. Leave blank to keep current secret unchanged.', secret: true },
       { yamlKey: 'bot_username', label: 'slack_bot_username', placeholder: 'slack_bot_name', description: 'Optional Slack-specific bot username override.', secret: false },
       { yamlKey: 'model', label: 'slack_model', placeholder: 'claude-sonnet-4-5-20250929', description: 'Optional Slack bot model override for this account.', secret: false },
+      { yamlKey: 'capture_unmentioned_images', label: 'slack_capture_unmentioned_images', placeholder: 'false', description: 'Capture inbound images without @mention in group channels (true/false). Default: false.', secret: false, valueType: 'bool' },
+      { yamlKey: 'inbound_image_max_mb', label: 'slack_inbound_image_max_mb', placeholder: '20', description: 'Max inbound Slack image size in MB. Default: 20.', secret: false, valueType: 'number' },
     ],
   },
   {
@@ -1105,7 +1107,20 @@ function parseOptionalBoolString(input: string, fieldName: string): boolean | nu
   throw new Error(`${fieldName} must be true/false (or 1/0)`)
 }
 
-function dynamicFieldDraftValue(raw: unknown, valueType: 'string' | 'bool' = 'string'): string {
+function parseOptionalU64String(input: string, fieldName: string): number | null {
+  const trimmed = input.trim()
+  if (!trimmed) return null
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`${fieldName} must be a non-negative integer`)
+  }
+  const parsed = Number(trimmed)
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${fieldName} must be a safe integer`)
+  }
+  return parsed
+}
+
+function dynamicFieldDraftValue(raw: unknown, valueType: 'string' | 'bool' | 'number' = 'string'): string {
   if (valueType === 'bool') {
     if (typeof raw === 'boolean') return raw ? 'true' : 'false'
     const text = String(raw || '').trim().toLowerCase()
@@ -1113,6 +1128,12 @@ function dynamicFieldDraftValue(raw: unknown, valueType: 'string' | 'bool' = 'st
     if (text === 'true' || text === '1' || text === 'yes') return 'true'
     if (text === 'false' || text === '0' || text === 'no') return 'false'
     return String(raw || '')
+  }
+  if (valueType === 'number') {
+    if (typeof raw === 'number' && Number.isFinite(raw)) return String(Math.trunc(raw))
+    const text = String(raw || '').trim()
+    if (!text) return ''
+    return text
   }
   return String(raw || '')
 }
@@ -2482,6 +2503,14 @@ function App() {
                 if (parsed !== null) {
                   fields[f.yamlKey] = parsed
                 }
+              } else if ((f.valueType || 'string') === 'number') {
+                const parsed = parseOptionalU64String(
+                  val,
+                  `${ch.name}_bot_${slot}_${f.yamlKey}`,
+                )
+                if (parsed !== null) {
+                  fields[f.yamlKey] = parsed
+                }
               } else {
                 fields[f.yamlKey] = val
               }
@@ -3652,6 +3681,9 @@ function App() {
                                         <ConfigFieldCard key={stateKey} label={`${ch.name}_bot_${slot}_${f.yamlKey}`} description={<>{f.description}</>}>
                                           <TextField.Root
                                             className="mt-2"
+                                            type={f.valueType === 'number' ? 'number' : 'text'}
+                                            min={f.valueType === 'number' ? '0' : undefined}
+                                            step={f.valueType === 'number' ? '1' : undefined}
                                             value={String(configDraft[stateKey] || '')}
                                             onChange={(e) => setConfigField(stateKey, e.target.value)}
                                             placeholder={f.placeholder}
