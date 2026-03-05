@@ -1088,8 +1088,6 @@ Thanks to everyone who has contributed to this project.
 
 [![Contributors](https://contrib.rocks/image?repo=microclaw/microclaw)](https://github.com/microclaw/microclaw/graphs/contributors)
 
-
-
 ## License
 
 MIT
