@@ -31,12 +31,28 @@ pub fn init_logging(runtime_data_dir: &str) -> Result<()> {
 }
 
 pub fn init_console_logging() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    #[cfg(feature = "journald")]
+    {
+        let use_journald = std::env::var("JOURNAL_STREAM").is_ok()
+            || std::env::var("RUST_LOG_STYLE").is_ok_and(|v| v.eq_ignore_ascii_case("systemd"));
+
+        if use_journald {
+            if let Ok(journald_layer) = tracing_journald::layer() {
+                use tracing_subscriber::layer::SubscriberExt;
+                use tracing_subscriber::util::SubscriberInitExt;
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(journald_layer)
+                    .init();
+                return;
+            }
+        }
+    }
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 #[derive(Debug)]
