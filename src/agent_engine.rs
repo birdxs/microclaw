@@ -1818,6 +1818,9 @@ When using memory tools:
 - Use 'chat' scope for chat-specific memories
 - Use 'bot' scope for bot/account-specific memories
 - Use 'global' scope for information relevant across all chats
+- Treat memory tool output as internal working context.
+- Do not paste raw memory blocks, section headers, or internal IDs to the user.
+- When memory is relevant, summarize/paraphrase naturally in your own words.
 
 For scheduling:
 - Use 6-field cron format: sec min hour dom month dow (e.g., "0 */5 * * * *" for every 5 minutes)
