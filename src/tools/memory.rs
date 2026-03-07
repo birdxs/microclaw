@@ -126,7 +126,7 @@ impl Tool for ReadMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_memory".into(),
-            description: "Read the AGENTS.md memory file. Use scope 'global' for memories shared across all chats, 'bot' for the current bot/account, or 'chat' for chat-specific memories.".into(),
+            description: "Read internal AGENTS.md memory context for reasoning. Use scope 'global' for memories shared across all chats, 'bot' for the current bot/account, or 'chat' for chat-specific memories. Do not echo raw memory blocks/IDs directly to users; summarize in natural language.".into(),
             input_schema: schema_object(
                 json!({
                     "scope": {

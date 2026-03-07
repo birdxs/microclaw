@@ -1818,6 +1818,9 @@ When using memory tools:
 - Use 'chat' scope for chat-specific memories
 - Use 'bot' scope for bot/account-specific memories
 - Use 'global' scope for information relevant across all chats
+- Treat memory tool output as internal working context.
+- Do not paste raw memory blocks, section headers, or internal IDs to the user.
+- When memory is relevant, summarize/paraphrase naturally in your own words.
 
 For scheduling:
 - Use 6-field cron format: sec min hour dom month dow (e.g., "0 */5 * * * *" for every 5 minutes)
@@ -1865,17 +1868,17 @@ Built-in execution playbook:
 "#
     );
 
-    if caller_channel.starts_with("feishu") {
+    if caller_channel.starts_with("feishu") || caller_channel.starts_with("lark") {
         prompt.push_str(
             r#"
 Feishu reaction output protocol (optional, use only when appropriate):
-- To react only (no visible text): output `reaction-only: <emoji-or-token>`.
-- To react and also send text: output:
-  `reaction: <emoji-or-token>`
-  `<reply text>`
-- You may also use `[reaction: <emoji-or-token>] <reply text>`.
-- If no reaction is needed, return normal text.
-- If the user explicitly asks "only react / no reply", prefer `reaction-only`.
+- For every Feishu or Lark message, choose exactly one of these 3 output modes:
+  1) Text only: return normal text.
+  2) Emoji only: output `reaction-only: <emoji-or-token>`.
+  3) Text + emoji: output:
+     `reaction: <emoji-or-token>`
+     `<reply text>`
+- You may also use `[reaction: <emoji-or-token>] <reply text>` for mode (3).
 - When you choose a reaction, pick only from this supported set:
   `THUMBSUP`, `THUMBSDOWN`, `CLAP`, `THANKS`, `HEART`, `BROKENHEART`, `Fire`, `PARTY`, `SMILE`, `TearsofJoy`, `SOB`, `RAGE`, `FISTBUMP`, `ROCKET`, `100`, `LetMeSee`, `OK`, `LOVE`, `HAPPY`, `WINK`, `YEAH`, `STRONG`, `TOP`, `NO1`.
 - For normal Feishu replies/reactions, do NOT call `send_message`; return the final assistant text directly so channel reaction parsing can run.
