@@ -82,6 +82,20 @@ fn subagent_runtime(config: &Config) -> Arc<SubagentRuntime> {
     runtime
 }
 
+async fn log_subagent_event(
+    db: Arc<Database>,
+    run_id: &str,
+    event_type: &str,
+    detail: Option<String>,
+) {
+    let run_id = run_id.to_string();
+    let event_type = event_type.to_string();
+    let _ = call_blocking(db, move |db| {
+        db.append_subagent_event(&run_id, &event_type, detail.as_deref())
+    })
+    .await;
+}
+
 async fn is_cancelled(
     db: Arc<Database>,
     run_id: &str,
@@ -221,6 +235,13 @@ async fn run_sub_agent_task(
                     id, name, input, ..
                 } = block
                 {
+                    log_subagent_event(
+                        db.clone(),
+                        &run_id,
+                        "tool_use",
+                        Some(format!("tool={name}")),
+                    )
+                    .await;
                     let mut tool_input = input.clone();
                     if let Some(obj) = tool_input.as_object_mut() {
                         obj.insert(
@@ -526,6 +547,13 @@ impl Tool for SessionsSpawnTool {
         {
             return ToolResult::error(format!("Failed creating subagent run: {e}"));
         }
+        log_subagent_event(
+            self.db.clone(),
+            &run_id,
+            "accepted",
+            Some(format!("depth={child_depth}")),
+        )
+        .await;
 
         let runtime = subagent_runtime(&self.config);
         let local_cancel = runtime.register_run(&run_id);
@@ -549,6 +577,7 @@ impl Tool for SessionsSpawnTool {
                 move |db| db.mark_subagent_queued(&run_id)
             })
             .await;
+            log_subagent_event(db.clone(), &run_id_async, "queued", None).await;
 
             let _permit = match runtime.semaphore.acquire().await {
                 Ok(p) => p,
@@ -574,6 +603,7 @@ impl Tool for SessionsSpawnTool {
                 move |db| db.mark_subagent_running(&run_id)
             })
             .await;
+            log_subagent_event(db.clone(), &run_id_async, "running", None).await;
 
             let timeout_secs = cfg.subagents.run_timeout_secs;
             let run_future = run_sub_agent_task(
@@ -613,6 +643,7 @@ impl Tool for SessionsSpawnTool {
                         )
                     })
                     .await;
+                    log_subagent_event(db.clone(), &run_id_for_finish, "completed", None).await;
                 }
                 Err(err) if err == "cancelled" => {
                     let rid = run_id_for_finish.clone();
@@ -627,6 +658,7 @@ impl Tool for SessionsSpawnTool {
                         )
                     })
                     .await;
+                    log_subagent_event(db.clone(), &run_id_for_finish, "cancelled", None).await;
                 }
                 Err(err) if err == "timed_out" => {
                     let rid = run_id_for_finish.clone();
@@ -641,13 +673,16 @@ impl Tool for SessionsSpawnTool {
                         )
                     })
                     .await;
+                    log_subagent_event(db.clone(), &run_id_for_finish, "timed_out", None).await;
                 }
                 Err(err) => {
                     let rid = run_id_for_finish.clone();
+                    let err_for_db = err.clone();
                     let _ = call_blocking(db.clone(), move |db| {
-                        db.mark_subagent_finished(&rid, "failed", Some(&err), None, 0, 0)
+                        db.mark_subagent_finished(&rid, "failed", Some(&err_for_db), None, 0, 0)
                     })
                     .await;
+                    log_subagent_event(db.clone(), &run_id_for_finish, "failed", Some(err)).await;
                 }
             }
 
@@ -933,6 +968,13 @@ impl Tool for SubagentsKillTool {
                     .unwrap_or(false);
                     if requested {
                         runtime.cancel_run(&row.run_id);
+                        log_subagent_event(
+                            self.db.clone(),
+                            &row.run_id,
+                            "cancel_requested",
+                            Some("kill_all".to_string()),
+                        )
+                        .await;
                         cancelled += 1;
                     }
                 }
@@ -958,6 +1000,13 @@ impl Tool for SubagentsKillTool {
             return ToolResult::error("Subagent run not found or already finished".into());
         }
         runtime.cancel_run(&run_id);
+        log_subagent_event(
+            self.db.clone(),
+            &run_id,
+            "cancel_requested",
+            Some("kill_one".to_string()),
+        )
+        .await;
         ToolResult::success(json!({"status": "ok", "run_id": run_id}).to_string())
     }
 }
@@ -966,6 +1015,95 @@ pub struct SubagentsRetryAnnouncesTool {
     config: Config,
     db: Arc<Database>,
     channel_registry: Arc<ChannelRegistry>,
+}
+
+pub struct SubagentsLogTool {
+    db: Arc<Database>,
+}
+
+impl SubagentsLogTool {
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl Tool for SubagentsLogTool {
+    fn name(&self) -> &str {
+        "subagents_log"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "subagents_log".into(),
+            description: "Get timeline events for one subagent run.".into(),
+            input_schema: schema_object(
+                json!({
+                    "run_id": {"type":"string"},
+                    "chat_id": {"type":"integer"},
+                    "limit": {"type":"integer", "minimum":1, "maximum":200}
+                }),
+                &["run_id"],
+            ),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> ToolResult {
+        let auth = match auth_context_from_input(&input) {
+            Some(v) => v,
+            None => return ToolResult::error("subagents_log requires caller auth context".into()),
+        };
+        let chat_id = input
+            .get("chat_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(auth.caller_chat_id);
+        if let Err(e) = authorize_chat_access(&input, chat_id) {
+            return ToolResult::error(e);
+        }
+        let run_id = match input.get("run_id").and_then(|v| v.as_str()) {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => return ToolResult::error("Missing required parameter: run_id".into()),
+        };
+        let run_id_for_check = run_id.clone();
+        let run_exists = match call_blocking(self.db.clone(), move |db| {
+            db.get_subagent_run(&run_id_for_check, chat_id)
+        })
+        .await
+        {
+            Ok(v) => v.is_some(),
+            Err(e) => return ToolResult::error(format!("Failed reading subagent run: {e}")),
+        };
+        if !run_exists {
+            return ToolResult::error("Subagent run not found".into());
+        }
+        let limit = input
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 200) as usize;
+        let run_id_for_events = run_id.clone();
+        let events = match call_blocking(self.db.clone(), move |db| {
+            db.list_subagent_events(&run_id_for_events, limit)
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return ToolResult::error(format!("Failed listing subagent events: {e}")),
+        };
+        let payload: Vec<serde_json::Value> = events
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "id": e.id,
+                    "run_id": e.run_id,
+                    "event_type": e.event_type,
+                    "detail": e.detail,
+                    "created_at": e.created_at
+                })
+            })
+            .collect();
+        ToolResult::success(json!({"run_id": run_id, "events": payload}).to_string())
+    }
 }
 
 impl SubagentsRetryAnnouncesTool {

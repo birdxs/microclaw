@@ -183,7 +183,7 @@ pub struct AuditLogRecord {
 pub type SessionMetaRow = (String, String, Option<String>, Option<i64>);
 pub type SessionTreeRow = (i64, Option<String>, Option<i64>, String);
 
-const SCHEMA_VERSION_CURRENT: i64 = 15;
+const SCHEMA_VERSION_CURRENT: i64 = 16;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -248,6 +248,15 @@ pub struct SubagentAnnounceRecord {
     pub attempts: i64,
     pub next_attempt_at: Option<String>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubagentEventRecord {
+    pub id: i64,
+    pub run_id: String,
+    pub event_type: String,
+    pub detail: Option<String>,
+    pub created_at: String,
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, MicroClawError> {
@@ -736,6 +745,21 @@ fn apply_schema_migrations(conn: &Connection) -> Result<(), MicroClawError> {
         )?;
         set_schema_version(conn, 15)?;
         version = 15;
+    }
+    if version < 16 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS subagent_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_subagent_events_run_created
+                ON subagent_events(run_id, created_at ASC);",
+        )?;
+        set_schema_version(conn, 16)?;
+        version = 16;
     }
     if version != SCHEMA_VERSION_CURRENT {
         set_schema_version(conn, SCHEMA_VERSION_CURRENT)?;
@@ -3904,6 +3928,47 @@ impl Database {
             params![id, status, attempts, next_attempt_at, last_error, now],
         )?;
         Ok(())
+    }
+
+    pub fn append_subagent_event(
+        &self,
+        run_id: &str,
+        event_type: &str,
+        detail: Option<&str>,
+    ) -> Result<(), MicroClawError> {
+        let conn = self.lock_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO subagent_events(run_id, event_type, detail, created_at)
+             VALUES(?1, ?2, ?3, ?4)",
+            params![run_id, event_type, detail, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_subagent_events(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SubagentEventRecord>, MicroClawError> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, event_type, detail, created_at
+             FROM subagent_events
+             WHERE run_id = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![run_id, limit.max(1) as i64], |row| {
+            Ok(SubagentEventRecord {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                event_type: row.get(2)?,
+                detail: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
 

@@ -211,6 +211,7 @@ impl ToolRegistry {
             Box::new(subagents::SubagentsListTool::new(db.clone())),
             Box::new(subagents::SubagentsInfoTool::new(db.clone())),
             Box::new(subagents::SubagentsKillTool::new(config, db.clone())),
+            Box::new(subagents::SubagentsLogTool::new(db.clone())),
             Box::new(subagents::SubagentsRetryAnnouncesTool::new(
                 config,
                 db.clone(),
@@ -346,6 +347,7 @@ impl ToolRegistry {
                     config,
                     db.clone(),
                 )));
+                tools.push(Box::new(subagents::SubagentsLogTool::new(db.clone())));
             }
         }
         ToolRegistry {
