@@ -41,6 +41,26 @@ fn subagent_runtime_meta_from_input(input: &serde_json::Value) -> Option<Subagen
     })
 }
 
+fn compute_child_token_budget(
+    requested_budget: Option<i64>,
+    parent_budget_remaining: Option<i64>,
+    configured_max: i64,
+) -> Result<i64, String> {
+    let configured_max = configured_max.clamp(2_000, 2_000_000);
+    if let Some(parent_remaining) = parent_budget_remaining {
+        if parent_remaining < 2_000 {
+            return Err(format!(
+                "subagent budget exhausted: parent remaining {} < 2000",
+                parent_remaining
+            ));
+        }
+        let desired = requested_budget.unwrap_or((parent_remaining / 2).max(2_000));
+        return Ok(desired.clamp(2_000, parent_remaining.min(configured_max)));
+    }
+    let desired = requested_budget.unwrap_or(configured_max);
+    Ok(desired.clamp(2_000, configured_max))
+}
+
 fn normalize_subagent_artifact_payload(raw_text: &str) -> (String, String) {
     let text = raw_text.trim();
     let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
@@ -616,10 +636,14 @@ impl Tool for SessionsSpawnTool {
             .get("token_budget")
             .and_then(|v| v.as_i64())
             .filter(|v| *v > 0);
-        let child_token_budget = requested_budget
-            .or_else(|| parent_budget_remaining.map(|v| (v / 2).max(2_000)))
-            .unwrap_or(self.config.subagents.max_tokens_per_run)
-            .clamp(2_000, self.config.subagents.max_tokens_per_run);
+        let child_token_budget = match compute_child_token_budget(
+            requested_budget,
+            parent_budget_remaining,
+            self.config.subagents.max_tokens_per_run,
+        ) {
+            Ok(v) => v,
+            Err(e) => return ToolResult::error(e),
+        };
 
         let db_for_count = self.db.clone();
         let active_count = match call_blocking(db_for_count, move |db| {
@@ -1429,6 +1453,7 @@ impl Tool for SubagentsSendTool {
 
         let spawn_tool =
             SessionsSpawnTool::new(&self.config, self.db.clone(), self.channel_registry.clone());
+        let remaining_budget = (parent.token_budget - parent.total_tokens).max(0);
         let spawn_input = json!({
             "task": format!("Continuation request: {message}"),
             "context": format!("This is a follow-up sent to focused run {}. Continue the work based on prior run context and produce actionable output.", focused_run),
@@ -1441,7 +1466,7 @@ impl Tool for SubagentsSendTool {
             "__subagent_runtime": {
                 "run_id": parent.run_id,
                 "depth": parent.depth,
-                "token_budget_remaining": parent.token_budget,
+                "token_budget_remaining": remaining_budget,
             }
         });
         spawn_tool.execute(spawn_input).await
@@ -1573,9 +1598,6 @@ impl Tool for SubagentsOrchestrateTool {
             .subagents
             .orchestrate_max_workers
             .min(self.config.subagents.max_children_per_run);
-        if packages.len() > max_workers {
-            packages.truncate(max_workers);
-        }
         let wait = input.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
         let wait_timeout_secs = input
             .get("wait_timeout_secs")
@@ -1587,7 +1609,30 @@ impl Tool for SubagentsOrchestrateTool {
             .and_then(|v| v.as_i64())
             .filter(|v| *v > 0)
             .unwrap_or(self.config.subagents.max_tokens_per_run);
-        let each_budget = (total_budget / packages.len() as i64).max(2_000);
+        let parent_run_id = input
+            .get("__subagent_runtime")
+            .and_then(|v| v.get("run_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let parent_meta = subagent_runtime_meta_from_input(&input);
+        let parent_remaining = parent_meta.and_then(|m| m.token_budget_remaining);
+        let total_budget = if let Some(remaining) = parent_remaining {
+            total_budget.min(remaining.max(0))
+        } else {
+            total_budget
+        };
+        if total_budget < 2_000 {
+            return ToolResult::error(format!(
+                "subagent budget exhausted for orchestration: remaining {} < 2000",
+                total_budget
+            ));
+        }
+        let max_workers_by_budget = (total_budget / 2_000).max(1) as usize;
+        let allowed_workers = max_workers.min(max_workers_by_budget).max(1);
+        if packages.len() > allowed_workers {
+            packages.truncate(allowed_workers);
+        }
+        let each_budget = (total_budget / packages.len() as i64).clamp(2_000, total_budget);
 
         let spawn_tool =
             SessionsSpawnTool::new(&self.config, self.db.clone(), self.channel_registry.clone());
@@ -1601,12 +1646,31 @@ impl Tool for SubagentsOrchestrateTool {
                 "chat_id": chat_id,
                 "token_budget": each_budget,
                 "__microclaw_auth": {
-                    "caller_channel": auth.caller_channel,
+                    "caller_channel": auth.caller_channel.clone(),
                     "caller_chat_id": chat_id,
-                    "control_chat_ids": auth.control_chat_ids,
-                    "env_files": auth.env_files,
+                    "control_chat_ids": auth.control_chat_ids.clone(),
+                    "env_files": auth.env_files.clone(),
                 }
             });
+            let spawn_input = if let (Some(meta), Some(parent_run_id)) =
+                (parent_meta, parent_run_id.as_deref())
+            {
+                let mut obj = spawn_input
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_else(serde_json::Map::new);
+                obj.insert(
+                    "__subagent_runtime".to_string(),
+                    json!({
+                        "run_id": parent_run_id,
+                        "depth": meta.depth,
+                        "token_budget_remaining": each_budget,
+                    }),
+                );
+                serde_json::Value::Object(obj)
+            } else {
+                spawn_input
+            };
             let res = spawn_tool.execute(spawn_input).await;
             if res.is_error {
                 return res;
@@ -1640,6 +1704,7 @@ impl Tool for SubagentsOrchestrateTool {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout_secs);
         let mut runs = Vec::new();
+        let mut wait_timed_out = false;
         while std::time::Instant::now() < deadline {
             let ids = spawned.clone();
             let rows = match call_blocking(self.db.clone(), move |db| {
@@ -1665,10 +1730,16 @@ impl Tool for SubagentsOrchestrateTool {
             }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+        if runs
+            .iter()
+            .any(|r| matches!(r.status.as_str(), "accepted" | "queued" | "running"))
+        {
+            wait_timed_out = true;
+        }
         let merged = Self::merge_run_artifacts(&runs);
         ToolResult::success(
             json!({
-                "status": "merged",
+                "status": if wait_timed_out { "timeout_partial" } else { "merged" },
                 "chat_id": chat_id,
                 "goal": goal,
                 "workers": spawned.len(),
@@ -1878,5 +1949,17 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("run_id"));
+    }
+
+    #[test]
+    fn test_compute_child_token_budget_respects_parent_remaining() {
+        let budget = compute_child_token_budget(Some(5000), Some(3000), 120000).unwrap();
+        assert_eq!(budget, 3000);
+    }
+
+    #[test]
+    fn test_compute_child_token_budget_rejects_exhausted_parent() {
+        let err = compute_child_token_budget(None, Some(1500), 120000).unwrap_err();
+        assert!(err.contains("budget exhausted"));
     }
 }
