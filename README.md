@@ -740,12 +740,18 @@ bot_username: "my_bot"
 # channels:
 #   telegram:
 #     default_account: "main"
+#     # optional: route group topics as separate chats via "<chat_id>:<thread_id>"
+#     # topic_routing:
+#     #   enabled: true
 #     # optional: only allow these Telegram user IDs in private chats (DM)
 #     # allowed_user_ids: [123456789]
 #     accounts:
 #       main:
 #         bot_token: "123456:ABC-DEF1234..."
 #         bot_username: "my_bot"
+#         # optional per-account topic routing override (fallback to channel-level)
+#         # topic_routing:
+#         #   enabled: false
 #         # optional per-account DM allowlist (overrides channel-level list)
 #         # allowed_user_ids: [123456789]
 #       support:
@@ -862,6 +868,8 @@ All configuration is via `microclaw.config.yaml`:
 | `channels.telegram.accounts.<id>.bot_username` | No | unset | Telegram username for a specific account (without `@`) |
 | `channels.telegram.accounts.<id>.model` | No | unset | Optional per-bot model override for that Telegram account |
 | `channels.telegram.accounts.<id>.soul_path` | No | unset | Optional per-bot SOUL file path for this Telegram account |
+| `channels.telegram.topic_routing.enabled` | No | `false` | If true, Telegram topics are routed as separate chats using `external_chat_id=<chat_id>:<thread_id>` |
+| `channels.telegram.accounts.<id>.topic_routing.enabled` | No | inherit channel-level | Optional per-account override for Telegram topic routing |
 | `channels.telegram.allowed_user_ids` | No | `[]` | Optional Telegram private chat sender allowlist at channel scope |
 | `channels.telegram.accounts.<id>.allowed_groups` | No | `[]` | Optional Telegram group allowlist scoped to one account |
 | `channels.telegram.accounts.<id>.allowed_user_ids` | No | `[]` | Optional Telegram private chat sender allowlist scoped to one account (merged with channel scope) |
