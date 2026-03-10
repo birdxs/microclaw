@@ -399,7 +399,10 @@ fn apply_config_override(path: Option<&PathBuf>) -> anyhow::Result<()> {
             .join(path)
     };
     if !resolved.exists() {
-        anyhow::bail!("--config points to non-existent file: {}", resolved.display());
+        anyhow::bail!(
+            "--config points to non-existent file: {}",
+            resolved.display()
+        );
     }
     std::env::set_var("MICROCLAW_CONFIG", &resolved);
     Ok(())
@@ -644,7 +647,12 @@ mod tests {
 
     #[test]
     fn cli_parses_global_config_option_for_start() {
-        let cli = Cli::parse_from(["microclaw", "--config", "api_test_microclaw.config.yaml", "start"]);
+        let cli = Cli::parse_from([
+            "microclaw",
+            "--config",
+            "api_test_microclaw.config.yaml",
+            "start",
+        ]);
         let config = cli
             .config
             .as_ref()

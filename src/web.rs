@@ -1511,8 +1511,7 @@ async fn api_hook_agent(
         sender_name: body.sender_name.or(body.name),
         message: body.message,
     };
-    stream::start_stream_run_with_actor(state, send, "hook:token".to_string(), "/hooks/agent")
-        .await
+    stream::start_stream_run_with_actor(state, send, "hook:token".to_string(), "/hooks/agent").await
 }
 
 async fn api_hook_wake(
@@ -1563,8 +1562,7 @@ async fn api_hook_wake(
         sender_name: Some(sender_name),
         message,
     };
-    stream::start_stream_run_with_actor(state, send, "hook:token".to_string(), "/hooks/wake")
-        .await
+    stream::start_stream_run_with_actor(state, send, "hook:token".to_string(), "/hooks/wake").await
 }
 
 async fn send_and_store_response(
@@ -1900,6 +1898,10 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/metrics", get(metrics::api_metrics))
         .route("/api/metrics/summary", get(metrics::api_metrics_summary))
         .route("/api/metrics/history", get(metrics::api_metrics_history))
+        .route(
+            "/api/subagents/observability",
+            get(metrics::api_subagents_observability),
+        )
         .route("/api/send", post(api_send))
         .route("/api/chat", post(api_send))
         .route("/api/hooks/agent", post(api_hook_agent))

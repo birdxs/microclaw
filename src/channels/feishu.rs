@@ -2936,7 +2936,8 @@ async fn handle_feishu_message(
                     .await
                     .map(|s| s.used_send_message_tool)
                     .unwrap_or(false);
-                let (visible_response, thinking_text) = split_feishu_visible_and_thinking(&response);
+                let (visible_response, thinking_text) =
+                    split_feishu_visible_and_thinking(&response);
                 if !thinking_text.is_empty() {
                     info!(
                         "Feishu: separated thinking block from visible reply ({} chars)",
@@ -2979,8 +2980,11 @@ async fn handle_feishu_message(
                             return;
                         }
                         if reaction_plan.allow_text_fallback_on_reaction_failure {
-                            let outbound =
-                                compose_feishu_outbound(app_state.config.show_thinking, &thinking_text, &visible_response);
+                            let outbound = compose_feishu_outbound(
+                                app_state.config.show_thinking,
+                                &thinking_text,
+                                &visible_response,
+                            );
                             if let Err(e) = send_feishu_response(
                                 &http_client,
                                 base_url,
@@ -3127,7 +3131,8 @@ async fn handle_feishu_message(
                         }
                     }
                 }
-                let (visible_response, thinking_text) = split_feishu_visible_and_thinking(&response);
+                let (visible_response, thinking_text) =
+                    split_feishu_visible_and_thinking(&response);
                 if !thinking_text.is_empty() {
                     info!(
                         "Feishu: separated thinking block from visible reply ({} chars)",
@@ -3170,8 +3175,11 @@ async fn handle_feishu_message(
                             return;
                         }
                         if reaction_plan.allow_text_fallback_on_reaction_failure {
-                            let outbound =
-                                compose_feishu_outbound(app_state.config.show_thinking, &thinking_text, &visible_response);
+                            let outbound = compose_feishu_outbound(
+                                app_state.config.show_thinking,
+                                &thinking_text,
+                                &visible_response,
+                            );
                             if let Err(e) = send_feishu_response(
                                 &http_client,
                                 base_url,
