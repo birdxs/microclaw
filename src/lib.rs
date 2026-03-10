@@ -1,4 +1,5 @@
 pub mod a2a;
+pub mod acp;
 pub mod agent_engine;
 pub mod channels;
 pub mod chat_commands;
@@ -13,6 +14,7 @@ pub mod http_client;
 pub mod llm;
 pub mod mcp;
 pub mod memory_backend;
+pub mod memory_service;
 pub mod otlp;
 pub mod plugins;
 pub(crate) mod run_control;
