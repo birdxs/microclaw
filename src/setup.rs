@@ -4949,6 +4949,14 @@ fn save_config_yaml(
     let backup = create_config_backup(path)?;
 
     let get = |key: &str| values.get(key).cloned().unwrap_or_default();
+    let get_with_fallback = |key: &str, default: &str| {
+        values
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default)
+            .to_string()
+    };
     let data_dir = values
         .get("DATA_DIR")
         .cloned()
@@ -5010,26 +5018,26 @@ fn save_config_yaml(
                 ))
             })?
     };
-    let subagents_max_concurrent =
-        get(subagents_max_concurrent_key())
-            .trim()
-            .parse::<usize>()
-            .map_err(|e| {
-                MicroClawError::Config(format!(
-                    "{} must be a positive integer: {e}",
-                    subagents_max_concurrent_key()
-                ))
-            })?;
-    let subagents_max_active_per_chat = get(subagents_max_active_per_chat_key())
+    let subagents_max_concurrent = get_with_fallback(subagents_max_concurrent_key(), "4")
         .trim()
         .parse::<usize>()
         .map_err(|e| {
             MicroClawError::Config(format!(
                 "{} must be a positive integer: {e}",
-                subagents_max_active_per_chat_key()
+                subagents_max_concurrent_key()
             ))
         })?;
-    let subagents_run_timeout_secs = get(subagents_run_timeout_secs_key())
+    let subagents_max_active_per_chat =
+        get_with_fallback(subagents_max_active_per_chat_key(), "5")
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| {
+                MicroClawError::Config(format!(
+                    "{} must be a positive integer: {e}",
+                    subagents_max_active_per_chat_key()
+                ))
+            })?;
+    let subagents_run_timeout_secs = get_with_fallback(subagents_run_timeout_secs_key(), "900")
         .trim()
         .parse::<u64>()
         .map_err(|e| {
@@ -5040,7 +5048,7 @@ fn save_config_yaml(
         })?;
     let subagents_announce_to_chat =
         parse_boolish(&get(subagents_announce_to_chat_key()), true)?;
-    let subagents_max_spawn_depth = get(subagents_max_spawn_depth_key())
+    let subagents_max_spawn_depth = get_with_fallback(subagents_max_spawn_depth_key(), "1")
         .trim()
         .parse::<usize>()
         .map_err(|e| {
@@ -5049,44 +5057,48 @@ fn save_config_yaml(
                 subagents_max_spawn_depth_key()
             ))
         })?;
-    let subagents_max_children_per_run = get(subagents_max_children_per_run_key())
-        .trim()
-        .parse::<usize>()
-        .map_err(|e| {
-            MicroClawError::Config(format!(
-                "{} must be a positive integer: {e}",
-                subagents_max_children_per_run_key()
-            ))
-        })?;
+    let subagents_max_children_per_run =
+        get_with_fallback(subagents_max_children_per_run_key(), "5")
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| {
+                MicroClawError::Config(format!(
+                    "{} must be a positive integer: {e}",
+                    subagents_max_children_per_run_key()
+                ))
+            })?;
     let subagents_thread_bound_routing_enabled =
         parse_boolish(&get(subagents_thread_bound_routing_enabled_key()), true)?;
-    let subagents_announce_relay_interval_secs = get(subagents_announce_relay_interval_secs_key())
-        .trim()
-        .parse::<u64>()
-        .map_err(|e| {
-            MicroClawError::Config(format!(
-                "{} must be a positive integer: {e}",
-                subagents_announce_relay_interval_secs_key()
-            ))
-        })?;
-    let subagents_max_tokens_per_run = get(subagents_max_tokens_per_run_key())
-        .trim()
-        .parse::<i64>()
-        .map_err(|e| {
-            MicroClawError::Config(format!(
-                "{} must be a positive integer: {e}",
-                subagents_max_tokens_per_run_key()
-            ))
-        })?;
-    let subagents_orchestrate_max_workers = get(subagents_orchestrate_max_workers_key())
-        .trim()
-        .parse::<usize>()
-        .map_err(|e| {
-            MicroClawError::Config(format!(
-                "{} must be a positive integer: {e}",
-                subagents_orchestrate_max_workers_key()
-            ))
-        })?;
+    let subagents_announce_relay_interval_secs =
+        get_with_fallback(subagents_announce_relay_interval_secs_key(), "15")
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| {
+                MicroClawError::Config(format!(
+                    "{} must be a positive integer: {e}",
+                    subagents_announce_relay_interval_secs_key()
+                ))
+            })?;
+    let subagents_max_tokens_per_run =
+        get_with_fallback(subagents_max_tokens_per_run_key(), "400000")
+            .trim()
+            .parse::<i64>()
+            .map_err(|e| {
+                MicroClawError::Config(format!(
+                    "{} must be a positive integer: {e}",
+                    subagents_max_tokens_per_run_key()
+                ))
+            })?;
+    let subagents_orchestrate_max_workers =
+        get_with_fallback(subagents_orchestrate_max_workers_key(), "5")
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| {
+                MicroClawError::Config(format!(
+                    "{} must be a positive integer: {e}",
+                    subagents_orchestrate_max_workers_key()
+                ))
+            })?;
     let telegram_token = if !get("TELEGRAM_BOT_TOKEN").trim().is_empty() {
         get("TELEGRAM_BOT_TOKEN")
     } else {
