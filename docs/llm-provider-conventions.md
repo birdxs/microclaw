@@ -7,6 +7,8 @@ This project keeps `src/llm.rs` model-agnostic.
 - Do not branch on specific model name strings in provider send/translation paths.
 - Represent provider-specific behavior as capability flags and branch on capabilities.
 - Keep provider/model presets in setup/config surfaces; keep `llm.rs` focused on protocol translation and runtime behavior.
+- Document reusable LLM profiles as `provider_presets.<id>` plus channel/account `provider_preset` references.
+- Do not document or reintroduce legacy `llm_providers` config as a user-facing path.
 - Write tests around capability combinations rather than model-name cases.
 - For OpenAI-compatible tool calling, treat wire-format variance as protocol compatibility work:
   - Accept `tool_calls[*].index` as optional in streaming deltas; when absent, fall back to array position.
