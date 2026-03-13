@@ -18,13 +18,13 @@ use tracing::{error, info, warn};
 use crate::agent_engine::{process_with_agent_with_events, AgentEvent, AgentRequestContext};
 use crate::chat_commands::handle_chat_command;
 use crate::config::{Config, WorkingDirIsolation};
-use crate::otlp::{OtlpExporter, OtlpMetricSnapshot};
 use crate::runtime::AppState;
 use microclaw_channels::channel::ConversationKind;
 use microclaw_channels::channel::{
     deliver_and_store_bot_message, get_chat_routing, session_source_for_chat,
 };
 use microclaw_channels::channel_adapter::{ChannelAdapter, ChannelRegistry};
+use microclaw_observability::metrics::{OtlpMetricExporter, OtlpMetricSnapshot};
 use microclaw_storage::db::{call_blocking, ChatSummary, MetricsHistoryPoint, StoredMessage};
 use microclaw_storage::usage::build_usage_report;
 
@@ -76,7 +76,7 @@ struct WebState {
     request_hub: RequestHub,
     auth_hub: AuthHub,
     metrics: Arc<Mutex<WebMetrics>>,
-    otlp: Option<Arc<OtlpExporter>>,
+    otlp: Option<Arc<OtlpMetricExporter>>,
     limits: WebLimits,
 }
 
@@ -816,6 +816,8 @@ struct UpdateConfigRequest {
     api_key: Option<String>,
     model: Option<String>,
     llm_base_url: Option<Option<String>>,
+    llm_user_agent: Option<Option<String>>,
+    provider_presets: Option<HashMap<String, crate::config::LlmProviderProfile>>,
     max_tokens: Option<u32>,
     max_tool_iterations: Option<usize>,
     openai_compat_body_overrides: Option<HashMap<String, serde_json::Value>>,
@@ -1814,7 +1816,7 @@ pub async fn start_web_server(state: Arc<AppState>) {
         request_hub: RequestHub::default(),
         auth_hub: AuthHub::default(),
         metrics: Arc::new(Mutex::new(WebMetrics::default())),
-        otlp: OtlpExporter::from_config(&state.config),
+        otlp: state.metric_exporter.clone(),
         limits,
     };
 
@@ -2168,6 +2170,9 @@ mod tests {
             embedding: None,
             memory_backend: memory_backend.clone(),
             tools: ToolRegistry::new(&cfg, channel_registry, db, memory_backend),
+            metric_exporter: None,
+            trace_exporter: None,
+            log_exporter: None,
         };
         Arc::new(state)
     }
@@ -2557,8 +2562,10 @@ mod tests {
                 provider: Some("openai".to_string()),
                 api_key: None,
                 llm_base_url: Some(format!("http://{addr}/v1")),
+                llm_user_agent: None,
                 default_model: Some("custom-model".to_string()),
                 models: vec!["custom-model".to_string()],
+                show_thinking: None,
             },
         );
         let web_state = test_web_state_from_app_state(
@@ -4094,13 +4101,20 @@ commands:
         .await
         .unwrap();
 
-        let hello = recv_ws_json(&mut ws).await;
-        assert_eq!(hello.get("type").and_then(|v| v.as_str()), Some("res"));
-        assert_eq!(hello.get("ok").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(
-            hello.pointer("/payload/type").and_then(|v| v.as_str()),
-            Some("hello-ok")
-        );
+        let mut saw_hello = false;
+        for _ in 0..4 {
+            let msg = recv_ws_json(&mut ws).await;
+            if msg.get("type").and_then(|v| v.as_str()) != Some("res") {
+                continue;
+            }
+            if msg.pointer("/payload/type").and_then(|v| v.as_str()) != Some("hello-ok") {
+                continue;
+            }
+            assert_eq!(msg.get("ok").and_then(|v| v.as_bool()), Some(true));
+            saw_hello = true;
+            break;
+        }
+        assert!(saw_hello, "expected websocket hello-ok response");
 
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             json!({
@@ -4118,38 +4132,41 @@ commands:
         .await
         .unwrap();
 
-        let ack = recv_ws_json(&mut ws).await;
-        assert_eq!(ack.get("type").and_then(|v| v.as_str()), Some("res"));
-        assert_eq!(
-            ack.pointer("/payload/status").and_then(|v| v.as_str()),
-            Some("started")
-        );
-
+        let mut saw_ack = false;
         let mut saw_delta = false;
         let mut saw_final = false;
-        for _ in 0..8 {
-            let evt = recv_ws_json(&mut ws).await;
-            if evt.get("type").and_then(|v| v.as_str()) != Some("event") {
-                continue;
+        for _ in 0..12 {
+            let msg = recv_ws_json(&mut ws).await;
+            match msg.get("type").and_then(|v| v.as_str()) {
+                Some("res")
+                    if msg.pointer("/payload/status").and_then(|v| v.as_str())
+                        == Some("started") =>
+                {
+                    saw_ack = true;
+                }
+                Some("event") if msg.get("event").and_then(|v| v.as_str()) == Some("chat") => {
+                    let state = msg.pointer("/payload/state").and_then(|v| v.as_str());
+                    if state == Some("delta") {
+                        saw_delta = true;
+                    }
+                    if state == Some("final") {
+                        saw_final = true;
+                        assert_eq!(
+                            msg.pointer("/payload/sessionKey").and_then(|v| v.as_str()),
+                            Some("main")
+                        );
+                    }
+                }
+                _ => {}
             }
-            if evt.get("event").and_then(|v| v.as_str()) != Some("chat") {
-                continue;
-            }
-            let state = evt.pointer("/payload/state").and_then(|v| v.as_str());
-            if state == Some("delta") {
-                saw_delta = true;
-            }
-            if state == Some("final") {
-                saw_final = true;
-                assert_eq!(
-                    evt.pointer("/payload/sessionKey").and_then(|v| v.as_str()),
-                    Some("main")
-                );
+
+            if saw_ack && saw_delta && saw_final {
                 break;
             }
         }
-        assert!(saw_delta);
-        assert!(saw_final);
+        assert!(saw_ack, "expected websocket started response");
+        assert!(saw_delta, "expected websocket delta event");
+        assert!(saw_final, "expected websocket final event");
 
         server.abort();
     }

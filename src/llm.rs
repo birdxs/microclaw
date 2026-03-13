@@ -376,16 +376,27 @@ struct StreamToolUseBlock {
 }
 
 fn usage_from_json(v: &serde_json::Value) -> Option<Usage> {
-    let input = v.get("input_tokens").and_then(|n| n.as_u64())?;
+    let input = v
+        .get("input_tokens")
+        .and_then(json_u64)
+        .or_else(|| v.get("prompt_tokens").and_then(json_u64))?;
     let output = v
         .get("output_tokens")
-        .and_then(|n| n.as_u64())
-        .or_else(|| v.get("completion_tokens").and_then(|n| n.as_u64()))
+        .and_then(json_u64)
+        .or_else(|| v.get("completion_tokens").and_then(json_u64))
         .unwrap_or(0);
     Some(Usage {
         input_tokens: u32::try_from(input).unwrap_or(u32::MAX),
         output_tokens: u32::try_from(output).unwrap_or(u32::MAX),
     })
+}
+
+fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
 }
 
 fn process_anthropic_stream_event(
@@ -530,8 +541,12 @@ fn process_openai_stream_event(
         return;
     };
 
-    if usage.is_none() {
-        *usage = v.get("usage").and_then(usage_from_json);
+    if let Some(parsed_usage) = v.get("usage").and_then(usage_from_json).or_else(|| {
+        v.get("response")
+            .and_then(|r| r.get("usage"))
+            .and_then(usage_from_json)
+    }) {
+        merge_usage_max(usage, parsed_usage);
     }
 
     let Some(choice) = v
@@ -626,6 +641,20 @@ fn process_openai_stream_event(
             {
                 entry.thought_signature = Some(sig.to_string());
             }
+        }
+    }
+}
+
+// OpenAI-compatible streaming usage is cumulative (running total), not per-chunk delta.
+// We therefore keep the max seen values instead of summing to avoid double counting.
+fn merge_usage_max(slot: &mut Option<Usage>, incoming: Usage) {
+    match slot {
+        Some(current) => {
+            current.input_tokens = current.input_tokens.max(incoming.input_tokens);
+            current.output_tokens = current.output_tokens.max(incoming.output_tokens);
+        }
+        None => {
+            *slot = Some(incoming);
         }
     }
 }
@@ -1163,6 +1192,16 @@ fn should_retry_with_max_completion_tokens(error_text: &str) -> bool {
     lower.contains("max_tokens") && lower.contains("max_completion_tokens")
 }
 
+fn should_retry_without_stream_options(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    (lower.contains("stream_options") || lower.contains("include_usage"))
+        && (lower.contains("unsupported")
+            || lower.contains("unknown")
+            || lower.contains("invalid")
+            || lower.contains("not supported")
+            || lower.contains("unrecognized"))
+}
+
 fn switch_to_max_completion_tokens(body: &mut serde_json::Value) -> bool {
     if body.get("max_completion_tokens").is_some() {
         return false;
@@ -1424,6 +1463,17 @@ impl LlmProvider for OpenAiProvider {
             &self.openai_compat_body_overrides_by_model,
         );
         body["stream"] = json!(true);
+        if body.get("stream_options").is_none() {
+            body["stream_options"] = json!({
+                "include_usage": true
+            });
+        } else if let Some(obj) = body
+            .get_mut("stream_options")
+            .and_then(|v| v.as_object_mut())
+        {
+            obj.entry("include_usage".to_string())
+                .or_insert_with(|| json!(true));
+        }
 
         if let Some(ref tool_defs) = tools {
             if !tool_defs.is_empty() {
@@ -1460,6 +1510,15 @@ impl LlmProvider for OpenAiProvider {
             {
                 warn!(
                     "OpenAI-compatible API rejected max_tokens; retrying stream with max_completion_tokens"
+                );
+                continue;
+            }
+            if body.get("stream_options").is_some() && should_retry_without_stream_options(&text) {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("stream_options");
+                }
+                warn!(
+                    "OpenAI-compatible API rejected stream_options/include_usage; retrying stream without stream_options"
                 );
                 continue;
             }
@@ -2874,6 +2933,64 @@ mod tests {
     }
 
     #[test]
+    fn test_process_openai_stream_event_updates_usage_with_max_values() {
+        let first = r#"{"choices":[{"delta":{"content":"a"}}],"usage":{"prompt_tokens":10,"completion_tokens":0}}"#;
+        let second = r#"{"choices":[{"delta":{"content":"b"}}],"usage":{"prompt_tokens":10,"completion_tokens":7}}"#;
+        let mut text = String::new();
+        let mut reasoning_text = String::new();
+        let mut stop_reason = None;
+        let mut usage = None;
+        let mut tool_calls = std::collections::BTreeMap::new();
+
+        process_openai_stream_event(
+            first,
+            None,
+            &mut text,
+            &mut reasoning_text,
+            &mut stop_reason,
+            &mut usage,
+            &mut tool_calls,
+        );
+        process_openai_stream_event(
+            second,
+            None,
+            &mut text,
+            &mut reasoning_text,
+            &mut stop_reason,
+            &mut usage,
+            &mut tool_calls,
+        );
+
+        let usage = usage.expect("usage should exist");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 7);
+    }
+
+    #[test]
+    fn test_process_openai_stream_event_parses_response_done_usage() {
+        let data = r#"{"type":"response.done","response":{"usage":{"input_tokens":11,"output_tokens":5}}}"#;
+        let mut text = String::new();
+        let mut reasoning_text = String::new();
+        let mut stop_reason = None;
+        let mut usage = None;
+        let mut tool_calls = std::collections::BTreeMap::new();
+
+        process_openai_stream_event(
+            data,
+            None,
+            &mut text,
+            &mut reasoning_text,
+            &mut stop_reason,
+            &mut usage,
+            &mut tool_calls,
+        );
+
+        let usage = usage.expect("usage should exist");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
     fn test_should_retry_with_max_completion_tokens() {
         let err = r#"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","param":"max_tokens"}}"#;
         assert!(should_retry_with_max_completion_tokens(err));
@@ -2889,6 +3006,28 @@ mod tests {
         assert_eq!(body.get("max_tokens"), None);
         assert_eq!(body["max_completion_tokens"], 128);
         assert!(!switch_to_max_completion_tokens(&mut body));
+    }
+
+    #[test]
+    fn test_usage_from_json_supports_openai_prompt_completion_tokens() {
+        let v = json!({
+            "prompt_tokens": 12,
+            "completion_tokens": 34
+        });
+        let usage = usage_from_json(&v).expect("usage should parse");
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 34);
+    }
+
+    #[test]
+    fn test_usage_from_json_supports_numeric_strings() {
+        let v = json!({
+            "input_tokens": "56",
+            "output_tokens": "78"
+        });
+        let usage = usage_from_json(&v).expect("usage should parse");
+        assert_eq!(usage.input_tokens, 56);
+        assert_eq!(usage.output_tokens, 78);
     }
 
     #[test]

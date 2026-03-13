@@ -47,6 +47,7 @@ An agentic AI assistant for chat surfaces, inspired by [nanoclaw](https://github
 - [Usage examples](#usage-examples)
 - [Architecture](#architecture)
 - [Adding a New Platform Adapter](#adding-a-new-platform-adapter)
+- [Observability (Langfuse)](#observability-langfuse)
 - [Documentation](#documentation)
 
 ## Install
@@ -943,7 +944,8 @@ All configuration is via `microclaw.config.yaml`:
 | `channels.telegram.default_account` | No | unset | Default Telegram account ID in multi-account mode |
 | `channels.telegram.accounts.<id>.bot_token` | No* | unset | Telegram bot token for a specific account (recommended multi-account mode) |
 | `channels.telegram.accounts.<id>.bot_username` | No | unset | Telegram username for a specific account (without `@`) |
-| `channels.telegram.accounts.<id>.model` | No | unset | Optional per-bot model override for that Telegram account |
+| `channels.telegram.provider_preset` | No | unset | Optional Telegram channel-level provider profile override |
+| `channels.telegram.accounts.<id>.provider_preset` | No | unset | Optional per-bot provider profile override for that Telegram account |
 | `channels.telegram.accounts.<id>.soul_path` | No | unset | Optional per-bot SOUL file path for this Telegram account |
 | `channels.telegram.topic_routing.enabled` | No | `false` | If true, Telegram topics are routed as separate chats using `external_chat_id=<chat_id>:<thread_id>` |
 | `channels.telegram.accounts.<id>.topic_routing.enabled` | No | inherit channel-level | Optional per-account override for Telegram topic routing |
@@ -955,14 +957,16 @@ All configuration is via `microclaw.config.yaml`:
 | `channels.discord.accounts.<id>.bot_token` | No* | unset | Discord bot token for a specific account |
 | `channels.discord.accounts.<id>.allowed_channels` | No | `[]` | Optional Discord channel allowlist scoped to one account |
 | `channels.discord.accounts.<id>.no_mention` | No | `false` | If true, that Discord account responds in guild channels without @mention |
-| `channels.discord.accounts.<id>.model` | No | unset | Optional per-bot model override for that Discord account |
+| `channels.discord.provider_preset` | No | unset | Optional Discord channel-level provider profile override |
+| `channels.discord.accounts.<id>.provider_preset` | No | unset | Optional per-bot provider profile override for that Discord account |
 | `channels.discord.accounts.<id>.soul_path` | No | unset | Optional per-bot SOUL file path for this Discord account |
 | `allow_group_slash_without_mention` | No | `false` | If true, allow slash commands in group/server/channel chats without @mention |
 | `discord_allowed_channels` | No | `[]` | Discord channel ID allowlist; empty means no channel restriction |
 | `api_key` | Yes* | -- | LLM API key (`ollama` can leave this empty; `openai-codex` supports OAuth or `api_key`) |
 | `bot_username` | No | -- | Telegram bot username (without @; needed for Telegram group mentions) |
-| `llm_provider` | No | `anthropic` | Provider preset ID (or custom ID). `anthropic` uses native Anthropic API, others use OpenAI-compatible API |
+| `llm_provider` | No | `anthropic` | Global main LLM provider profile. Built-ins include `anthropic`, `openai`, `google`, `aliyun-bailian`, `nvidia`, `openrouter`, `ollama`, and `custom` |
 | `model` | No | provider-specific | Model name |
+| `provider_presets.<id>` | No | `{}` | Optional reusable provider profiles for channel/bot overrides. Each profile can define provider, api key, base URL, user-agent, model, and show-thinking |
 | `model_prices` | No | `[]` | Optional per-model pricing table (USD per 1M tokens) used by `/usage` cost estimates |
 | `llm_base_url` | No | provider preset default | Custom provider base URL |
 | `openai_compat_body_overrides` | No | `{}` | Global request-body overrides for OpenAI-compatible providers (`openai`, `openrouter`, `deepseek`, `ollama`, etc.) |
@@ -1122,7 +1126,7 @@ Notes:
 
 ### Supported `llm_provider` values
 
-`openai`, `openai-codex`, `openrouter`, `anthropic`, `ollama`, `google`, `alibaba`, `deepseek`, `moonshot`, `mistral`, `azure`, `bedrock`, `zhipu`, `minimax`, `cohere`, `tencent`, `xai`, `huggingface`, `together`, `custom`.
+`openai`, `openai-codex`, `openrouter`, `anthropic`, `ollama`, `google`, `alibaba`, `aliyun-bailian`, `nvidia`, `deepseek`, `moonshot`, `mistral`, `azure`, `bedrock`, `zhipu`, `minimax`, `cohere`, `tencent`, `xai`, `huggingface`, `together`, `custom`.
 
 ## Platform behavior
 
@@ -1238,6 +1242,77 @@ MicroClaw's core loop is channel-agnostic. A new platform integration should mai
 5. Preserve session key stability so resume/compaction/memory continue to work across restarts.
 6. Apply existing authorization and safety boundaries (`control_chat_ids`, tool constraints, path guard).
 7. Add adapter-specific integration tests under `TEST.md` patterns (DM/private, group/server mention, `/reset`, limits, failures).
+
+## Observability (Langfuse)
+
+MicroClaw supports OpenTelemetry (OTLP)-based observability and provides first-class integration with [Langfuse](https://langfuse.com/). You can trace complete agent runs (`agent_run`), inspect `llm_generation` and `tool_execution` spans, and monitor token usage.
+
+### 5-minute quick start (first-time users)
+
+1. **Deploy Langfuse**
+   - **Cloud**: use `https://cloud.langfuse.com`
+   - **Self-hosted**: follow the official Langfuse self-hosting guide and make sure the UI is reachable (for example `http://127.0.0.1:3000`)
+2. **Create a Langfuse project** and copy:
+   - `langfuse_public_key` (`pk-lf-...`)
+   - `langfuse_secret_key` (`sk-lf-...`)
+3. **Configure MicroClaw** in `microclaw.config.yaml`
+4. **Restart MicroClaw**
+5. **Send one test message** in Web/Telegram/Discord and open Langfuse Traces
+
+### Recommended config
+
+```yaml
+observability:
+  service_name: "microclaw-agent"
+  otlp_tracing_enabled: true
+  langfuse_host: "https://cloud.langfuse.com" # or "http://127.0.0.1:3000" for self-hosted
+  langfuse_public_key: "pk-lf-..."
+  langfuse_secret_key: "sk-lf-..."
+  otlp_tracing_max_queue_size: 8192
+  otlp_tracing_max_export_batch_size: 512
+  otlp_tracing_scheduled_delay_ms: 5000
+```
+
+### Verify it is working
+
+- Start MicroClaw with debug logs:
+
+```sh
+RUST_LOG=info,microclaw_observability=debug,opentelemetry_sdk=info microclaw start
+```
+
+- Look for:
+  - `otlp trace exporter initialized`
+  - `trace span submitted to otel sdk`
+- In Langfuse, verify:
+  - Trace name: `agent_run`
+  - Child spans: `llm_generation`, `tool_execution`
+  - Token usage fields are non-zero after real model output
+
+### Common pitfalls (read this before troubleshooting)
+
+- **Wrong `langfuse_host` value**
+  - Use only host root like `http://127.0.0.1:3000`
+  - Do not use UI path like `/project/<id>/traces`
+  - Do not append `/api/public/otel/v1/traces`
+- **Proxy intercepts local Langfuse traffic**
+  - If logs show proxy intercepting local URL, set:
+
+```sh
+export NO_PROXY=127.0.0.1,localhost,<your-langfuse-host>
+export no_proxy=127.0.0.1,localhost,<your-langfuse-host>
+```
+
+- **Docker networking confusion**
+  - If MicroClaw runs in container, `127.0.0.1` points to that container, not your host
+  - Use a container-reachable hostname (for example `http://langfuse-web:3000`)
+- **No traces after config change**
+  - Restart MicroClaw after editing config
+  - Send a fresh test request
+- **Too noisy OpenTelemetry timer debug logs**
+  - Raise SDK log level: `opentelemetry_sdk=info`
+- **Usage fields look incorrect in older runs**
+  - Old traces are not backfilled; validate with new runs after upgrade
 
 ## Documentation
 
