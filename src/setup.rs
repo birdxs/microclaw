@@ -2934,8 +2934,8 @@ impl SetupApp {
             "Preset ID",
             "Provider",
             "API key",
-            "Base URL",
             "Model",
+            "Base URL",
             "Show thinking",
             "User-Agent (optional)",
         ]
@@ -2949,8 +2949,8 @@ impl SetupApp {
             0 => entry.id.clone(),
             1 => entry.provider.clone(),
             2 => entry.api_key.clone(),
-            3 => entry.base_url.clone(),
-            4 => entry.default_model.clone(),
+            3 => entry.default_model.clone(),
+            4 => entry.base_url.clone(),
             5 => entry.show_thinking.to_string(),
             6 => entry.user_agent.clone(),
             _ => String::new(),
@@ -3003,7 +3003,7 @@ impl SetupApp {
         page.entries.push(cloned.clone());
         page.selected = page.entries.len().saturating_sub(1);
         page.mode = ProviderPresetPageMode::Edit;
-        page.field_selected = 4;
+        page.field_selected = 3;
         page.editing = false;
         self.sync_provider_preset_page_field()?;
         Ok(Some(cloned.id))
@@ -3057,8 +3057,8 @@ impl SetupApp {
                 0 => entry.id = value.clone(),
                 1 => entry.provider = value,
                 2 => entry.api_key = value,
-                3 => entry.base_url = value,
-                4 => entry.default_model = value,
+                3 => entry.default_model = value,
+                4 => entry.base_url = value,
                 5 => entry.show_thinking = parse_bool_like(&value).unwrap_or(false),
                 6 => entry.user_agent = value,
                 _ => {}
@@ -3089,12 +3089,12 @@ impl SetupApp {
             0 => Some(SetupApp::next_provider_preset_id(&page.entries)),
             1 => Some("anthropic".to_string()),
             2 => Some(String::new()),
-            3 => Some(
+            3 => Some(default_model_for_provider(&entry.provider).to_string()),
+            4 => Some(
                 find_provider_preset(&entry.provider)
                     .map(|preset| preset.default_base_url.to_string())
                     .unwrap_or_default(),
             ),
-            4 => Some(default_model_for_provider(&entry.provider).to_string()),
             5 => Some("false".to_string()),
             6 => Some(String::new()),
             _ => None,
@@ -3203,7 +3203,7 @@ impl SetupApp {
             };
             if value == MODEL_PICKER_MANUAL_INPUT {
                 page.editing = true;
-                page.field_selected = 5;
+                page.field_selected = 3;
                 self.status = "Editing default model (manual input)".to_string();
                 return;
             }
@@ -7035,8 +7035,8 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
                                 mask_secret(&entry.api_key)
                             }
                         }
-                        3 => entry.base_url.clone(),
-                        4 => entry.default_model.clone(),
+                        3 => entry.default_model.clone(),
+                        4 => entry.base_url.clone(),
                         5 => entry.show_thinking.to_string(),
                         6 => entry.user_agent.clone(),
                         _ => String::new(),
@@ -8635,7 +8635,7 @@ subagents:
         assert_eq!(page.entries.len(), 2);
         assert_eq!(page.selected, 1);
         assert!(matches!(page.mode, ProviderPresetPageMode::Edit));
-        assert_eq!(page.field_selected, 4);
+        assert_eq!(page.field_selected, 3);
         assert!(!page.editing);
         assert_eq!(page.entries[1].id, "provider1-2");
         assert_eq!(page.entries[1].provider, "anthropic");
@@ -8715,7 +8715,7 @@ subagents:
             }],
             selected: 0,
             mode: ProviderPresetPageMode::Edit,
-            field_selected: 3,
+            field_selected: 4,
             editing: false,
             picker: None,
         });
