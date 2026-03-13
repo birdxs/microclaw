@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent_engine::archive_conversation;
@@ -45,6 +46,48 @@ fn normalized_slash_command(text: &str) -> Option<&str> {
 
 pub fn unknown_command_response() -> String {
     "Unknown command.".to_string()
+}
+
+#[derive(Clone, Copy)]
+enum PersistedOverride<'a> {
+    Unchanged,
+    Clear,
+    Set(&'a str),
+}
+
+fn config_path_for_save() -> Result<PathBuf, String> {
+    match Config::resolve_config_path() {
+        Ok(Some(path)) => Ok(path),
+        Ok(None) => Ok(PathBuf::from("./microclaw.config.yaml")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn persist_channel_llm_overrides(
+    config: &Config,
+    caller_channel: &str,
+    provider: PersistedOverride<'_>,
+    model: PersistedOverride<'_>,
+) -> Result<(), String> {
+    let path = config_path_for_save()?;
+    let mut cfg = Config::load().unwrap_or_else(|_| config.clone());
+    match provider {
+        PersistedOverride::Unchanged => {}
+        PersistedOverride::Clear => cfg.set_provider_override_for_channel(caller_channel, None),
+        PersistedOverride::Set(value) => {
+            cfg.set_provider_override_for_channel(caller_channel, Some(value))
+        }
+    }
+    match model {
+        PersistedOverride::Unchanged => {}
+        PersistedOverride::Clear => cfg.set_model_override_for_channel(caller_channel, None),
+        PersistedOverride::Set(value) => {
+            cfg.set_model_override_for_channel(caller_channel, Some(value))
+        }
+    }
+    cfg.post_deserialize().map_err(|e| e.to_string())?;
+    cfg.save_yaml(&path.to_string_lossy())
+        .map_err(|e| e.to_string())
 }
 
 pub async fn handle_chat_command(
@@ -171,12 +214,13 @@ pub async fn handle_chat_command(
 
     if trimmed == "/provider" || trimmed.starts_with("/provider ") {
         return Some(
-            build_provider_response(
+            build_provider_response_with_persistence(
                 &state.config,
                 state.llm_provider_overrides.clone(),
                 state.llm_model_overrides.clone(),
                 caller_channel,
                 trimmed,
+                true,
             )
             .await,
         );
@@ -197,13 +241,14 @@ pub async fn handle_chat_command(
 
     if trimmed == "/model" || trimmed.starts_with("/model ") {
         return Some(
-            build_model_response(
+            build_model_response_with_persistence(
                 &state.config,
                 state.llm_provider_overrides.clone(),
                 state.llm_model_overrides.clone(),
                 caller_channel,
                 chat_id,
                 trimmed,
+                true,
             )
             .await,
         );
@@ -294,6 +339,27 @@ pub async fn build_model_response(
     _chat_id: i64,
     command_text: &str,
 ) -> String {
+    build_model_response_with_persistence(
+        config,
+        llm_provider_overrides,
+        llm_model_overrides,
+        caller_channel,
+        _chat_id,
+        command_text,
+        false,
+    )
+    .await
+}
+
+async fn build_model_response_with_persistence(
+    config: &Config,
+    llm_provider_overrides: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+    llm_model_overrides: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+    caller_channel: &str,
+    _chat_id: i64,
+    command_text: &str,
+    persist_to_config: bool,
+) -> String {
     let caller_channel = caller_channel.to_string();
     let requested = command_text
         .trim()
@@ -314,6 +380,16 @@ pub async fn build_model_response(
     }
 
     if requested.eq_ignore_ascii_case("reset") || requested.eq_ignore_ascii_case("default") {
+        if persist_to_config {
+            if let Err(e) = persist_channel_llm_overrides(
+                config,
+                &caller_channel,
+                PersistedOverride::Unchanged,
+                PersistedOverride::Clear,
+            ) {
+                return format!("Failed to persist model override reset: {e}");
+            }
+        }
         let mut overrides = llm_model_overrides.write().await;
         overrides.remove(&caller_channel);
         return format!(
@@ -337,6 +413,16 @@ pub async fn build_model_response(
         );
     }
 
+    if persist_to_config {
+        if let Err(e) = persist_channel_llm_overrides(
+            config,
+            &caller_channel,
+            PersistedOverride::Unchanged,
+            PersistedOverride::Set(requested),
+        ) {
+            return format!("Failed to persist model override: {e}");
+        }
+    }
     let mut overrides = llm_model_overrides.write().await;
     overrides.insert(caller_channel.clone(), requested.to_string());
     format!("Model switched for this channel to: {provider} / {requested}")
@@ -381,6 +467,25 @@ pub async fn build_provider_response(
     caller_channel: &str,
     command_text: &str,
 ) -> String {
+    build_provider_response_with_persistence(
+        config,
+        llm_provider_overrides,
+        llm_model_overrides,
+        caller_channel,
+        command_text,
+        false,
+    )
+    .await
+}
+
+async fn build_provider_response_with_persistence(
+    config: &Config,
+    llm_provider_overrides: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+    llm_model_overrides: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+    caller_channel: &str,
+    command_text: &str,
+    persist_to_config: bool,
+) -> String {
     let requested = command_text
         .trim()
         .strip_prefix("/provider")
@@ -401,6 +506,16 @@ pub async fn build_provider_response(
     }
 
     if requested.eq_ignore_ascii_case("reset") || requested.eq_ignore_ascii_case("default") {
+        if persist_to_config {
+            if let Err(e) = persist_channel_llm_overrides(
+                config,
+                caller_channel,
+                PersistedOverride::Clear,
+                PersistedOverride::Clear,
+            ) {
+                return format!("Failed to persist provider override reset: {e}");
+            }
+        }
         {
             let mut provider_overrides = llm_provider_overrides.write().await;
             provider_overrides.remove(caller_channel);
@@ -428,6 +543,16 @@ pub async fn build_provider_response(
             .join(", ");
         return format!("Unknown provider '{requested}'. Available providers: {names}");
     };
+    if persist_to_config {
+        if let Err(e) = persist_channel_llm_overrides(
+            config,
+            caller_channel,
+            PersistedOverride::Set(&profile.alias),
+            PersistedOverride::Clear,
+        ) {
+            return format!("Failed to persist provider override: {e}");
+        }
+    }
     {
         let mut provider_overrides = llm_provider_overrides.write().await;
         provider_overrides.insert(caller_channel.to_string(), profile.alias.clone());
@@ -737,18 +862,25 @@ pub async fn maybe_handle_plugin_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_model_response, build_models_response, build_provider_response,
+        build_model_response, build_model_response_with_persistence, build_models_response,
+        build_provider_response, build_provider_response_with_persistence,
         is_placeholder_model_list, parse_anthropic_models_json_ids, parse_models_command_args,
         parse_openai_models_json_ids, resolve_openai_models_url,
     };
     use crate::config::{Config, LlmProviderProfile, ResolvedLlmProviderProfile};
+    use chrono::Utc;
     use std::collections::HashMap;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::RwLock;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_support::env_lock()
+    }
 
     fn test_config() -> Config {
         let mut cfg = Config::test_defaults();
@@ -865,6 +997,234 @@ mod tests {
         drop(provider_guard);
         let model_guard = model_overrides.read().await;
         assert!(!model_guard.contains_key("telegram"));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn provider_command_persists_override_for_default_account_channel() {
+        let _guard = env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "microclaw_chat_commands_provider_persist_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp).unwrap();
+        fs::write(
+            temp.join("microclaw.config.yaml"),
+            r#"
+bot_username: bot
+api_key: key
+llm_provider: openai
+model: gpt-5.2
+provider_presets:
+  modal:
+    provider: openai
+    default_model: gpt-5.2
+  cloudflare:
+    provider: openai
+    default_model: "@cf/zai-org/glm-4.7-flash"
+channels:
+  telegram:
+    enabled: true
+    default_account: sales
+    accounts:
+      sales:
+        enabled: true
+        bot_token: tok
+        provider_preset: modal
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load().unwrap();
+        let provider_overrides = Arc::new(RwLock::new(cfg.llm_provider_overrides()));
+        let model_overrides = Arc::new(RwLock::new(HashMap::new()));
+        let text = build_provider_response_with_persistence(
+            &cfg,
+            provider_overrides.clone(),
+            model_overrides,
+            "telegram",
+            "/provider cloudflare",
+            true,
+        )
+        .await;
+        assert!(text.contains("Provider switched for this channel to: cloudflare"));
+
+        let saved = Config::load().unwrap();
+        assert_eq!(
+            saved.provider_override_for_channel("telegram").as_deref(),
+            Some("cloudflare")
+        );
+        assert_eq!(
+            provider_overrides
+                .read()
+                .await
+                .get("telegram")
+                .map(String::as_str),
+            Some("cloudflare")
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        let _ = fs::remove_file(temp.join("microclaw.config.yaml"));
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn model_command_persists_override_for_default_account_channel() {
+        let _guard = env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "microclaw_chat_commands_model_persist_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp).unwrap();
+        fs::write(
+            temp.join("microclaw.config.yaml"),
+            r#"
+bot_username: bot
+api_key: key
+llm_provider: openai
+model: gpt-5.2
+provider_presets:
+  cloudflare:
+    provider: openai
+    default_model: "@cf/zai-org/glm-4.7-flash"
+channels:
+  telegram:
+    enabled: true
+    default_account: sales
+    accounts:
+      sales:
+        enabled: true
+        bot_token: tok
+        provider_preset: cloudflare
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load().unwrap();
+        let provider_overrides = Arc::new(RwLock::new(cfg.llm_provider_overrides()));
+        let model_overrides = Arc::new(RwLock::new(HashMap::new()));
+        let text = build_model_response_with_persistence(
+            &cfg,
+            provider_overrides,
+            model_overrides.clone(),
+            "telegram",
+            1,
+            "/model @cf/zai-org/glm-4.7-flash",
+            true,
+        )
+        .await;
+        assert_eq!(
+            text,
+            "Model switched for this channel to: cloudflare / @cf/zai-org/glm-4.7-flash"
+        );
+
+        let saved = fs::read_to_string(temp.join("microclaw.config.yaml")).unwrap();
+        assert!(
+            saved.contains("model: '@cf/zai-org/glm-4.7-flash'")
+                || saved.contains("model: \"@cf/zai-org/glm-4.7-flash\"")
+        );
+        let saved_cfg = Config::load().unwrap();
+        assert_eq!(
+            saved_cfg.model_override_for_channel("telegram").as_deref(),
+            Some("@cf/zai-org/glm-4.7-flash")
+        );
+        assert_eq!(
+            model_overrides
+                .read()
+                .await
+                .get("telegram")
+                .map(String::as_str),
+            Some("@cf/zai-org/glm-4.7-flash")
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        let _ = fs::remove_file(temp.join("microclaw.config.yaml"));
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn model_command_persists_override_only_for_current_bot_account() {
+        let _guard = env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "microclaw_chat_commands_model_bot_scope_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp).unwrap();
+        fs::write(
+            temp.join("microclaw.config.yaml"),
+            r#"
+bot_username: bot
+api_key: key
+llm_provider: openai
+model: gpt-5.2
+llm_providers:
+  openai:
+    provider: openai
+    default_model: gpt-5.2
+    models:
+      - gpt-5.2
+      - gpt-5
+channels:
+  telegram:
+    enabled: true
+    default_account: sales
+    accounts:
+      sales:
+        enabled: true
+        bot_token: sales-tok
+        model: gpt-5.2
+      ops:
+        enabled: true
+        bot_token: ops-tok
+        model: gpt-5-mini
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load().unwrap();
+        let provider_overrides = Arc::new(RwLock::new(cfg.llm_provider_overrides()));
+        let model_overrides = Arc::new(RwLock::new(HashMap::new()));
+        let text = build_model_response_with_persistence(
+            &cfg,
+            provider_overrides,
+            model_overrides.clone(),
+            "telegram.ops",
+            1,
+            "/model gpt-5",
+            true,
+        )
+        .await;
+        assert_eq!(text, "Model switched for this channel to: openai / gpt-5");
+
+        let saved_cfg = Config::load().unwrap();
+        assert_eq!(
+            saved_cfg.model_override_for_channel("telegram").as_deref(),
+            Some("gpt-5.2")
+        );
+        assert_eq!(
+            saved_cfg.model_override_for_channel("telegram.ops").as_deref(),
+            Some("gpt-5")
+        );
+        assert_eq!(
+            model_overrides
+                .read()
+                .await
+                .get("telegram.ops")
+                .map(String::as_str),
+            Some("gpt-5")
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        let _ = fs::remove_file(temp.join("microclaw.config.yaml"));
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]

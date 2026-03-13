@@ -526,6 +526,15 @@ pub struct Config {
 }
 
 impl Config {
+    fn ensure_mapping_mut(value: &mut serde_yaml::Value) -> &mut serde_yaml::Mapping {
+        if !matches!(value, serde_yaml::Value::Mapping(_)) {
+            *value = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        }
+        value
+            .as_mapping_mut()
+            .expect("value should be a mapping after initialization")
+    }
+
     fn channel_default_account_id(&self, channel: &str) -> Option<String> {
         let channel_cfg = self.channels.get(channel)?;
         let mut account_ids: Vec<String> = channel_cfg
@@ -555,6 +564,78 @@ impl Config {
                     account_ids.first().cloned()
                 }
             })
+    }
+
+    fn llm_override_target(&self, channel: &str) -> Option<(String, Option<String>)> {
+        let channel = channel.trim();
+        if channel.is_empty() {
+            return None;
+        }
+        if let Some((base_channel, account_id)) = channel.split_once('.') {
+            let base_channel = base_channel.trim();
+            let account_id = account_id.trim();
+            if base_channel.is_empty() || account_id.is_empty() {
+                return None;
+            }
+            return Some((base_channel.to_string(), Some(account_id.to_string())));
+        }
+
+        Some((
+            channel.to_string(),
+            self.channel_default_account_id(channel),
+        ))
+    }
+
+    fn llm_override_mapping_mut(&mut self, channel: &str) -> Option<&mut serde_yaml::Mapping> {
+        let (base_channel, account_id) = self.llm_override_target(channel)?;
+        let channel_value = self
+            .channels
+            .entry(base_channel)
+            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        let channel_map = Self::ensure_mapping_mut(channel_value);
+        if let Some(account_id) = account_id {
+            let accounts_key = serde_yaml::Value::String("accounts".to_string());
+            let accounts_value = channel_map
+                .entry(accounts_key)
+                .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+            let accounts_map = Self::ensure_mapping_mut(accounts_value);
+            let account_value = accounts_map
+                .entry(serde_yaml::Value::String(account_id))
+                .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+            return Some(Self::ensure_mapping_mut(account_value));
+        }
+        Some(channel_map)
+    }
+
+    pub fn set_provider_override_for_channel(&mut self, channel: &str, provider: Option<&str>) {
+        let Some(target) = self.llm_override_mapping_mut(channel) else {
+            return;
+        };
+        let provider_preset_key = serde_yaml::Value::String("provider_preset".to_string());
+        let llm_provider_key = serde_yaml::Value::String("llm_provider".to_string());
+        target.remove(&provider_preset_key);
+        target.remove(&llm_provider_key);
+        if let Some(provider) = provider
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+            .map(|provider| provider.to_ascii_lowercase())
+        {
+            target.insert(
+                provider_preset_key,
+                serde_yaml::Value::String(provider.to_string()),
+            );
+        }
+    }
+
+    pub fn set_model_override_for_channel(&mut self, channel: &str, model: Option<&str>) {
+        let Some(target) = self.llm_override_mapping_mut(channel) else {
+            return;
+        };
+        let model_key = serde_yaml::Value::String("model".to_string());
+        target.remove(&model_key);
+        if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) {
+            target.insert(model_key, serde_yaml::Value::String(model.to_string()));
+        }
     }
 
     fn channel_account_bot_username(&self, channel: &str, account_id: &str) -> Option<String> {
@@ -599,6 +680,23 @@ impl Config {
             .and_then(Self::provider_override_from_value)
     }
 
+    fn model_override_from_value(value: &serde_yaml::Value) -> Option<String> {
+        value
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn channel_account_model_override(&self, channel: &str, account_id: &str) -> Option<String> {
+        self.channels
+            .get(channel)
+            .and_then(|v| v.get("accounts"))
+            .and_then(|v| v.get(account_id))
+            .and_then(Self::model_override_from_value)
+    }
+
     pub fn provider_override_for_channel(&self, channel: &str) -> Option<String> {
         if let Some((base_channel, account_id)) = channel.split_once('.') {
             if let Some(v) = self.channel_account_provider_override(base_channel, account_id) {
@@ -619,6 +717,28 @@ impl Config {
         self.channels
             .get(channel)
             .and_then(Self::provider_override_from_value)
+    }
+
+    pub fn model_override_for_channel(&self, channel: &str) -> Option<String> {
+        if let Some((base_channel, account_id)) = channel.split_once('.') {
+            if let Some(v) = self.channel_account_model_override(base_channel, account_id) {
+                return Some(v);
+            }
+            return self
+                .channels
+                .get(base_channel)
+                .and_then(Self::model_override_from_value);
+        }
+
+        if let Some(default_account) = self.channel_default_account_id(channel) {
+            if let Some(v) = self.channel_account_model_override(channel, &default_account) {
+                return Some(v);
+            }
+        }
+
+        self.channels
+            .get(channel)
+            .and_then(Self::model_override_from_value)
     }
 
     pub fn soul_path_for_channel(&self, channel: &str) -> Option<String> {
