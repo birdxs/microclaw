@@ -168,6 +168,7 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: Build embedded web assets
+        shell: bash
         run: |
           npm --prefix web ci
           npm --prefix web run build
