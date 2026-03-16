@@ -1,13 +1,13 @@
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 
 use crate::config::WorkingDirIsolation;
 use microclaw_core::llm_types::ToolDefinition;
 use microclaw_core::text::floor_char_boundary;
-use microclaw_tools::sandbox::{SandboxExecOptions, SandboxRouter};
+use microclaw_tools::sandbox::{SandboxExecOptions, SandboxMode, SandboxRouter};
 
 use super::{schema_object, Tool, ToolResult};
 
@@ -98,10 +98,56 @@ fn contains_explicit_tmp_absolute_path(command: &str) -> bool {
     false
 }
 
+fn extract_explicit_tmp_absolute_path(command: &str) -> Option<String> {
+    let mut start = 0usize;
+    while let Some(offset) = command[start..].find("/tmp/") {
+        let idx = start + offset;
+        let prev = if idx == 0 {
+            None
+        } else {
+            command[..idx].chars().next_back()
+        };
+        if prev.is_none()
+            || matches!(
+                prev,
+                Some(' ' | '\t' | '\n' | '\'' | '"' | '=' | '(' | ':' | ';' | '|')
+            )
+        {
+            let suffix = &command[idx + 5..];
+            let end = suffix
+                .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ')' | ';' | '|'))
+                .unwrap_or(suffix.len());
+            return Some(command[idx..idx + 5 + end].to_string());
+        }
+        start = idx + 5;
+    }
+    None
+}
+
+fn suggested_tmp_working_dir_path(working_dir: &Path, command: &str) -> Option<PathBuf> {
+    let tmp_path = extract_explicit_tmp_absolute_path(command)?;
+    let relative = tmp_path.trim_start_matches("/tmp/").trim();
+    if relative.is_empty() {
+        return Some(working_dir.to_path_buf());
+    }
+    Some(working_dir.join(relative))
+}
+
 fn command_accesses_dotenv(command: &str) -> bool {
     let patterns = [".env", "dotenv", "env_file"];
     let lower = command.to_ascii_lowercase();
     patterns.iter().any(|p| lower.contains(p))
+}
+
+fn command_not_found_hint(router: Option<&Arc<SandboxRouter>>) -> &'static str {
+    match router {
+        Some(router) if router.mode() == SandboxMode::All => {
+            "Command was not found in the current execution environment. Install it on the host, or ensure the configured sandbox image contains it."
+        }
+        _ => {
+            "Command was not found on the host. Install it, or enable sandbox mode with an image that already contains the dependency."
+        }
+    }
 }
 
 #[async_trait]
@@ -113,7 +159,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".into(),
-            description: "Execute a bash command and return the output. IMPORTANT: You must CALL this tool (not write it as text) to run a command. Use for running shell commands, scripts, or system operations.".into(),
+            description: "Execute a bash command and return the output. IMPORTANT: You must CALL this tool (not write it as text) to run a command. Use for running shell commands, scripts, or system operations. Use relative paths or the current chat working directory's tmp/ subdirectory instead of absolute /tmp paths.".into(),
             input_schema: schema_object(
                 json!({
                     "command": {
@@ -151,9 +197,13 @@ impl Tool for BashTool {
         }
 
         if contains_explicit_tmp_absolute_path(command) {
+            let suggested_path = suggested_tmp_working_dir_path(&working_dir, command)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| working_dir.display().to_string());
             return ToolResult::error(format!(
-                "Command contains absolute /tmp path, which is disallowed. Use paths under current chat working directory: {}",
-                working_dir.display()
+                "Command contains an absolute /tmp path. Use the current chat working directory instead: {}. For example, replace the /tmp path with {}.",
+                working_dir.display(),
+                suggested_path
             ))
             .with_error_type("path_policy_blocked");
         }
@@ -206,6 +256,13 @@ impl Tool for BashTool {
                 }
 
                 result_text = redact_env_secrets(&result_text, &env_files_for_redact);
+
+                if exit_code == 127 && stderr.to_ascii_lowercase().contains("command not found") {
+                    if !result_text.ends_with('\n') {
+                        result_text.push('\n');
+                    }
+                    result_text.push_str(command_not_found_hint(self.sandbox_router.as_ref()));
+                }
 
                 // Truncate very long output
                 if result_text.len() > 30000 {
@@ -282,6 +339,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_extract_explicit_tmp_absolute_path() {
+        assert_eq!(
+            extract_explicit_tmp_absolute_path("git clone repo /tmp/lootbox"),
+            Some("/tmp/lootbox".to_string())
+        );
+        assert_eq!(
+            extract_explicit_tmp_absolute_path("A=\"/tmp/lootbox\"; echo $A"),
+            Some("/tmp/lootbox".to_string())
+        );
+    }
+
+    #[test]
+    fn test_suggested_tmp_working_dir_path() {
+        let work = Path::new("/workspace/chat/tmp");
+        assert_eq!(
+            suggested_tmp_working_dir_path(work, "git clone repo /tmp/lootbox"),
+            Some(PathBuf::from("/workspace/chat/tmp/lootbox"))
+        );
+    }
+
     #[tokio::test]
     async fn test_bash_echo() {
         let tool = BashTool::new(".");
@@ -324,6 +402,7 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(result.error_type.as_deref(), Some("path_policy_blocked"));
         assert!(result.content.contains("current chat working directory"));
+        assert!(result.content.contains("replace the /tmp path"));
     }
 
     #[tokio::test]

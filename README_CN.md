@@ -479,6 +479,7 @@ Todo 列表存储在 `<data_dir>/runtime/groups/{chat_id}/TODO.json`，跨会话
 - `POST /api/chat`（聊天客户端风格别名）
 - `POST /api/send_stream`（异步运行 + SSE 回放）
 - `POST /api/chat_stream`（聊天客户端风格别名）
+- `GET /` 在 WebSocket Upgrade 请求下作为 Mission Control / OpenClaw 风格 WebSocket bridge
 - `POST /hooks/agent` 与 `POST /api/hooks/agent`（兼容 OpenClaw webhook 请求体）
 - `POST /hooks/wake` 与 `POST /api/hooks/wake`（系统事件唤醒，支持 `now` 或 `next-heartbeat`）
 
@@ -819,6 +820,11 @@ microclaw start
 - 可选加固：
   - `~/.microclaw/sandbox-mount-allowlist.txt`：沙箱挂载路径白名单。
   - `~/.microclaw/sandbox-path-allowlist.txt`：文件工具路径白名单。
+
+工作目录约定：
+- `bash` 会在当前 chat 工作目录下的 `tmp/` 子目录执行。
+- 优先使用相对路径或当前 chat 工作目录下的路径，不要使用绝对 `/tmp/...`。
+- 如果出现 `command not found`，仍需在宿主安装该依赖，或改用已包含该命令的沙箱镜像。
 
 ### 支持的 `llm_provider` 值
 

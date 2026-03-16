@@ -274,7 +274,7 @@ mod tests {
         std::fs::write(dir.join("visible.txt"), "match_me").unwrap();
 
         let re = regex::Regex::new("match_me").unwrap();
-        let mut results = Vec::new();
+        let mut results: Vec<String> = Vec::new();
         let mut count = 0;
         grep_recursive(&dir, None, &re, &mut results, &mut count).unwrap();
 

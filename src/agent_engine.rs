@@ -1137,29 +1137,6 @@ async fn process_with_agent_logic(
             } else {
                 display_text
             };
-            let final_text = if failed_tools.is_empty() {
-                final_text
-            } else {
-                let tools = failed_tools.iter().cloned().collect::<Vec<_>>().join(", ");
-                let mut text = format!(
-                    "{final_text}\n\nExecution note: some tool actions failed in this request ({tools}). Ask me to retry if needed."
-                );
-                if !failed_tool_details.is_empty() {
-                    text.push_str("\nFailed actions:");
-                    let max_listed = 3usize;
-                    for detail in failed_tool_details.iter().take(max_listed) {
-                        text.push_str("\n- ");
-                        text.push_str(detail);
-                    }
-                    if failed_tool_details.len() > max_listed {
-                        text.push_str(&format!(
-                            "\n- ... and {} more.",
-                            failed_tool_details.len() - max_listed
-                        ));
-                    }
-                }
-                text
-            };
             if let Some(tx) = event_tx {
                 let _ = tx.send(AgentEvent::FinalResponse {
                     text: final_text.clone(),
@@ -2013,7 +1990,7 @@ Built-in execution playbook:
 - Apply the same behavior across Telegram/Discord/Web unless a tool returns a channel-specific error.
 - Do not answer with "I can't from this runtime" unless a concrete tool attempt failed in this turn.
 - Always prefer absolute paths for files passed between tools (especially attachment_path).
-- For bash/file tools, treat the current chat working directory as the default workspace. Prefer relative paths under that workspace and avoid `/tmp` unless the user explicitly asks for it.
+- For bash/file tools, treat the current chat working directory as the default workspace. For temporary files, clones, and build artifacts, use the current chat working directory's `tmp/` subdirectory. Do not use absolute `/tmp/...` paths.
 - For coding tasks, follow this loop: inspect code (`read_file`/`grep`/`glob`) -> edit (`edit_file`/`write_file`) -> validate (`bash` tests/build) -> summarize concrete changes/results.
 - If you will call any tool or activate any skill in this turn, you must start by calling todo_write to create a concise task list before the first tool/skill call.
 - This requirement includes activate_skill: plan the work in todo_write first, then activate and execute.
@@ -3199,12 +3176,9 @@ mod tests {
         .unwrap();
 
         assert!(reply.contains("build step completed"));
-        assert!(reply.contains("Execution note: some tool actions failed in this request (bash)."));
-        assert!(reply.contains("Failed actions:"));
-        assert!(
-            reply.contains("bash `git clone https://github.com/naamfung/zua.git /tmp/zua` failed:")
-        );
-        assert!(reply.contains("Command contains absolute /tmp path"));
+        assert!(!reply.contains("Execution note: some tool actions failed in this request"));
+        assert!(!reply.contains("Failed actions:"));
+        assert!(!reply.contains("Command contains an absolute /tmp path"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
         drop(state);
@@ -3318,7 +3292,8 @@ mod tests {
     fn test_build_system_prompt_prefers_chat_working_dir_over_tmp() {
         let prompt = super::build_system_prompt("testbot", "telegram", "", 42, "", "UTC", None);
         assert!(prompt.contains("current chat working directory"));
-        assert!(prompt.contains("avoid `/tmp` unless the user explicitly asks for it"));
+        assert!(prompt.contains("use the current chat working directory's `tmp/` subdirectory"));
+        assert!(prompt.contains("Do not use absolute `/tmp/...` paths"));
     }
 
     #[test]

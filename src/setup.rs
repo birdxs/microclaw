@@ -947,6 +947,10 @@ fn default_model_for_provider(provider: &str) -> &'static str {
         .unwrap_or("gpt-5.2")
 }
 
+fn is_placeholder_provider_model_list(models: &[&str]) -> bool {
+    models.len() == 1 && models[0].eq_ignore_ascii_case("custom-model")
+}
+
 fn normalize_setup_provider_id(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -3167,11 +3171,15 @@ impl SetupApp {
             self.status = "Unknown provider; switched to manual model input".to_string();
             return;
         };
-        let mut options = preset
-            .models
-            .iter()
-            .map(|model| ((*model).to_string(), (*model).to_string()))
-            .collect::<Vec<_>>();
+        let mut options = if is_placeholder_provider_model_list(preset.models) {
+            Vec::new()
+        } else {
+            preset
+                .models
+                .iter()
+                .map(|model| ((*model).to_string(), (*model).to_string()))
+                .collect::<Vec<_>>()
+        };
         options.push((
             MODEL_PICKER_MANUAL_INPUT.to_string(),
             MODEL_PICKER_MANUAL_INPUT.to_string(),
@@ -3240,6 +3248,43 @@ impl SetupApp {
         let _ = self.sync_provider_preset_page_field();
         if let Some(status) = status {
             self.status = status;
+        }
+    }
+
+    fn handle_provider_preset_enter(&mut self) {
+        let selected_field = self
+            .provider_preset_page
+            .as_ref()
+            .map(|page| page.field_selected)
+            .unwrap_or(0);
+        let editing = self
+            .provider_preset_page
+            .as_ref()
+            .map(|page| page.editing)
+            .unwrap_or(false);
+        if editing {
+            if let Some(page) = self.provider_preset_page.as_mut() {
+                page.editing = false;
+            }
+            let _ = self.sync_provider_preset_page_field();
+            self.status = "Updated provider profile field".into();
+            return;
+        }
+
+        match selected_field {
+            1 => self.open_provider_preset_provider_picker(),
+            3 => self.open_provider_preset_model_picker(),
+            5 => {
+                self.toggle_selected_provider_preset_show_thinking();
+                let _ = self.sync_provider_preset_page_field();
+                self.status = "Toggled provider profile show_thinking".into();
+            }
+            _ => {
+                if let Some(page) = self.provider_preset_page.as_mut() {
+                    page.editing = true;
+                    self.status = "Editing provider profile field".into();
+                }
+            }
         }
     }
 
@@ -4385,6 +4430,7 @@ impl SetupApp {
         std::thread::spawn(move || {
             perform_online_validation(
                 tg_enabled,
+                true,
                 &tg_token,
                 &env_username,
                 &provider,
@@ -4457,6 +4503,7 @@ impl SetupApp {
         let profile_id = request.profile_id.clone();
         let checks = std::thread::spawn(move || {
             perform_online_validation(
+                false,
                 false,
                 "",
                 "",
@@ -5411,6 +5458,7 @@ impl SetupApp {
 #[allow(clippy::too_many_arguments)]
 fn perform_online_validation(
     telegram_enabled: bool,
+    include_telegram_status: bool,
     tg_token: &str,
     env_username: &str,
     provider: &str,
@@ -5456,7 +5504,7 @@ fn perform_online_validation(
             checks.push(format!("Telegram OK ({actual_username})"));
         }
     } else {
-        checks.push("Telegram skipped (disabled)".into());
+        push_telegram_disabled_status(&mut checks, include_telegram_status);
     }
 
     // --- LLM validation: send a minimal "hi" message ---
@@ -5571,6 +5619,12 @@ fn perform_online_validation(
     }
 
     Ok(checks)
+}
+
+fn push_telegram_disabled_status(checks: &mut Vec<String>, include_telegram_status: bool) {
+    if include_telegram_status {
+        checks.push("Telegram skipped (disabled)".into());
+    }
 }
 
 fn send_openai_validation_chat_request(
@@ -7579,17 +7633,17 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
                             match run_with_spinner(
                                 &mut terminal,
                                 &mut app,
-                                &format!("Testing provider profile {profile_id}"),
+                                &format!("Testing model for provider profile {profile_id}"),
                                 move || app_for_online.validate_selected_provider_preset_online(),
                             ) {
                                 Ok((validated_profile_id, checks)) => {
                                     app.status = format!(
-                                        "Profile {validated_profile_id} passed: {}",
+                                        "Model test for {validated_profile_id} passed: {}",
                                         checks.join(" | ")
                                     );
                                 }
                                 Err(e) => {
-                                    app.status = format!("Profile {profile_id} test failed: {e}");
+                                    app.status = format!("Model test for {profile_id} failed: {e}");
                                 }
                             }
                         }
@@ -7647,34 +7701,7 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
                             }
                         }
                         KeyCode::Enter => {
-                            let selected_field = app
-                                .provider_preset_page
-                                .as_ref()
-                                .map(|page| page.field_selected)
-                                .unwrap_or(0);
-                            let editing = app
-                                .provider_preset_page
-                                .as_ref()
-                                .map(|page| page.editing)
-                                .unwrap_or(false);
-                            if editing {
-                                if let Some(page) = app.provider_preset_page.as_mut() {
-                                    page.editing = false;
-                                }
-                                let _ = app.sync_provider_preset_page_field();
-                                app.status = "Updated provider profile field".into();
-                            } else if selected_field == 1 {
-                                app.open_provider_preset_provider_picker();
-                            } else if selected_field == 4 {
-                                app.open_provider_preset_model_picker();
-                            } else if selected_field == 5 {
-                                app.toggle_selected_provider_preset_show_thinking();
-                                let _ = app.sync_provider_preset_page_field();
-                                app.status = "Toggled provider profile show_thinking".into();
-                            } else if let Some(page) = app.provider_preset_page.as_mut() {
-                                page.editing = true;
-                                app.status = "Editing provider profile field".into();
-                            }
+                            app.handle_provider_preset_enter();
                         }
                         KeyCode::Backspace => {
                             let editing = app
@@ -8763,6 +8790,93 @@ subagents:
     }
 
     #[test]
+    fn test_provider_preset_enter_on_default_model_opens_model_picker() {
+        let mut app = SetupApp::new();
+        app.provider_preset_page = Some(ProviderPresetPage {
+            entries: vec![ProviderPresetDraft {
+                id: "provider1".into(),
+                provider: "openai".into(),
+                api_key: String::new(),
+                base_url: "https://api.openai.com/v1".into(),
+                user_agent: String::new(),
+                default_model: "gpt-5.2".into(),
+                show_thinking: false,
+            }],
+            selected: 0,
+            mode: ProviderPresetPageMode::Edit,
+            field_selected: 3,
+            editing: false,
+            picker: None,
+        });
+
+        app.handle_provider_preset_enter();
+
+        let page = app.provider_preset_page.as_ref().unwrap();
+        let picker = page.picker.as_ref().unwrap();
+        assert_eq!(picker.target_key, "default_model");
+        assert!(picker.title.contains("openai"));
+        assert!(!page.editing);
+    }
+
+    #[test]
+    fn test_provider_preset_enter_on_base_url_starts_text_editing() {
+        let mut app = SetupApp::new();
+        app.provider_preset_page = Some(ProviderPresetPage {
+            entries: vec![ProviderPresetDraft {
+                id: "provider1".into(),
+                provider: "openai".into(),
+                api_key: String::new(),
+                base_url: "https://api.openai.com/v1".into(),
+                user_agent: String::new(),
+                default_model: "gpt-5.2".into(),
+                show_thinking: false,
+            }],
+            selected: 0,
+            mode: ProviderPresetPageMode::Edit,
+            field_selected: 4,
+            editing: false,
+            picker: None,
+        });
+
+        app.handle_provider_preset_enter();
+
+        let page = app.provider_preset_page.as_ref().unwrap();
+        assert!(page.editing);
+        assert!(page.picker.is_none());
+        assert_eq!(app.status, "Editing provider profile field");
+    }
+
+    #[test]
+    fn test_custom_provider_model_picker_hides_placeholder_model() {
+        let mut app = SetupApp::new();
+        app.provider_preset_page = Some(ProviderPresetPage {
+            entries: vec![ProviderPresetDraft {
+                id: "provider1".into(),
+                provider: "custom".into(),
+                api_key: String::new(),
+                base_url: "https://example.com/v1".into(),
+                user_agent: String::new(),
+                default_model: "custom-model".into(),
+                show_thinking: false,
+            }],
+            selected: 0,
+            mode: ProviderPresetPageMode::Edit,
+            field_selected: 3,
+            editing: false,
+            picker: None,
+        });
+
+        app.open_provider_preset_model_picker();
+
+        let page = app.provider_preset_page.as_ref().unwrap();
+        let picker = page.picker.as_ref().unwrap();
+        assert_eq!(picker.target_key, "default_model");
+        assert_eq!(picker.options.len(), 1);
+        assert_eq!(picker.options[0].0, MODEL_PICKER_MANUAL_INPUT);
+        assert_eq!(picker.options[0].1, MODEL_PICKER_MANUAL_INPUT);
+    }
+
+    #[test]
     fn test_provider_presets_field_comes_after_show_thinking_in_model_section() {
         let app = SetupApp::new();
         let show_idx = app
@@ -8917,6 +9031,20 @@ subagents:
     #[test]
     fn test_provider_preset_field_label_uses_default_model() {
         assert_eq!(SetupApp::provider_preset_field_labels()[3], "Default model");
+    }
+
+    #[test]
+    fn test_push_telegram_disabled_status_included_when_requested() {
+        let mut checks = Vec::new();
+        push_telegram_disabled_status(&mut checks, true);
+        assert_eq!(checks, vec!["Telegram skipped (disabled)".to_string()]);
+    }
+
+    #[test]
+    fn test_push_telegram_disabled_status_omitted_when_not_requested() {
+        let mut checks = Vec::new();
+        push_telegram_disabled_status(&mut checks, false);
+        assert!(checks.is_empty());
     }
 
     #[test]
