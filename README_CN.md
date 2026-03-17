@@ -155,6 +155,32 @@ brew tap microclaw/tap
 brew install microclaw
 ```
 
+### Docker 镜像
+
+Release tag 会发布官方容器镜像到：
+
+- `ghcr.io/microclaw/microclaw:latest`
+- `ghcr.io/microclaw/microclaw:<版本号>`
+- `docker.io/microclaw/microclaw:latest`，前提是仓库已配置 Docker Hub 发布凭据
+
+使用本地配置和数据目录挂载运行官方镜像：
+
+```sh
+docker run --rm -it \
+  -p 127.0.0.1:10961:10961 \
+  -v "$(pwd)/microclaw.config.yaml:/app/microclaw.config.yaml:ro" \
+  -v "$(pwd)/data:/home/microclaw/.microclaw" \
+  -v "$(pwd)/tmp:/app/tmp" \
+  ghcr.io/microclaw/microclaw:latest
+```
+
+镜像入口是 `microclaw`，因此可以直接覆盖子命令：
+
+```sh
+docker run --rm ghcr.io/microclaw/microclaw:latest doctor
+docker run --rm ghcr.io/microclaw/microclaw:latest version
+```
+
 ### 从源码构建
 
 ```sh
@@ -699,13 +725,16 @@ microclaw start
 ```sh
 microclaw gateway install
 microclaw gateway status
+microclaw gateway status --json
 ```
 
 服务生命周期管理：
 
 ```sh
+microclaw gateway install --force
 microclaw gateway start
 microclaw gateway stop
+microclaw gateway restart
 microclaw gateway logs 200
 microclaw gateway uninstall
 ```
@@ -713,6 +742,7 @@ microclaw gateway uninstall
 说明：
 - macOS 使用 `launchd` 用户级服务
 - Linux 使用 `systemd --user`
+- Windows 使用由 `microclaw.exe` 直接托管的原生 Windows Service。运行 `microclaw gateway install` 前，请先准备好 `microclaw.config.yaml`，并在管理员终端中执行 gateway 服务命令
 - 运行日志写入 `<data_dir>/runtime/logs/`
 - 日志按小时分片：`microclaw-YYYY-MM-DD-HH.log`
 - 超过 30 天的日志会自动删除
