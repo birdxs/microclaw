@@ -135,7 +135,7 @@ struct WebLimits {
 impl Default for WebLimits {
     fn default() -> Self {
         Self {
-            max_inflight_per_session: 2,
+            max_inflight_per_session: 10,
             max_requests_per_window: 8,
             rate_window: Duration::from_secs(10),
             run_history_limit: 512,

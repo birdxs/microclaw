@@ -124,7 +124,7 @@ fn default_web_port() -> u16 {
     10961
 }
 fn default_web_max_inflight_per_session() -> usize {
-    2
+    10
 }
 fn default_web_max_requests_per_window() -> usize {
     8
@@ -943,7 +943,7 @@ impl Config {
             web_enabled: true,
             web_host: "127.0.0.1".into(),
             web_port: 10961,
-            web_max_inflight_per_session: 2,
+            web_max_inflight_per_session: 10,
             web_max_requests_per_window: 8,
             web_rate_window_seconds: 10,
             web_run_history_limit: 512,
