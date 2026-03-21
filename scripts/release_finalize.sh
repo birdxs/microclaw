@@ -51,7 +51,7 @@ wait_for_ci_success() {
   local timeout_seconds="${CI_WAIT_TIMEOUT_SECONDS:-6000}"
   local interval_seconds="${CI_WAIT_INTERVAL_SECONDS:-20}"
   local elapsed=0
-  local required_jobs_json='["Web And Docs Build","Rust (ubuntu-latest)","Rust (macos-latest)","Stability Smoke"]'
+  local required_jobs_json='["Web And Docs Build","Docker Build","Security Audit","Rust (ubuntu-latest)","Rust (macos-latest)","Stability Smoke"]'
   local required_job_count
 
   required_job_count="$(jq -r 'length' <<<"$required_jobs_json")"
@@ -235,6 +235,12 @@ release_asset_sha256() {
   echo "${digest#sha256:}"
 }
 
+homebrew_macos_asset_name() {
+  local version="$1"
+  local arch="$2"
+  echo "microclaw-${version}-${arch}-apple-darwin.tar.gz"
+}
+
 previous_release_tag() {
   local current_tag="$1"
   git tag --list 'v*' --sort=-version:refname | awk -v current="$current_tag" '$0 != current { print; exit }'
@@ -350,8 +356,21 @@ if ! wait_for_release_asset_ready "$GITHUB_REPO" "$TAG" "$TARBALL_NAME"; then
   exit 1
 fi
 
-OFFICIAL_SHA256="$(release_asset_sha256 "$GITHUB_REPO" "$TAG" "$TARBALL_NAME")"
-echo "Official release asset SHA256: $OFFICIAL_SHA256"
+HOMEBREW_ARM64_TARBALL_NAME="$(homebrew_macos_asset_name "$NEW_VERSION" "aarch64")"
+HOMEBREW_X86_64_TARBALL_NAME="$(homebrew_macos_asset_name "$NEW_VERSION" "x86_64")"
+
+if ! wait_for_release_asset_ready "$GITHUB_REPO" "$TAG" "$HOMEBREW_ARM64_TARBALL_NAME"; then
+  exit 1
+fi
+
+if ! wait_for_release_asset_ready "$GITHUB_REPO" "$TAG" "$HOMEBREW_X86_64_TARBALL_NAME"; then
+  exit 1
+fi
+
+HOMEBREW_ARM64_SHA256="$(release_asset_sha256 "$GITHUB_REPO" "$TAG" "$HOMEBREW_ARM64_TARBALL_NAME")"
+HOMEBREW_X86_64_SHA256="$(release_asset_sha256 "$GITHUB_REPO" "$TAG" "$HOMEBREW_X86_64_TARBALL_NAME")"
+echo "Official Homebrew arm64 SHA256: $HOMEBREW_ARM64_SHA256"
+echo "Official Homebrew x86_64 SHA256: $HOMEBREW_X86_64_SHA256"
 
 echo "Resetting tap workspace: $TAP_DIR"
 rm -rf "$TAP_DIR"
@@ -366,9 +385,17 @@ cat > "$FORMULA_PATH" << RUBY
 class Microclaw < Formula
   desc "Agentic AI assistant for Telegram - web search, scheduling, memory, tool execution"
   homepage "https://github.com/$GITHUB_REPO"
-  url "https://github.com/$GITHUB_REPO/releases/download/$TAG/$TARBALL_NAME"
-  sha256 "$OFFICIAL_SHA256"
   license "MIT"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/$GITHUB_REPO/releases/download/$TAG/$HOMEBREW_ARM64_TARBALL_NAME"
+      sha256 "$HOMEBREW_ARM64_SHA256"
+    else
+      url "https://github.com/$GITHUB_REPO/releases/download/$TAG/$HOMEBREW_X86_64_TARBALL_NAME"
+      sha256 "$HOMEBREW_X86_64_SHA256"
+    end
+  end
 
   def install
     bin.install "microclaw"
