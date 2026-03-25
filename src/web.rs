@@ -1901,6 +1901,7 @@ pub async fn start_web_server(state: Arc<AppState>) {
     router = crate::channels::signal::register_signal_webhook(router, state.clone());
     router = crate::channels::dingtalk::register_dingtalk_webhook(router, state.clone());
     router = crate::channels::qq::register_qq_webhook(router, state.clone());
+    router = crate::channels::weixin::register_weixin_webhook(router, state.clone());
 
     let addr = format!("{}:{}", state.config.web_host, state.config.web_port);
     let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -4432,7 +4433,7 @@ commands:
                 "id": "send-1",
                 "method": "chat.send",
                 "params": {
-                    "sessionKey": "main",
+                    "key": "main",
                     "message": "hello over ws",
                     "idempotencyKey": "idem-ws-1"
                 }
@@ -4462,7 +4463,7 @@ commands:
                     if state == Some("final") {
                         saw_final = true;
                         assert_eq!(
-                            msg.pointer("/payload/sessionKey").and_then(|v| v.as_str()),
+                            msg.pointer("/payload/key").and_then(|v| v.as_str()),
                             Some("main")
                         );
                     }
@@ -4515,7 +4516,7 @@ commands:
                 "id": "send-1",
                 "method": "chat.send",
                 "params": {
-                    "sessionKey": "main",
+                    "key": "main",
                     "message": "history please",
                     "idempotencyKey": "idem-ws-2"
                 }
@@ -4538,7 +4539,7 @@ commands:
                 "id": "history-1",
                 "method": "chat.history",
                 "params": {
-                    "sessionKey": "main",
+                    "key": "main",
                     "limit": 10
                 }
             })
@@ -4673,20 +4674,20 @@ commands:
         for (request_id, method, params) in [
             (
                 "setting-1",
-                "session_setLabel",
-                json!({"sessionKey":"main","label":"Ops"}),
+                "sessions.setLabel",
+                json!({"key":"main","label":"Ops"}),
             ),
             (
                 "send-1",
-                "sessions_send",
-                json!({"sessionKey":"main","message":"continue"}),
+                "sessions.send",
+                json!({"key":"main","message":"continue"}),
             ),
             (
                 "spawn-1",
-                "sessions_spawn",
+                "sessions.spawn",
                 json!({"task":"spawn from mission control","label":"worker"}),
             ),
-            ("delete-1", "session_delete", json!({"sessionKey":"main"})),
+            ("delete-1", "sessions.delete", json!({"key":"main"})),
         ] {
             ws.send(tokio_tungstenite::tungstenite::Message::Text(
                 json!({
@@ -4714,7 +4715,7 @@ commands:
                 Some(true),
                 "{method}"
             );
-            if method == "sessions_send" {
+            if method == "sessions.send" {
                 let mut saw_final = false;
                 for _ in 0..12 {
                     let candidate = recv_ws_json(&mut ws).await;
@@ -4730,7 +4731,7 @@ commands:
                     }
                     assert_eq!(
                         candidate
-                            .pointer("/payload/sessionKey")
+                            .pointer("/payload/key")
                             .and_then(|v| v.as_str()),
                         Some("main")
                     );
@@ -4740,6 +4741,172 @@ commands:
                 assert!(saw_final, "sessions_send should emit a final chat event");
             }
         }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_ws_sessions_list_returns_filtered_sessions() {
+        let web_state = test_web_state(Box::new(DummyLlm), WebLimits::default());
+        seed_test_api_key(&web_state, "ws-list-secret").await;
+        let (addr, server) = spawn_test_server(build_router(web_state.clone())).await;
+
+        let app = build_router(web_state.clone());
+
+        // Seed a session that should NOT be returned
+        let req1 = Request::builder()
+            .method("POST")
+            .uri("/api/send")
+            .header("authorization", "Bearer ws-list-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"session_key":"other:123","sender_name":"u","message":"seed"}"#,
+            ))
+            .unwrap();
+        app.clone().oneshot(req1).await.unwrap();
+
+        // Seed a session that SHOULD be returned
+        let req2 = Request::builder()
+            .method("POST")
+            .uri("/api/send")
+            .header("authorization", "Bearer ws-list-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"session_key":"chatclaw:microclaw:456","sender_name":"u","message":"seed"}"#,
+            ))
+            .unwrap();
+        app.clone().oneshot(req2).await.unwrap();
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let _ = recv_ws_json(&mut ws).await;
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({
+                "type": "req",
+                "id": "connect-1",
+                "method": "connect",
+                "params": {
+                    "minProtocol": 3,
+                    "maxProtocol": 3,
+                    "auth": { "token": "ws-list-secret" }
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        let _ = recv_ws_json(&mut ws).await;
+
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({
+                "type": "req",
+                "id": "list-1",
+                "method": "sessions.list",
+                "params": {
+                    "agentId": "chatclaw:microclaw"
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let res = loop {
+            let candidate = recv_ws_json(&mut ws).await;
+            if candidate.get("type").and_then(|v| v.as_str()) != Some("res") {
+                continue;
+            }
+            if candidate.get("id").and_then(|v| v.as_str()) != Some("list-1") {
+                continue;
+            }
+            break candidate;
+        };
+
+        assert_eq!(res.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let sessions = res
+            .pointer("/payload/sessions")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].get("session_key").and_then(|v| v.as_str()),
+            Some("chatclaw:microclaw:456")
+        );
+
+        // Test with search term
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({
+                "type": "req",
+                "id": "list-search",
+                "method": "sessions.list",
+                "params": {
+                    "search": "123"
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let res_search = loop {
+            let candidate = recv_ws_json(&mut ws).await;
+            if candidate.get("type").and_then(|v| v.as_str()) != Some("res") {
+                continue;
+            }
+            if candidate.get("id").and_then(|v| v.as_str()) != Some("list-search") {
+                continue;
+            }
+            break candidate;
+        };
+
+        assert_eq!(res_search.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let sessions_search = res_search
+            .pointer("/payload/sessions")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(sessions_search.len(), 1);
+        assert_eq!(
+            sessions_search[0]
+                .get("session_key")
+                .and_then(|v| v.as_str()),
+            Some("other:123")
+        );
+
+        // Test without filter
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({
+                "type": "req",
+                "id": "list-2",
+                "method": "sessions.list",
+                "params": {}
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let res2 = loop {
+            let candidate = recv_ws_json(&mut ws).await;
+            if candidate.get("type").and_then(|v| v.as_str()) != Some("res") {
+                continue;
+            }
+            if candidate.get("id").and_then(|v| v.as_str()) != Some("list-2") {
+                continue;
+            }
+            break candidate;
+        };
+
+        assert_eq!(res2.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let sessions2 = res2
+            .pointer("/payload/sessions")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        // Since we seeded two sessions, it should return both without filter
+        assert_eq!(sessions2.len(), 2);
 
         server.abort();
     }
@@ -4800,13 +4967,13 @@ commands:
         for (request_id, method, params) in [
             (
                 "label-1",
-                "session_setLabel",
-                json!({"sessionKey":"main","label":"Ops"}),
+                "sessions.setLabel",
+                json!({"key":"main","label":"Ops"}),
             ),
             (
                 "thinking-1",
-                "session_setThinking",
-                json!({"sessionKey":"main","level":"high"}),
+                "sessions.setThinking",
+                json!({"key":"main","level":"high"}),
             ),
         ] {
             ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -4946,8 +5113,8 @@ commands:
             json!({
                 "type": "req",
                 "id": "kill-1",
-                "method": "sessions_kill",
-                "params": { "sessionKey": session_key }
+                "method": "sessions.kill",
+                "params": { "key": session_key }
             })
             .to_string(),
         ))
