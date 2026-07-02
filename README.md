@@ -3,7 +3,7 @@
 
 [English](README.md) | [中文](README_CN.md)
 
-[![Website](https://img.shields.io/badge/Website-microclaw.ai-blue)](https://microclaw.ai)
+[![Website](https://img.shields.io/badge/Website-microclaw.org-blue)](https://microclaw.org)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/pvmezwkAk5)
 [![Reddit](https://img.shields.io/badge/Reddit-r%2Fmicroclaw-FF4500?logo=reddit&logoColor=white)](https://www.reddit.com/r/microclaw/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -53,13 +53,14 @@ It works with Anthropic and OpenAI-compatible providers, supports multi-step too
 - **Persistent by default**: sessions resume, memory survives restarts, and scheduled tasks keep running in the background.
 - **Provider-agnostic**: use Anthropic or OpenAI-compatible APIs without rewriting the runtime.
 - **Extensible where it matters**: add skills, MCP servers, plugins, hooks, and new channel adapters without replacing the core.
+- **Runs on a $5 VPS**: a single static Rust binary with embedded SQLite — no Python interpreter, no separate vector DB, no service mesh. RAM/CPU footprint is small enough for the cheapest cloud tier (1 vCPU / 1 GB).
 
 ## Quick Start
 
 Install:
 
 ```sh
-curl -fsSL https://microclaw.ai/install.sh | bash
+curl -fsSL https://microclaw.org/install.sh | bash
 ```
 
 Run diagnostics:
@@ -93,13 +94,25 @@ If you want a source build instead, jump to [Install](#install). If you want ope
 ### One-line installer (recommended)
 
 ```sh
-curl -fsSL https://microclaw.ai/install.sh | bash
+curl -fsSL https://microclaw.org/install.sh | bash
+```
+
+For the full variant (includes Matrix channel support):
+
+```sh
+curl -fsSL https://microclaw.org/install.sh | bash -s -- --full
 ```
 
 ### Windows PowerShell installer
 
 ```powershell
-iwr https://microclaw.ai/install.ps1 -UseBasicParsing | iex
+iwr https://microclaw.org/install.ps1 -UseBasicParsing | iex
+```
+
+For the full variant (adds Matrix channel) on Windows:
+
+```powershell
+& ([scriptblock]::Create((iwr https://microclaw.org/install.ps1 -UseBasicParsing).Content)) -Full
 ```
 
 This installer only does one thing:
@@ -111,6 +124,33 @@ Upgrade in place later:
 ```sh
 microclaw upgrade
 ```
+
+### Linux system requirements
+
+The prebuilt Linux binaries are built against **glibc 2.39** (the toolchain on `ubuntu-latest`) and are **not** statically linked. They run only on a distribution whose system glibc is **2.39 or newer**. On older systems you will see errors like:
+
+```
+microclaw: /lib64/libc.so.6: version `GLIBC_2.39' not found (required by microclaw)
+```
+
+Distributions known to work out of the box:
+
+| Distribution            | glibc | Status |
+| ----------------------- | ----- | ------ |
+| Ubuntu 24.04 LTS+       | 2.39  | ✅ works |
+| Debian 13 (trixie)+     | 2.41  | ✅ works |
+| AlmaLinux / Rocky / RHEL 10+ | 2.39 | ✅ works |
+| Fedora 40+              | 2.39  | ✅ works |
+| Debian 12 (bookworm)    | 2.36  | ❌ too old |
+| AlmaLinux / RHEL 8–9    | 2.28–2.34 | ❌ too old |
+| Ubuntu 22.04 / 20.04    | 2.35 / 2.31 | ❌ too old |
+
+Check your version with `ldd --version`. The binaries also require **OpenSSL 3** (`libssl.so.3`); on distros that still ship OpenSSL 1.1 install the OpenSSL 3 runtime (e.g. `dnf install openssl3-libs`).
+
+On a too-old distribution you have three options:
+1. Upgrade/reinstall to a supported release (e.g. Ubuntu 24.04 or AlmaLinux 10).
+2. Run inside a container with a newer base image (`docker run ... ubuntu:24.04`).
+3. Build from source on the target machine — see [From source](#from-source). A fully static build via the `x86_64-unknown-linux-musl` target removes both the glibc and OpenSSL system dependencies.
 
 ### Preflight diagnostics
 
@@ -139,20 +179,21 @@ microclaw doctor sandbox
 macOS/Linux:
 
 ```sh
-curl -fsSL https://microclaw.ai/uninstall.sh | bash
+curl -fsSL https://microclaw.org/uninstall.sh | bash
 ```
 
 Windows PowerShell:
 
 ```powershell
-iwr https://microclaw.ai/uninstall.ps1 -UseBasicParsing | iex
+iwr https://microclaw.org/uninstall.ps1 -UseBasicParsing | iex
 ```
 
 ### Homebrew (macOS)
 
 ```sh
 brew tap microclaw/tap
-brew install microclaw
+brew install microclaw          # default
+brew install microclaw-full     # full (adds Matrix channel)
 ```
 
 ### Docker image
@@ -219,6 +260,14 @@ cargo build --release
 cp target/release/microclaw /usr/local/bin/
 ```
 
+Optional full build with heavier integrations enabled:
+
+```sh
+cargo build --release --features full
+```
+
+`full` currently enables `channel-matrix`. The default build includes all channels except Matrix (including MCP support). The full build adds the Matrix SDK.
+
 Optional semantic-memory build (sqlite-vec disabled by default):
 
 ```sh
@@ -254,7 +303,7 @@ This keeps behavior consistent across channels and lets one runtime power intera
 
 ## Blog post
 
-For a deeper dive into the architecture and design decisions, read: **[Building MicroClaw: An Agentic AI Assistant in Rust That Lives in Your Chats](https://microclaw.ai/blog/building-microclaw)**
+For a deeper dive into the architecture and design decisions, read: **[Building MicroClaw: An Agentic AI Assistant in Rust That Lives in Your Chats](https://microclaw.org/blog/building-microclaw)**
 
 ## Features
 
@@ -271,7 +320,20 @@ For a deeper dive into the architecture and design decisions, read: **[Building 
 - **Mention catch-up (Telegram groups)** -- when mentioned in a Telegram group, the bot reads all messages since its last reply (not just the last N)
 - **Continuous typing indicator** -- typing indicator stays active for the full duration of processing
 - **Persistent memory** -- AGENTS.md files at global, bot/account, and per-chat scopes, loaded into every request
+- **Per-chat user model (USER.md)** -- a curated narrative of who the user in this chat is (preferences, expertise, working style); reflector-managed and capped to keep prompts compact
+- **Cross-session recall** -- `session_search` tool runs SQLite FTS5 over stored messages, so the agent can find facts from older conversations
+- **Cross-channel voice** -- inbound voice messages on Telegram / Discord / Slack / Feishu are auto-transcribed; opt-in TTS round-trip sends audio replies back through the same surface
+- **Multimedia tools** -- `generate_image`, `describe_image`, `text_to_speech`, `transcribe_audio` — all OpenAI-compatible
+- **Defensive defaults** -- web_fetch blocks private/loopback/cloud-metadata IPs (every redirect hop), bash gates known-dangerous patterns, PII is redacted before writes to USER.md / memory rows
+- **Tool result truncation + artifacts** -- oversized tool outputs auto-stash to disk with head/tail kept in context; the agent can pull slices by id via `fetch_artifact`
+- **Skill lifecycle** -- end-of-turn review can patch existing skills (not just create), activation is tracked, unused skills auto-archive after 30 days, and the prompt-side catalog is retrieval-gated to top-K matches
 - **Message splitting** -- long responses are automatically split at newline boundaries to fit channel limits (Telegram 4096 / Discord 2000 / Slack 4000 / Feishu 4000 / IRC ~380)
+- **Anthropic prompt caching** -- system prompt + last 3 messages get `cache_control` breakpoints on every Anthropic request, so multi-turn chats reuse the cached prefix and recurring input cost drops ~75%
+- **Fuzzy `edit_file` matching** -- when `old_string` doesn't byte-match exactly, the tool retries through 8 strategies (line-trimmed, indent-flexible, escape-normalized, smart-quote-aware, block-anchor, …), reports which one matched, and refuses tool-call escape-drift artifacts that would corrupt source
+- **Tool-loop guardrails** -- per-turn warnings when an idempotent tool returns the same result repeatedly or when any tool fails several times in a row, so the model stops looping without being hard-blocked
+- **Filesystem checkpoints + `/rewind`** -- opt-in shadow-git snapshot of the chat's working dir at the start of every turn (under `<data_dir>/checkpoints/`); list and restore from chat with `/rewind` and `/rewind <hash>`
+- **`@`-prefix context references** -- `@file:path`, `@file:path:lines`, `@folder:dir`, `@diff`, `@staged`, `@url:…` in user messages are expanded server-side into an attached-context block, so the LLM sees the content directly without an extra `read_file`/`web_fetch` round-trip; sensitive paths and SSRF targets are blocked
+- **Subdirectory `AGENTS.md` hints** -- when a tool call touches a subdirectory, microclaw walks up to 5 ancestors looking for `AGENTS.md` / `CLAUDE.md` / `.cursorrules` and lazily appends the nearest one to that tool's result, once per turn
 
 ## Tools
 
@@ -280,7 +342,7 @@ For a deeper dive into the architecture and design decisions, read: **[Building 
 | `bash` | Execute shell commands with configurable timeout |
 | `read_file` | Read files with line numbers, optional offset/limit |
 | `write_file` | Create or overwrite files (auto-creates directories) |
-| `edit_file` | Find-and-replace editing with uniqueness validation |
+| `edit_file` | Find-and-replace editing with uniqueness validation; falls back through whitespace/indent/escape/smart-quote/block-anchor strategies when `old_string` doesn't byte-match exactly |
 | `glob` | Find files by pattern (`**/*.rs`, `src/**/*.ts`) |
 | `grep` | Regex search across file contents |
 | `read_memory` | Read persistent AGENTS.md memory (`global`, `bot`, or `chat`) |
@@ -309,6 +371,15 @@ For a deeper dive into the architecture and design decisions, read: **[Building 
 | `sync_skills` | Sync a skill from external registry (e.g. vercel-labs/skills) and normalize local frontmatter |
 | `todo_read` | Read the current task/plan list for a chat |
 | `todo_write` | Create or update the task/plan list for a chat |
+| `session_search` | Full-text search (SQLite FTS5) over stored messages — cross-conversation recall, scoped to caller's chat by default |
+| `clarify` | Ask the user a structured multi-choice or open-ended question; releases the turn so the next user message supplies the answer |
+| `osv_check` | Query [osv.dev](https://osv.dev) for vulnerability advisories against a package + ecosystem + version (npm, PyPI, crates.io, Go, Maven, etc.) |
+| `insights` | Summarize tool/skill usage and token cost over a trailing window |
+| `fetch_artifact` | Pull a slice of a previously truncated tool result by `artifact_id` |
+| `generate_image` | Text-to-image via OpenAI-compatible `/images/generations` |
+| `describe_image` | Vision/image understanding via OpenAI-compatible chat with image content |
+| `text_to_speech` | TTS via OpenAI-compatible `/audio/speech` (multiple voices and formats) |
+| `transcribe_audio` | STT via OpenAI-compatible `/audio/transcriptions` |
 
 Generated reference (source-of-truth, anti-drift):
 - `docs/generated/tools.md`
@@ -345,6 +416,9 @@ MicroClaw also keeps structured memory rows in SQLite (`memories` table):
 - Explicit "remember ..." commands use a deterministic fast path (direct structured-memory upsert)
 - Low-quality/noisy memories are filtered by quality gates before insertion
 - Memory lifecycle is managed with confidence + soft-archive fields (instead of hard delete)
+- Structured memory injection uses layered loading: L0 Identity (`PROFILE`), L1 Essential (high-confidence), L2 Relevance (query-matched), while deeper recall stays on-demand via `structured_memory_search`
+- Reflector can also extract subject-predicate-object triples into the temporal `knowledge_graph` store for relationship/timeline queries (`knowledge_graph_query` / `knowledge_graph_add`)
+- Structured-memory writes are audit-logged to `<data_dir>/runtime/wal/memory_writes.jsonl` for poisoning/debug analysis
 
 Optional memory MCP backend:
 - If MCP config includes a server exposing both `memory_query` and `memory_upsert`, structured-memory operations prefer that MCP server.
@@ -720,6 +794,14 @@ curl -N "http://127.0.0.1:10961/api/stream?run_id=<RUN_ID>" \
   -H "Authorization: Bearer $MICROCLAW_API_KEY"
 ```
 
+Concurrency note:
+
+- the runtime is multi-lane: web streamed runs, scheduler jobs, reflector passes, and session-native subagents execute on separate async lanes
+- inside one turn, ReadOnly tool calls run in parallel waves and mid-turn user follow-ups are injected into the active loop (default on)
+- per-chat turn serialization is universal across channel adapters
+
+See [docs/operations/concurrency-and-responsiveness.md](docs/operations/concurrency-and-responsiveness.md) for the current model, limits, and practical tuning guidance.
+
 Mission Control / OpenClaw-style WebSocket bridge:
 
 1. Connect to `ws://127.0.0.1:10961/`
@@ -1064,6 +1146,12 @@ sandbox:
   mode: "off" # optional; default off. set "all" to run bash in a container sandbox
 max_document_size_mb: 100
 memory_token_budget: 1500
+memory_l0_identity_pct: 20       # optional; reserve identity slice from memory budget
+memory_l1_essential_pct: 30      # optional; reserve essential slice from memory budget
+memory_max_entries_per_chat: 200 # optional; 0 = unlimited
+memory_max_global_entries: 500   # optional; 0 = unlimited
+kg_max_triples_per_chat: 1000    # optional; 0 = unlimited
+skill_review_min_tool_calls: 0   # optional; >0 enables post-reflector auto skill review
 timezone: "UTC"
 # optional semantic memory runtime config (requires --features sqlite-vec build)
 # embedding_provider: "openai"   # openai | ollama
@@ -1165,7 +1253,13 @@ All configuration is via `microclaw.config.yaml`:
 | `max_tokens` | No | `8192` | Max tokens per model response |
 | `max_tool_iterations` | No | `100` | Max tool-use loop iterations per message |
 | `max_document_size_mb` | No | `100` | Maximum allowed size for inbound Telegram documents; larger files are rejected with a hint message |
-| `memory_token_budget` | No | `1500` | Estimated token budget for injecting structured memories into prompt context |
+| `memory_token_budget` | No | `1500` | Estimated token budget for layered structured-memory injection (L0+L1+L2) |
+| `memory_l0_identity_pct` | No | `20` | Percentage of `memory_token_budget` reserved for L0 identity (`PROFILE`) memories |
+| `memory_l1_essential_pct` | No | `30` | Percentage of `memory_token_budget` reserved for L1 essential (high-confidence) memories |
+| `memory_max_entries_per_chat` | No | `200` | Max active structured memories per chat (`0` = unlimited) |
+| `memory_max_global_entries` | No | `500` | Max active global structured memories (`0` = unlimited) |
+| `kg_max_triples_per_chat` | No | `1000` | Max active knowledge-graph triples per chat (`0` = unlimited) |
+| `skill_review_min_tool_calls` | No | `0` | Enables post-reflector autonomous skill review when tool-call threshold is met (`0` disables) |
 | `subagents.max_concurrent` | No | `4` | Maximum number of active sub-agent runs across the runtime |
 | `subagents.max_active_per_chat` | No | `5` | Maximum number of active sub-agent runs allowed per chat |
 | `subagents.run_timeout_secs` | No | `900` | Timeout for a single sub-agent run |
@@ -1514,6 +1608,7 @@ export no_proxy=127.0.0.1,localhost,<your-langfuse-host>
 | [SUPPORT.md](SUPPORT.md) | Operator support and compatibility expectations |
 | [CHANGELOG.md](CHANGELOG.md) | Release-oriented change log |
 | [docs/operations/acp-stdio.md](docs/operations/acp-stdio.md) | ACP stdio mode overview and verification steps |
+| [docs/operations/concurrency-and-responsiveness.md](docs/operations/concurrency-and-responsiveness.md) | Current non-blocking execution model, limits, and tuning guidance |
 | [docs/operations/http-hook-trigger.md](docs/operations/http-hook-trigger.md) | Webhook and async streaming trigger behavior |
 | [docs/releases/release-policy.md](docs/releases/release-policy.md) | Release targets, gates, and rollback standard |
 | [CLAUDE.md](CLAUDE.md) | Project context for AI coding assistants |

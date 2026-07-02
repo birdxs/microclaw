@@ -7,10 +7,12 @@ use serde::Deserialize;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{error, info, warn};
 
-use crate::agent_engine::process_with_agent_with_events;
+use crate::agent_engine::maybe_rerun_for_pending;
+use crate::agent_engine::process_with_agent_with_events_guarded;
 use crate::agent_engine::should_suppress_user_error;
 use crate::agent_engine::AgentEvent;
 use crate::agent_engine::AgentRequestContext;
+use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::{
     mark_channel_started, parse_epoch_ms_from_seconds_fraction, should_drop_pre_start_message,
     should_drop_recent_duplicate_message,
@@ -278,21 +280,7 @@ async fn maybe_plugin_slash_response(
     maybe_handle_plugin_command(config, text, chat_id, channel_name).await
 }
 
-static SLACK_CHAT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
 static SLACK_ASSISTANT_THREADS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-
-fn slack_chat_lock(channel_name: &str, external_chat_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let key = format!("{channel_name}:{external_chat_id}");
-    let cache = SLACK_CHAT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut guard) = cache.lock() else {
-        return Arc::new(tokio::sync::Mutex::new(()));
-    };
-    guard
-        .entry(key)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
 
 fn slack_assistant_key(channel: &str, user: &str) -> String {
     format!("{channel}:{user}")
@@ -542,6 +530,56 @@ impl ChannelAdapter for SlackAdapter {
     }
 }
 
+/// Upload a synthesized voice reply via the same files.upload endpoint the
+/// SlackAdapter uses for generic attachments. Standalone helper because the
+/// inbound message handler doesn't have a SlackAdapter in scope.
+async fn upload_slack_voice_reply(
+    bot_token: &str,
+    channel: &str,
+    thread_ts: Option<&str>,
+    file_path: &std::path::Path,
+) -> Result<(), String> {
+    let filename = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("reply.mp3")
+        .to_string();
+    let bytes = tokio::fs::read(file_path)
+        .await
+        .map_err(|e| format!("Failed to read voice reply file: {e}"))?;
+
+    let mut form = reqwest::multipart::Form::new()
+        .text("channels", channel.to_string())
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(bytes).file_name(filename),
+        );
+    if let Some(ts) = thread_ts {
+        form = form.text("thread_ts", ts.to_string());
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://slack.com/api/files.upload")
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {bot_token}"))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to upload voice reply: {e}"))?;
+    let resp_json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Slack upload response: {e}"))?;
+    if resp_json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let err = resp_json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        return Err(format!("Slack files.upload error: {err}"));
+    }
+    Ok(())
+}
+
 /// Request a WebSocket URL from Slack's apps.connections.open endpoint.
 async fn open_socket_mode_connection(app_token: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
@@ -616,6 +654,103 @@ async fn resolve_bot_user_id(bot_token: &str) -> Result<String, String> {
 }
 
 /// Send a text response to a Slack channel, splitting at 4000 chars.
+/// Download all audio attachments from a Slack `files` array, transcribe them
+/// via the configured STT provider, and return inbound-formatted text. Returns
+/// `None` if no audio attachments are present (so the caller keeps the original
+/// text). When transcription is not configured this is a no-op as well — the
+/// original message is preserved verbatim.
+async fn maybe_inject_slack_audio_transcripts(
+    app_state: &AppState,
+    bot_token: &str,
+    files: &[serde_json::Value],
+    user: &str,
+    original_text: &str,
+    max_bytes: u64,
+) -> Option<String> {
+    let audio_files: Vec<&serde_json::Value> = files
+        .iter()
+        .filter(|f| {
+            f.get("mimetype")
+                .and_then(|v| v.as_str())
+                .map(|m| m.starts_with("audio/"))
+                .unwrap_or(false)
+        })
+        .collect();
+    if audio_files.is_empty() {
+        return None;
+    }
+    if !crate::voice::can_transcribe(&app_state.config) {
+        return None;
+    }
+
+    let client = reqwest::Client::new();
+    let mut transcripts: Vec<String> = Vec::new();
+    for file in audio_files {
+        let url = file
+            .get("url_private")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if url.is_empty() {
+            continue;
+        }
+        if let Some(content_length) = file.get("size").and_then(|v| v.as_u64()) {
+            if content_length > max_bytes {
+                warn!(
+                    "Slack: skipping audio download; size={} exceeds max_bytes={}",
+                    content_length, max_bytes
+                );
+                continue;
+            }
+        }
+        let bytes = match client
+            .get(url)
+            .header("Authorization", format!("Bearer {bot_token}"))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(b) if b.len() as u64 <= max_bytes => b.to_vec(),
+                Ok(b) => {
+                    warn!(
+                        "Slack: skipping audio; size={} exceeds max_bytes={}",
+                        b.len(),
+                        max_bytes
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Slack: failed to read audio bytes: {e}");
+                    continue;
+                }
+            },
+            Ok(resp) => {
+                warn!("Slack: audio download returned HTTP {}", resp.status());
+                continue;
+            }
+            Err(e) => {
+                warn!("Slack: failed to download audio: {e}");
+                continue;
+            }
+        };
+        match crate::voice::transcribe_audio(&app_state.config, &bytes).await {
+            Ok(t) => transcripts.push(crate::voice::format_voice_inbound(user, &t)),
+            Err(e) => {
+                warn!("Slack: voice transcription failed: {e}");
+                transcripts.push(crate::voice::format_voice_inbound_error(user, &e));
+            }
+        }
+    }
+    if transcripts.is_empty() {
+        return None;
+    }
+    let joined = transcripts.join("\n");
+    if original_text.trim().is_empty() {
+        Some(joined)
+    } else {
+        Some(format!("{}\n\n{}", original_text.trim(), joined))
+    }
+}
+
 /// Download the first image from a Slack `files` array and return it as (base64, media_type).
 /// Slack requires the bot token as a Bearer header to access `url_private`.
 async fn download_first_slack_image(
@@ -771,7 +906,10 @@ pub async fn start_slack_bot(app_state: Arc<AppState>, runtime: SlackRuntimeCont
             id
         }
         Err(e) => {
-            error!("Failed to resolve Slack bot user ID: {e}");
+            error!(
+                "Slack channel failed to start: {e}. If this is an authentication error, \
+                 check `slack.bot_token` and `slack.app_token` — run `microclaw setup`."
+            );
             return;
         }
     };
@@ -802,6 +940,9 @@ async fn run_socket_mode(
 ) -> Result<(), String> {
     let ws_url = open_socket_mode_connection(app_token).await?;
     info!("Slack Socket Mode: connecting to WebSocket...");
+
+    crate::tls::ensure_rustls_crypto_provider()
+        .map_err(|e| format!("WebSocket TLS init failed: {e}"))?;
 
     let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
@@ -1029,6 +1170,21 @@ async fn handle_slack_message(
         return;
     }
 
+    // Inject voice/audio transcription into the inbound text so the agent sees
+    // the transcribed message instead of an empty file-only event.
+    let injected = maybe_inject_slack_audio_transcripts(
+        &app_state,
+        bot_token,
+        &files,
+        user,
+        text,
+        runtime.inbound_image_max_bytes,
+    )
+    .await;
+    let voice_inbound = injected.is_some();
+    let text_owned = injected.unwrap_or_else(|| text.to_string());
+    let text: &str = &text_owned;
+
     let trimmed = text.trim();
     let mention_tag = format!("<@{bot_user_id}>");
     let should_respond = is_dm || is_app_mention || text.contains(&mention_tag);
@@ -1088,9 +1244,6 @@ async fn handle_slack_message(
     } else {
         None
     };
-
-    let chat_lock = slack_chat_lock(&runtime.channel_name, &external_chat_id);
-    let _guard = chat_lock.lock().await;
 
     // Store incoming message
     let stored = StoredMessage {
@@ -1184,31 +1337,80 @@ async fn handle_slack_message(
         }
     }
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let slack_chat_type = if is_dm { "private" } else { "group" };
+    let turn_guard = match app_state
+        .chat_turn_queue
+        .try_start_or_enqueue(
+            &runtime.channel_name,
+            chat_id,
+            PendingMessage {
+                sender_name: user.to_string(),
+                content: text.to_string(),
+                message_id: inbound_message_id.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+    {
+        Some(guard) => guard,
+        None => {
+            info!(
+                "Slack: message queued (chat busy): chat_id={}, message_id={}",
+                chat_id, inbound_message_id
+            );
+            return;
+        }
+    };
 
-    match process_with_agent_with_events(
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    // Live event tap: echo MidTurnInjection acks and detect send_message tool
+    // usage concurrently with the running agent loop.
+    let injection_ack: Option<crate::channels::event_tap::InjectionAck> =
+        if app_state.config.mid_turn_injection_echo {
+            let token_for_tap = bot_token.to_string();
+            let channel_for_tap = channel.to_string();
+            let thread_for_tap = normalized_thread_ts.map(|s| s.to_string());
+            Some(Box::new(move |count| {
+                let token = token_for_tap.clone();
+                let channel = channel_for_tap.clone();
+                let thread = thread_for_tap.clone();
+                Box::pin(async move {
+                    let text = crate::channels::event_tap::mid_turn_injection_ack_text(count);
+                    if let Err(e) =
+                        send_slack_response(&token, &channel, thread.as_deref(), &text).await
+                    {
+                        warn!("Slack: failed to send mid-turn injection ack: {e}");
+                    }
+                })
+            }))
+        } else {
+            None
+        };
+    let mut tap = crate::channels::event_tap::EventTap::spawn(event_rx, injection_ack);
+
+    match process_with_agent_with_events_guarded(
         &app_state,
         AgentRequestContext {
             caller_channel: &runtime.channel_name,
             chat_id,
-            chat_type: if is_dm { "private" } else { "group" },
+            chat_type: slack_chat_type,
         },
         None,
         image_data,
         Some(&event_tx),
+        Some(turn_guard),
     )
     .await
     {
         Ok(response) => {
             drop(event_tx);
-            let mut used_send_message_tool = false;
-            while let Some(event) = event_rx.recv().await {
-                if let AgentEvent::ToolStart { name, .. } = event {
-                    if name == "send_message" {
-                        used_send_message_tool = true;
-                    }
-                }
-            }
+            let response_for_voice = response.clone();
+            while tap.replay_rx.recv().await.is_some() {}
+            let used_send_message_tool = tap
+                .join
+                .await
+                .map(|r| r.used_send_message_tool)
+                .unwrap_or(false);
 
             if used_send_message_tool {
                 if !response.is_empty() {
@@ -1250,6 +1452,32 @@ async fn handle_slack_message(
                 let _ =
                     call_blocking(app_state.db.clone(), move |db| db.store_message(&bot_msg)).await;
             }
+
+            // Voice round-trip: synthesize the reply as audio and upload via
+            // files.upload so Slack renders it as an inline audio file.
+            if voice_inbound
+                && crate::voice::round_trip_enabled(&app_state.config)
+                && !response_for_voice.trim().is_empty()
+            {
+                match crate::voice::synth_speech_to_temp(&app_state.config, &response_for_voice)
+                    .await
+                {
+                    Ok(audio_path) => {
+                        if let Err(e) = upload_slack_voice_reply(
+                            bot_token,
+                            channel,
+                            normalized_thread_ts,
+                            &audio_path,
+                        )
+                        .await
+                        {
+                            warn!("Slack voice round-trip: upload failed: {e}");
+                        }
+                        let _ = tokio::fs::remove_file(&audio_path).await;
+                    }
+                    Err(e) => warn!("Slack voice round-trip: synth failed: {e}"),
+                }
+            }
         }
         Err(e) => {
             error!("Error processing Slack message: {e}");
@@ -1264,6 +1492,9 @@ async fn handle_slack_message(
             }
         }
     }
+
+    // If messages were queued during this run, re-dispatch to process them.
+    maybe_rerun_for_pending(app_state, &runtime.channel_name, chat_id, slack_chat_type);
 }
 
 #[cfg(test)]

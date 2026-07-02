@@ -9,10 +9,12 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{error, info, warn};
 
-use crate::agent_engine::process_with_agent_with_events;
+use crate::agent_engine::maybe_rerun_for_pending;
+use crate::agent_engine::process_with_agent_with_events_guarded;
 use crate::agent_engine::should_suppress_user_error;
 use crate::agent_engine::AgentEvent;
 use crate::agent_engine::AgentRequestContext;
+use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::should_drop_recent_duplicate_message;
 use crate::chat_commands::maybe_handle_plugin_command;
 use crate::chat_commands::{handle_chat_command, is_slash_command, unknown_command_response};
@@ -165,6 +167,8 @@ pub struct FeishuChannelConfig {
     pub accounts: HashMap<String, FeishuAccountConfig>,
     #[serde(default)]
     pub default_account: Option<String>,
+    #[serde(default)]
+    pub ack_reaction: bool,
 }
 
 fn pick_default_account_id(
@@ -230,6 +234,7 @@ pub fn build_feishu_runtime_contexts(config: &crate::config::Config) -> Vec<Feis
             show_progress: account_cfg.show_progress,
             accounts: HashMap::new(),
             default_account: None,
+            ack_reaction: feishu_cfg.ack_reaction,
         };
         let bot_username = if account_cfg.bot_username.trim().is_empty() {
             config.bot_username_for_channel(&channel_name)
@@ -279,8 +284,6 @@ async fn maybe_plugin_slash_response(
     maybe_handle_plugin_command(config, text, chat_id, channel_name).await
 }
 
-static FEISHU_CHAT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
 static FEISHU_RUNTIME_START_MS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 static FEISHU_RUNTIME_BOT_OPEN_ID: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
@@ -320,18 +323,6 @@ fn runtime_bot_open_id(channel_name: &str) -> Option<String> {
         .lock()
         .ok()
         .and_then(|map| map.get(channel_name).cloned())
-}
-
-fn feishu_chat_lock(channel_name: &str, external_chat_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let key = format!("{channel_name}:{external_chat_id}");
-    let cache = FEISHU_CHAT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut guard) = cache.lock() else {
-        return Arc::new(tokio::sync::Mutex::new(()));
-    };
-    guard
-        .entry(key)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1322,25 @@ pub(crate) fn system_prompt_extension(caller_channel: &str) -> Option<&'static s
     }
 }
 
+// ---------------------------------------------------------------------------
+// ACK Reaction (已读标记)
+// ---------------------------------------------------------------------------
+
+const FEISHU_ACK_REACTIONS: &[&str] = &[
+    "OK", "THUMBSUP", "DONE", "SMILE", "APPLAUSE", "MUSCLE",
+];
+
+fn pick_uniform_index(len: usize, seed: &str) -> usize {
+    debug_assert!(len > 0);
+    // Simple hash-based selection using message text as seed
+    let hash: u64 = seed.bytes().fold(0u64, |acc, b| acc.wrapping_mul(33).wrapping_add(b as u64));
+    (hash as usize) % len
+}
+
+fn random_feishu_ack_reaction(text: &str) -> &'static str {
+    FEISHU_ACK_REACTIONS[pick_uniform_index(FEISHU_ACK_REACTIONS.len(), text)]
+}
+
 fn normalize_reaction_alias(input: &str) -> String {
     input
         .chars()
@@ -2104,7 +2114,10 @@ pub async fn start_feishu_bot(app_state: Arc<AppState>, runtime: FeishuRuntimeCo
     {
         Ok(t) => t,
         Err(e) => {
-            error!("Feishu: failed to get initial token: {e}");
+            error!(
+                "Feishu channel failed to start: could not obtain a tenant token: {e}. \
+                 This is usually a bad `feishu.app_id` / `feishu.app_secret` — run `microclaw setup`."
+            );
             return;
         }
     };
@@ -2116,7 +2129,10 @@ pub async fn start_feishu_bot(app_state: Arc<AppState>, runtime: FeishuRuntimeCo
             id
         }
         Err(e) => {
-            error!("Feishu: failed to resolve bot open_id: {e}");
+            error!(
+                "Feishu: failed to resolve bot open_id: {e}. \
+                 Check the app credentials and permissions (run `microclaw setup`)."
+            );
             return;
         }
     };
@@ -2173,6 +2189,9 @@ async fn run_ws_connection(
     let ping_secs = ping_interval.unwrap_or(120);
 
     info!("Feishu WS: connecting (service_id={service_id}, ping_interval={ping_secs}s)");
+
+    crate::tls::ensure_rustls_crypto_provider()
+        .map_err(|e| format!("WebSocket TLS init failed: {e}"))?;
 
     let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
@@ -2442,6 +2461,42 @@ async fn handle_feishu_event(
         return;
     }
 
+    // Send ACK reaction (已读标记) — only when enabled in config
+    if feishu_cfg.ack_reaction {
+    let ack_http_client = http_client.clone();
+    let ack_base_url = base_url.to_string();
+    let ack_app_id = feishu_cfg.app_id.clone();
+    let ack_app_secret = feishu_cfg.app_secret.clone();
+    let ack_message_id = message_id.to_string();
+    let ack_text = text.clone();
+    tokio::spawn(async move {
+        // Send ACK reaction with locale-aware emoji
+        let emoji = random_feishu_ack_reaction(&ack_text);
+        let token = match get_token(
+            &ack_http_client,
+            &ack_base_url,
+            &ack_app_id,
+            &ack_app_secret,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        if let Err(e) = send_feishu_reaction(
+            &ack_http_client,
+            &ack_base_url,
+            &token,
+            &ack_message_id,
+            emoji,
+        )
+        .await
+        {
+            warn!("Feishu: ACK reaction failed for {}: {}", ack_message_id, e);
+        }
+    });
+    }
+
     // Group mentions: direct @bot and @all are treated as mention signals.
     let mention_flags = if !is_dm {
         let mut flags = parse_feishu_mentions(
@@ -2665,10 +2720,43 @@ async fn handle_feishu_message(
         "audio" => {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(content_raw) {
                 if let Some(file_key) = v.get("file_key").and_then(|k| k.as_str()) {
-                    text = format!(
-                        "[audio message] file_key={} (audio transcription not yet supported for Feishu)",
-                        file_key
-                    );
+                    if crate::voice::can_transcribe(&app_state.config) {
+                        match download_feishu_resource(
+                            &http_client,
+                            base_url,
+                            &token,
+                            message_id,
+                            file_key,
+                            "file",
+                        )
+                        .await
+                        {
+                            Ok(bytes) => {
+                                match crate::voice::transcribe_audio(&app_state.config, &bytes)
+                                    .await
+                                {
+                                    Ok(transcription) => {
+                                        text = crate::voice::format_voice_inbound(
+                                            user,
+                                            &transcription,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("Feishu: voice transcription failed: {e}");
+                                        text = crate::voice::format_voice_inbound_error(user, &e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Feishu: failed to download audio {file_key}: {e}");
+                                text = crate::voice::format_voice_inbound_error(user, &e);
+                            }
+                        }
+                    } else {
+                        text = format!(
+                            "[audio message] file_key={file_key} (transcription disabled — set openai_api_key or voice_transcription_command)"
+                        );
+                    }
                 }
             }
         }
@@ -2769,9 +2857,6 @@ async fn handle_feishu_message(
         return;
     }
 
-    let chat_lock = feishu_chat_lock(&runtime.channel_name, external_chat_id);
-    let _guard = chat_lock.lock().await;
-
     // Determine if we should respond
     if !should_respond {
         info!(
@@ -2780,6 +2865,31 @@ async fn handle_feishu_message(
         );
         return;
     }
+
+    let feishu_chat_type = if is_dm { "private" } else { "group" };
+    let turn_guard = match app_state
+        .chat_turn_queue
+        .try_start_or_enqueue(
+            &runtime.channel_name,
+            chat_id,
+            PendingMessage {
+                sender_name: user.to_string(),
+                content: inbound_text.clone(),
+                message_id: inbound_message_id.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+    {
+        Some(guard) => guard,
+        None => {
+            info!(
+                "Feishu: message queued (chat busy): chat_id={}, message_id={}",
+                chat_id, inbound_message_id
+            );
+            return;
+        }
+    };
 
     info!(
         "Feishu message from {} in {}: {}",
@@ -2849,6 +2959,12 @@ async fn handle_feishu_message(
                             dirty = true;
                         }
                     }
+                    Ok(Some(AgentEvent::MidTurnInjection { count })) => {
+                        lines.push(
+                            crate::channels::event_tap::mid_turn_injection_ack_text(count),
+                        );
+                        dirty = true;
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(_) => {}
@@ -2917,16 +3033,17 @@ async fn handle_feishu_message(
             });
         });
 
-        match process_with_agent_with_events(
+        match process_with_agent_with_events_guarded(
             &app_state,
             AgentRequestContext {
                 caller_channel: &runtime.channel_name,
                 chat_id,
-                chat_type: if is_dm { "private" } else { "group" },
+                chat_type: feishu_chat_type,
             },
             None,
             image_data,
             Some(&event_tx),
+            Some(turn_guard),
         )
         .await
         {
@@ -3109,29 +3226,70 @@ async fn handle_feishu_message(
             }
         }
     } else {
-        match process_with_agent_with_events(
+        // Live event tap: echo MidTurnInjection acks concurrently with the
+        // agent loop. `used_send_message_tool` is still detected post-hoc
+        // below via ToolResult (Feishu uses the success-only signal).
+        let injection_ack: Option<crate::channels::event_tap::InjectionAck> =
+            if app_state.config.mid_turn_injection_echo {
+                let http_for_tap = http_client.clone();
+                let base_for_tap = base_url.to_string();
+                let token_for_tap = token.clone();
+                let chat_for_tap = external_chat_id.to_string();
+                let reply_to_for_tap = message_id.to_string();
+                let topic_mode_for_tap = topic_mode;
+                Some(Box::new(move |count| {
+                    let http = http_for_tap.clone();
+                    let base = base_for_tap.clone();
+                    let token = token_for_tap.clone();
+                    let chat = chat_for_tap.clone();
+                    let reply_to = reply_to_for_tap.clone();
+                    Box::pin(async move {
+                        let text =
+                            crate::channels::event_tap::mid_turn_injection_ack_text(count);
+                        if let Err(e) = send_feishu_response(
+                            &http,
+                            &base,
+                            &token,
+                            &chat,
+                            &text,
+                            &reply_to,
+                            topic_mode_for_tap,
+                        )
+                        .await
+                        {
+                            warn!("Feishu: failed to send mid-turn injection ack: {e}");
+                        }
+                    })
+                }))
+            } else {
+                None
+            };
+        let mut tap = crate::channels::event_tap::EventTap::spawn(event_rx, injection_ack);
+        match process_with_agent_with_events_guarded(
             &app_state,
             AgentRequestContext {
                 caller_channel: &runtime.channel_name,
                 chat_id,
-                chat_type: if is_dm { "private" } else { "group" },
+                chat_type: feishu_chat_type,
             },
             None,
             image_data,
             Some(&event_tx),
+            Some(turn_guard),
         )
         .await
         {
             Ok(response) => {
                 drop(event_tx);
                 let mut used_send_message_tool = false;
-                while let Some(event) = event_rx.recv().await {
+                while let Some(event) = tap.replay_rx.recv().await {
                     if let AgentEvent::ToolResult { name, is_error, .. } = event {
                         if name == "send_message" && !is_error {
                             used_send_message_tool = true;
                         }
                     }
                 }
+                let _ = tap.join.await;
                 let (visible_response, thinking_text) =
                     split_feishu_visible_and_thinking(&response);
                 if !thinking_text.is_empty() {
@@ -3302,6 +3460,9 @@ async fn handle_feishu_message(
             }
         }
     }
+
+    // If messages were queued during this run, re-dispatch to process them.
+    maybe_rerun_for_pending(app_state, &runtime.channel_name, chat_id, feishu_chat_type);
 }
 
 #[cfg(test)]
@@ -3560,5 +3721,19 @@ accounts:
         let runtimes = build_feishu_runtime_contexts(&cfg);
         assert_eq!(runtimes.len(), 1);
         assert!(runtimes[0].config.topic_mode);
+    }
+
+    #[test]
+    fn pick_uniform_index_is_deterministic() {
+        let idx1 = pick_uniform_index(6, "hello");
+        let idx2 = pick_uniform_index(6, "hello");
+        assert_eq!(idx1, idx2);
+        assert!(idx1 < 6);
+    }
+
+    #[test]
+    fn random_feishu_ack_reaction_returns_valid_emoji() {
+        let emoji = random_feishu_ack_reaction("test message");
+        assert!(FEISHU_ACK_REACTIONS.contains(&emoji));
     }
 }

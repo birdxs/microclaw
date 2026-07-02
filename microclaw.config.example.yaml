@@ -23,12 +23,33 @@ model: ""
 max_tokens: 8192
 # Max tool loop iterations per message
 max_tool_iterations: 100
+# Optional per-task auxiliary models. Each slot names a (typically cheaper) model
+# used for a specific ancillary task instead of the main conversation model. The
+# auxiliary model runs on the SAME provider/credentials as the main model — only
+# the model name is swapped — and falls back to the main model when unset.
+# aux_models:
+#   compaction: claude-haiku-4-5   # cheaper model for context/history summarization
+#   reflector: claude-haiku-4-5    # cheaper model for the background memory reflector
+#   title: claude-haiku-4-5        # cheaper model for short session-title generation
+#   vision: claude-haiku-4-5       # model for image description (overrides media.vision.model)
+# Inject pending messages into the active agent loop between iterations (mid-turn injection)
+enable_mid_turn_injection: true
+# On non-web channels (Telegram, Discord, Slack, Feishu, Matrix, WeChat),
+# send a small ack message when a mid-turn injection happens so the user
+# sees their follow-up was received instead of waiting for the turn to end.
+mid_turn_injection_echo: true
 # Chat history context size
 max_history_messages: 50
 # Maximum inbound Telegram document size in MB
 max_document_size_mb: 100
 # Estimated token budget for injecting structured memories into system prompt
 memory_token_budget: 1500
+# Graph-augmented recall: expand the temporal knowledge graph from entities the
+# query mentions and inject connected ("# Connected") facts the flat layers miss.
+# Local-only (no embeddings/LLM); uses the graph the reflector already builds.
+memory_graph_recall_enabled: true
+memory_graph_max_hops: 2      # clamped to 1-3
+memory_graph_max_triples: 10  # 0 disables
 # Optional embedding runtime config (requires binary built with --features sqlite-vec)
 # embedding_provider: "openai"   # openai | ollama
 # embedding_api_key: ""
@@ -52,6 +73,40 @@ working_dir_isolation: "chat"
 # IANA timezone for scheduling (e.g. "US/Eastern", "Europe/London")
 timezone: "UTC"
 
+# Web-search backend used by the `web_search` and `deep_research` tools.
+# Defaults to DuckDuckGo (no API key). A backend selected without its
+# credentials/endpoint transparently degrades to DuckDuckGo instead of failing.
+#   backend: duckduckgo | searxng | brave | tavily
+#   searxng_base_url: self-hosted SearXNG instance (great on a $5 VPS; no key)
+#   brave_api_key / tavily_api_key: API keys for the hosted providers
+#   max_results: results per query (default 8, capped at 20)
+# web_search:
+#   backend: searxng
+#   searxng_base_url: "http://127.0.0.1:8888"
+#   brave_api_key: ""
+#   tavily_api_key: ""
+#   max_results: 8
+
+# Outbound guardrail — scans delivered bot messages for credential-like strings
+# (API keys, tokens, PEM private keys, Bearer/`api_key=` patterns) before they
+# leave the bot. Off by default. `redact` masks the secret and still delivers;
+# `block` withholds the whole message. Emails/phone numbers are NOT touched.
+#   mode: off | redact | block
+# output_guardrail:
+#   mode: redact
+
+# RTK (Rust Token Killer) integration — opt-in, off by default.
+# When enabled, bash tool commands are passed through `rtk rewrite` before
+# execution: commands RTK recognizes (git, cargo, npm, ls, grep, docker, ...)
+# run as `rtk <command>` and return compressed output (60-90% fewer tokens);
+# commands without an RTK equivalent run unchanged. Requires the rtk binary
+# (https://github.com/rtk-ai/rtk) on the host. If a sandboxed execution
+# environment lacks rtk, MicroClaw automatically falls back to the original
+# command.
+# rtk:
+#   enabled: true
+#   binary_path: "rtk"
+
 # OpenAI API key for voice transcription via Whisper (optional)
 # openai_api_key: ""
 
@@ -64,6 +119,22 @@ timezone: "UTC"
 # Session management
 max_session_messages: 40
 compact_keep_recent: 20
+
+# Anthropic prompt caching (system_and_3 strategy).
+# When enabled, microclaw inserts up to 4 cache_control breakpoints per
+# request — system prompt + last 3 messages — so multi-turn chats hit the
+# Anthropic prompt cache and re-use prior input tokens (~75% input cost
+# reduction on long sessions). Anthropic-only; no effect on OpenAI-compat
+# providers.
+anthropic_prompt_cache_enabled: true
+# "5m" or "1h". 1h requires extended-cache opt-in on the API key.
+anthropic_prompt_cache_ttl: "5m"
+
+# Filesystem checkpoints (off by default).
+# When on, microclaw snapshots the chat's working_dir at the start of every
+# agent turn into a shadow git repo under <data_dir>/checkpoints. Use
+# `/rewind` to list, `/rewind <hash>` to restore. Requires `git` on PATH.
+checkpoints_enabled: false
 
 # Control chats can operate across chats (send_message/schedule/memory global/export/todo).
 # Non-control chats are restricted to their own chat_id.
@@ -230,3 +301,80 @@ web_session_idle_ttl_seconds: 300
 #   no_network: true
 #   require_runtime: true
 #   # mount_allowlist_path: "~/.microclaw/sandbox-mount-allowlist.txt"
+
+# Concurrent sub-agents (the "specialist team" that runs tasks in the background).
+# All fields are optional and shown with their defaults.
+# subagents:
+#   max_concurrent: 4              # global cap on simultaneously running sub-agents
+#   max_active_per_chat: 5         # cap on active runs per chat
+#   run_timeout_secs: 900          # per-run timeout
+#   announce_to_chat: true         # post a message when a run completes
+#   fan_in_summary: false          # when a batch of child tasks all finish, post one combined summary
+#   progress_reports: true         # whether sub-agents may post mid-run "📊 progress" updates to chat
+#   # How often a long-running sub-agent may post a "📊 progress" update (seconds).
+#   progress_min_interval_secs: 45
+#   # Proactive task standup: periodically post a one-line status for tasks that
+#   # have been running a while. OFF by default since it sends unprompted messages.
+#   standup:
+#     enabled: false
+#     interval_secs: 1800          # min seconds between standups per chat
+
+# Proactive long-silence check-in: after a chat is quiet for a while, let the bot
+# reach out IF it has something genuinely useful to say. OFF by default (it sends
+# unprompted messages and uses an LLM call per idle chat).
+# idle_checkin:
+#   enabled: false
+#   idle_hours: 24                 # only consider a chat idle after this many hours of silence
+#   min_interval_hours: 24         # at most one check-in per chat per this many hours
+
+# "Sleep-time" memory consolidation: when a chat is idle, run a deterministic
+# (no-LLM) background pass that archives near-duplicate memories so the store stops
+# accumulating redundancy between reflector runs. PROFILE memories are never touched,
+# archiving is reversible, and the pass is capped + throttled. OFF by default.
+# sleep_time:
+#   enabled: false
+#   idle_hours: 6                  # only consolidate a chat after this many hours of silence
+#   min_interval_hours: 24         # at most one consolidation pass per chat per this many hours
+#   similarity_threshold: 0.82     # Jaccard similarity at/above which same-category memories are duplicates
+#   max_archived_per_pass: 20      # safety cap on archives per chat per pass
+
+# "Inner thoughts" interjection: in an active group chat where the bot wasn't
+# addressed, occasionally chime in IF it has something genuinely worth saying.
+# OFF by default (it speaks unprompted in groups and uses an LLM call per check).
+# interjection:
+#   enabled: false
+#   min_interval_secs: 900         # at most one unprompted interjection per chat per this window
+#   lookback_mins: 10              # only consider chats with user messages this recent
+
+# Multimedia tools. All OFF by default. Credentials are shared via media.api_key
+# / media.base_url (falling back to MICROCLAW_OPENAI_API_KEY, OPENAI_API_KEY, or
+# top-level openai_api_key / openai_base_url). Individual tools may override the
+# endpoint + key (e.g. point TTS at a dedicated speech provider). Enable only the
+# tools you want the bot to use.
+# media:
+#   # api_key: ""                  # shared key for all media tools (below)
+#   # base_url: ""                 # shared OpenAI-compatible endpoint (default api.openai.com/v1)
+#   image_gen:
+#     enabled: false               # generate_image tool
+#   tts:
+#     enabled: false               # text_to_speech tool (also required by podcast)
+#     model: tts-1
+#     default_voice: alloy
+#     # base_url: ""               # TTS-specific endpoint override (falls back to media.base_url)
+#     # api_key: ""                # TTS-specific key override (falls back to media.api_key)
+#   # Generate a book → PDF (render_pdf tool). Pure-Rust, self-contained, no
+#   # external binaries. For CJK (Chinese/Japanese/Korean) output, point
+#   # font_path at a single-face TrueType (.ttf) CJK font.
+#   book:
+#     enabled: false
+#     page_size: A4                # A4 or Letter
+#     # font_path: /System/Library/Fonts/Supplemental/Arial Unicode.ttf
+#   # Generate a podcast episode (generate_podcast tool). Needs media.tts enabled
+#   # and an ffmpeg binary on PATH (or set ffmpeg_path).
+#   podcast:
+#     enabled: false
+#     ffmpeg_path: ffmpeg
+#     default_voice: alloy
+#     segment_pause_ms: 500        # silence inserted between segments
+#     # base_url: ""               # podcast-specific endpoint (falls back to media.tts.base_url)
+#     # api_key: ""                # podcast-specific key (falls back to media.tts.api_key)

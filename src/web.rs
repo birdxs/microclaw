@@ -31,6 +31,7 @@ use microclaw_storage::usage::build_usage_report;
 
 mod a2a;
 mod auth;
+mod chat_abort;
 mod config;
 mod metrics;
 mod middleware;
@@ -40,7 +41,7 @@ mod stream;
 mod ws;
 use middleware::*;
 
-static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web/dist");
+include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 pub(crate) const DEFAULT_WEB_PASSWORD: &str = "helloworld";
 
 pub struct WebAdapter;
@@ -194,6 +195,7 @@ struct RunChannel {
     history: VecDeque<RunEvent>,
     next_id: u64,
     done: bool,
+    aborted: bool,
     owner_actor: String,
 }
 
@@ -214,6 +216,7 @@ impl RunHub {
                 history: VecDeque::new(),
                 next_id: 1,
                 done: false,
+                aborted: false,
                 owner_actor,
             },
         );
@@ -237,6 +240,10 @@ impl RunHub {
         channel.history.push_back(evt.clone());
         if evt.event == "done" || evt.event == "error" {
             channel.done = true;
+        }
+        if evt.event == "aborted" {
+            channel.done = true;
+            channel.aborted = true;
         }
         let _ = channel.sender.send(evt);
     }
@@ -2330,6 +2337,8 @@ mod tests {
             embedding: None,
             memory_backend: memory_backend.clone(),
             tools: ToolRegistry::new(&cfg, channel_registry, db, memory_backend),
+            chat_turn_queue: Arc::new(crate::chat_turn_queue::ChatTurnQueue::new(20)),
+            skill_review_queue: crate::skill_review::build_skill_review_channel().0,
             metric_exporter: None,
             trace_exporter: None,
             log_exporter: None,
@@ -2375,7 +2384,8 @@ mod tests {
     async fn seed_test_api_key_with_scopes(state: &WebState, secret: &str, scopes: &[String]) {
         let secret_owned = secret.to_string();
         let key_hash = sha256_hex(&secret_owned);
-        let prefix = secret_owned[..secret_owned.len().min(6)].to_string();
+        let safe_end = microclaw_core::text::floor_char_boundary(&secret_owned, 6);
+        let prefix = secret_owned[..safe_end].to_string();
         let scopes = scopes.to_vec();
         call_blocking(state.app_state.db.clone(), move |db| {
             db.upsert_auth_password_hash(&make_password_hash("passw0rd!"))?;
@@ -5365,9 +5375,14 @@ commands:
             .await
             .unwrap();
         assert!(done);
-        assert!(replay.iter().any(|evt| {
-            evt.event == "done" && evt.data.contains(crate::run_control::STOPPED_TEXT)
-        }));
+        // When a run is aborted, replay should contain an "aborted" event (not "done").
+        // The "aborted" event carries partial buffered text, which may be null if no
+        // text was generated before the abort signal was processed.
+        assert!(
+            replay.iter().any(|evt| evt.event == "aborted"),
+            "expected 'aborted' event in replay, got: {:?}",
+            replay
+        );
 
         server.abort();
     }

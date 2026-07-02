@@ -9,11 +9,13 @@ use futures_util::FutureExt;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::chat_turn_queue::ChatTurnQueue;
 use crate::channels::dingtalk::{build_dingtalk_runtime_contexts, DingTalkRuntimeContext};
 use crate::channels::discord::{build_discord_runtime_contexts, DiscordRuntimeContext};
 use crate::channels::email::{build_email_runtime_contexts, EmailRuntimeContext};
 use crate::channels::feishu::{build_feishu_runtime_contexts, FeishuRuntimeContext};
 use crate::channels::imessage::{build_imessage_runtime_contexts, IMessageRuntimeContext};
+#[cfg(feature = "channel-matrix")]
 use crate::channels::matrix::{build_matrix_runtime_contexts, MatrixRuntimeContext};
 use crate::channels::nostr::{build_nostr_runtime_contexts, NostrRuntimeContext};
 use crate::channels::qq::{build_qq_runtime_contexts, QQRuntimeContext};
@@ -24,10 +26,12 @@ use crate::channels::telegram::{
 };
 use crate::channels::weixin::{build_weixin_runtime_contexts, WeixinRuntimeContext};
 use crate::channels::whatsapp::{build_whatsapp_runtime_contexts, WhatsAppRuntimeContext};
+use crate::channels::DiscordAdapter;
+#[cfg(feature = "channel-matrix")]
+use crate::channels::MatrixAdapter;
 use crate::channels::{
-    DingTalkAdapter, DiscordAdapter, EmailAdapter, FeishuAdapter, IMessageAdapter, IrcAdapter,
-    MatrixAdapter, NostrAdapter, QQAdapter, SignalAdapter, SlackAdapter, TelegramAdapter,
-    WeixinAdapter, WhatsAppAdapter,
+    DingTalkAdapter, EmailAdapter, FeishuAdapter, IMessageAdapter, IrcAdapter, NostrAdapter,
+    QQAdapter, SignalAdapter, SlackAdapter, TelegramAdapter, WeixinAdapter, WhatsAppAdapter,
 };
 use crate::config::normalize_model_name;
 use crate::config::Config;
@@ -45,6 +49,16 @@ use microclaw_observability::metrics::OtlpMetricExporter;
 use microclaw_observability::traces::OtlpTraceExporter;
 use microclaw_storage::db::Database;
 
+#[cfg(not(feature = "channel-matrix"))]
+fn warn_missing_feature(config: &Config, channel_key: &str, feature_name: &str) {
+    if config.channel_enabled(channel_key) {
+        warn!(
+            "Channel '{}' is enabled in config, but this binary was built without the '{}' feature",
+            channel_key, feature_name
+        );
+    }
+}
+
 pub struct AppState {
     pub config: Config,
     pub channel_registry: Arc<ChannelRegistry>,
@@ -58,6 +72,8 @@ pub struct AppState {
     pub embedding: Option<Arc<dyn EmbeddingProvider>>,
     pub memory_backend: Arc<MemoryBackend>,
     pub tools: ToolRegistry,
+    pub chat_turn_queue: Arc<ChatTurnQueue>,
+    pub skill_review_queue: crate::skill_review::SkillReviewQueue,
     pub metric_exporter: Option<Arc<OtlpMetricExporter>>,
     pub trace_exporter: Option<Arc<OtlpTraceExporter>>,
     pub log_exporter: Option<Arc<OtlpLogExporter>>,
@@ -160,6 +176,7 @@ pub async fn run(
 
     // Build channel registry from config
     let mut registry = ChannelRegistry::new();
+    registry.set_output_guardrail(config.output_guardrail.mode);
     let mut telegram_runtimes: Vec<(teloxide::Bot, TelegramRuntimeContext)> = Vec::new();
     let mut llm_model_overrides: HashMap<String, String> = HashMap::new();
     let discord_runtimes: Vec<(String, DiscordRuntimeContext)> = prepare_channel_runtimes(
@@ -222,6 +239,7 @@ pub async fn run(
                 .map(|model| (runtime.channel_name.clone(), model))
         },
     );
+    #[cfg(feature = "channel-matrix")]
     let matrix_runtimes: Vec<MatrixRuntimeContext> = prepare_channel_runtimes(
         &config,
         "matrix",
@@ -237,6 +255,8 @@ pub async fn run(
         },
         |_| None,
     );
+    #[cfg(not(feature = "channel-matrix"))]
+    warn_missing_feature(&config, "matrix", "channel-matrix");
     let whatsapp_runtimes: Vec<WhatsAppRuntimeContext> = prepare_channel_runtimes(
         &config,
         "whatsapp",
@@ -442,13 +462,15 @@ pub async fn run(
     let memory_backend = Arc::new(MemoryBackend::new(
         db.clone(),
         crate::memory_backend::MemoryMcpClient::discover(&mcp_manager),
+        &config.data_dir,
     ));
-    let mut tools = ToolRegistry::new(
+    let tools = ToolRegistry::new(
         &config,
         channel_registry.clone(),
         db.clone(),
         memory_backend.clone(),
     );
+    let mut tools = tools;
 
     for (server, tool_info) in mcp_manager.all_tools() {
         tools.add_tool(Box::new(crate::tools::mcp::McpTool::new(server, tool_info)));
@@ -460,6 +482,13 @@ pub async fn run(
     let metric_exporter = OtlpMetricExporter::from_observability(config.observability.as_ref());
     let trace_exporter = OtlpTraceExporter::from_observability(config.observability.as_ref());
     let log_exporter = OtlpLogExporter::from_observability(config.observability.as_ref());
+
+    let chat_turn_queue = Arc::new(ChatTurnQueue::new(
+        config.chat_turn_queue_max_pending,
+    ));
+
+    let (skill_review_queue, skill_review_worker) =
+        crate::skill_review::build_skill_review_channel();
 
     let state = Arc::new(AppState {
         config,
@@ -474,6 +503,8 @@ pub async fn run(
         embedding,
         memory_backend,
         tools,
+        chat_turn_queue,
+        skill_review_queue,
         metric_exporter,
         trace_exporter,
         log_exporter,
@@ -488,6 +519,17 @@ pub async fn run(
 
     crate::scheduler::spawn_scheduler(state.clone());
     crate::scheduler::spawn_reflector(state.clone());
+    crate::scheduler::spawn_task_standup(state.clone());
+    crate::scheduler::spawn_idle_checkin(state.clone());
+    crate::scheduler::spawn_memory_consolidation(state.clone());
+    crate::scheduler::spawn_interjection(state.clone());
+    {
+        let review_state = state.clone();
+        spawn_guarded("skill_review_worker".to_string(), async move {
+            crate::skill_review::spawn_skill_review_worker(review_state, skill_review_worker)
+                .await;
+        });
+    }
     if state.config.subagents.announce_to_chat {
         let relay_state = state.clone();
         spawn_guarded("subagents_announce_relay".to_string(), async move {
@@ -570,7 +612,11 @@ pub async fn run(
         );
     }
 
+    #[cfg(feature = "channel-matrix")]
     let has_matrix = !matrix_runtimes.is_empty();
+    #[cfg(not(feature = "channel-matrix"))]
+    let has_matrix = false;
+    #[cfg(feature = "channel-matrix")]
     if has_matrix {
         spawn_channel_runtimes(
             state.clone(),

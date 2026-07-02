@@ -12,6 +12,23 @@
         pkgs = import nixpkgs {
           inherit system;
         };
+        webAssets = pkgs.buildNpmPackage {
+          pname = "microclaw-web-assets";
+          version = "0.1.0";
+          src = ./web;
+          npmBuildScript = "build";
+          npmDeps = pkgs.importNpmLock {
+            npmRoot = ./web;
+          };
+          npmConfigHook = pkgs.importNpmLock.npmConfigHook;
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp -r dist $out/dist
+            runHook postInstall
+          '';
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -55,6 +72,10 @@
             OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
             OPENSSL_INCLUDE_DIR = "${pkgs.openssl.dev}/include";
             LD_LIBRARY_PATH = "${pkgs.openssl.out}/lib:${pkgs.sqlite}/lib:${pkgs.libsodium}/lib";
+            preBuild = ''
+              rm -rf web/dist
+              cp -r ${webAssets}/dist web/dist
+            '';
             doCheck = false;
           };
           default = self.packages.${system}.microclaw;

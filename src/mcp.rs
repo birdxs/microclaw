@@ -258,14 +258,15 @@ impl McpServer {
                     ));
                 }
                 let resolved = resolve_command(&config.command);
-                let transport = TokioChildProcess::new(Command::new(&resolved).configure(|cmd| {
-                    cmd.args(&config.args);
-                    cmd.envs(&config.env);
-                    cmd.stderr(std::process::Stdio::null());
-                    #[cfg(windows)]
-                    hide_windows_subprocess_window_tokio(cmd);
-                }))
-                .map_err(|e| format!("Failed to spawn MCP server '{name}': {e}"))?;
+                let transport =
+                    TokioChildProcess::new(Command::new(&resolved).configure(|cmd| {
+                        cmd.args(&config.args);
+                        cmd.envs(&config.env);
+                        cmd.stderr(std::process::Stdio::null());
+                        #[cfg(windows)]
+                        hide_windows_subprocess_window_tokio(cmd);
+                    }))
+                    .map_err(|e| format!("Failed to spawn MCP server '{name}': {e}"))?;
 
                 let running = client_info.clone().serve(transport).await.map_err(|e| {
                     format!("Failed to initialize MCP server '{name}' (stdio): {e}")
@@ -275,13 +276,14 @@ impl McpServer {
             "streamable_http" | "http" => {
                 if config.endpoint.trim().is_empty() {
                     return Err(format!(
-                        "MCP server '{name}' requires `endpoint` when transport=streamable_http"
-                    ));
+                    "MCP server '{name}' requires `endpoint` when transport=streamable_http"
+                ));
                 }
                 let mut custom_headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
                 for (k, v) in &config.headers {
-                    let header_name = HeaderName::from_bytes(k.as_bytes())
-                        .map_err(|e| format!("Invalid header name '{k}' for MCP '{name}': {e}"))?;
+                    let header_name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+                        format!("Invalid header name '{k}' for MCP '{name}': {e}")
+                    })?;
                     let header_value = HeaderValue::from_str(v).map_err(|e| {
                         format!("Invalid header value for '{k}' in MCP '{name}': {e}")
                     })?;
@@ -291,10 +293,9 @@ impl McpServer {
                     StreamableHttpClientTransportConfig::with_uri(config.endpoint.as_str())
                         .custom_headers(custom_headers);
                 let transport = StreamableHttpClientTransport::from_config(http_config);
-                let running =
-                    client_info.clone().serve(transport).await.map_err(|e| {
-                        format!("Failed to initialize MCP server '{name}' (http): {e}")
-                    })?;
+                let running = client_info.clone().serve(transport).await.map_err(|e| {
+                    format!("Failed to initialize MCP server '{name}' (http): {e}")
+                })?;
                 McpPeer::Http(running)
             }
             other => {
@@ -401,8 +402,9 @@ impl McpServer {
         let tools = rmcp_tools
             .into_iter()
             .map(|t| {
-                let input_schema = serde_json::to_value(&*t.input_schema)
-                    .unwrap_or_else(|_| serde_json::json!({"type": "object", "properties": {}}));
+                let input_schema = serde_json::to_value(&*t.input_schema).unwrap_or_else(
+                    |_| serde_json::json!({"type": "object", "properties": {}}),
+                );
                 McpToolInfo {
                     server_name: self.name.clone(),
                     name: t.name.into_owned(),
@@ -599,7 +601,10 @@ impl McpManager {
         Self::from_config_paths(&[PathBuf::from(path)], default_request_timeout_secs).await
     }
 
-    pub async fn from_config_paths(paths: &[PathBuf], default_request_timeout_secs: u64) -> Self {
+    pub async fn from_config_paths(
+        paths: &[PathBuf],
+        default_request_timeout_secs: u64,
+    ) -> Self {
         let default_request_timeout_secs =
             resolve_request_timeout_secs(None, default_request_timeout_secs);
         let (loaded_any_config, merged_default_protocol_version, merged_servers) =
@@ -715,8 +720,9 @@ fn load_config_from_path(path: &Path) -> Option<McpConfig> {
 fn build_client_info(requested_protocol: Option<String>) -> ClientInfo {
     let mut info = ClientInfo::default();
     if let Some(protocol_version) = requested_protocol {
-        let parsed = serde_json::from_value::<ProtocolVersion>(serde_json::json!(protocol_version))
-            .unwrap_or_else(|_| ProtocolVersion::default());
+        let parsed =
+            serde_json::from_value::<ProtocolVersion>(serde_json::json!(protocol_version))
+                .unwrap_or_else(|_| ProtocolVersion::default());
         info = info.with_protocol_version(parsed);
     }
     info
@@ -782,13 +788,13 @@ mod tests {
     #[test]
     fn test_mcp_config_defaults() {
         let json = r#"{
-          "mcpServers": {
-            "demo": {
-              "command": "npx",
-              "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
-            }
-          }
-        }"#;
+      "mcpServers": {
+        "demo": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+        }
+      }
+    }"#;
 
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
         let server = cfg.mcp_servers.get("demo").unwrap();
@@ -812,17 +818,17 @@ mod tests {
     #[test]
     fn test_mcp_http_config_parse() {
         let json = r#"{
-          "default_protocol_version": "2024-11-05",
-          "mcpServers": {
-            "remote": {
-              "transport": "streamable_http",
-              "endpoint": "http://127.0.0.1:8080/mcp",
-              "headers": {"Authorization": "Bearer test"},
-              "max_retries": 3,
-              "health_interval_secs": 15
-            }
-          }
-        }"#;
+      "default_protocol_version": "2024-11-05",
+      "mcpServers": {
+        "remote": {
+          "transport": "streamable_http",
+          "endpoint": "http://127.0.0.1:8080/mcp",
+          "headers": {"Authorization": "Bearer test"},
+          "max_retries": 3,
+          "health_interval_secs": 15
+        }
+      }
+    }"#;
 
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.default_protocol_version.unwrap(), "2024-11-05");
@@ -844,16 +850,16 @@ mod tests {
     #[test]
     fn test_mcp_bulkhead_and_rate_limit_parse() {
         let json = r#"{
-          "mcpServers": {
-            "remote": {
-              "transport": "streamable_http",
-              "endpoint": "http://127.0.0.1:8080/mcp",
-              "max_concurrent_requests": 6,
-              "queue_wait_ms": 500,
-              "rate_limit_per_minute": 240
-            }
-          }
-        }"#;
+      "mcpServers": {
+        "remote": {
+          "transport": "streamable_http",
+          "endpoint": "http://127.0.0.1:8080/mcp",
+          "max_concurrent_requests": 6,
+          "queue_wait_ms": 500,
+          "rate_limit_per_minute": 240
+        }
+      }
+    }"#;
 
         let cfg: McpConfig = serde_json::from_str(json).unwrap();
         let remote = cfg.mcp_servers.get("remote").unwrap();
@@ -872,31 +878,31 @@ mod tests {
         std::fs::write(
             &base,
             r#"{
-              "defaultProtocolVersion": "2024-11-05",
-              "mcpServers": {
-                "shared": {
-                  "transport": "streamable_http",
-                  "endpoint": "http://127.0.0.1:7001/mcp"
-                }
-              }
-            }"#,
+          "defaultProtocolVersion": "2024-11-05",
+          "mcpServers": {
+            "shared": {
+              "transport": "streamable_http",
+              "endpoint": "http://127.0.0.1:7001/mcp"
+            }
+          }
+        }"#,
         )
         .unwrap();
         std::fs::write(
             &override_cfg,
             r#"{
-              "defaultProtocolVersion": "2025-12-01",
-              "mcpServers": {
-                "shared": {
-                  "transport": "streamable_http",
-                  "endpoint": "http://127.0.0.1:7002/mcp"
-                },
-                "extra": {
-                  "transport": "streamable_http",
-                  "endpoint": "http://127.0.0.1:7003/mcp"
-                }
-              }
-            }"#,
+          "defaultProtocolVersion": "2025-12-01",
+          "mcpServers": {
+            "shared": {
+              "transport": "streamable_http",
+              "endpoint": "http://127.0.0.1:7002/mcp"
+            },
+            "extra": {
+              "transport": "streamable_http",
+              "endpoint": "http://127.0.0.1:7003/mcp"
+            }
+          }
+        }"#,
         )
         .unwrap();
 

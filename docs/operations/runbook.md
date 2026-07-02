@@ -296,6 +296,13 @@ If any configured MCP server exposes both `memory_query` and `memory_upsert`, Mi
 - explicit `remember ...` fast path writes
 - reflector insert/update/supersede/touch flows
 - structured memory tool operations (`structured_memory_search/update/delete`)
+- knowledge graph tool operations (`knowledge_graph_query/add`) continue to use local SQLite knowledge graph storage
+
+Structured-memory prompt injection is layered:
+- L0 identity (`PROFILE`) slice from `memory_token_budget`
+- L1 essential high-confidence slice
+- L2 query-relevant fill
+- L3 deep recall via tool calls (not auto-injected)
 
 Fallback policy:
 

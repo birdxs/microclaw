@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use crate::mcp::{McpManager, McpServer, McpToolInfo};
 use microclaw_core::error::MicroClawError;
+use microclaw_core::text::floor_char_boundary;
 use microclaw_storage::db::{call_blocking, Database, Memory};
 
 #[derive(Clone)]
@@ -163,11 +164,37 @@ fn invalid_memory_payload(op: impl Into<String>, detail: impl Into<String>) -> M
     MemoryProviderFailure::invalid_payload(op, detail).into_error()
 }
 
+/// Append a write-ahead log entry for memory operations (for auditing and poisoning detection).
+/// Spawns a background task — never blocks the write path.
+fn audit_memory_write(data_dir: &str, entry: serde_json::Value) {
+    let data_dir = data_dir.to_string();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let wal_dir = std::path::Path::new(&data_dir).join("runtime").join("wal");
+            std::fs::create_dir_all(&wal_dir)?;
+            let path = wal_dir.join("memory_writes.jsonl");
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            let mut line = serde_json::to_string(&entry).unwrap_or_default();
+            line.push('\n');
+            file.write_all(line.as_bytes())
+        })
+        .await;
+        if let Err(e) = result {
+            tracing::debug!("Memory WAL write failed (non-critical): {e}");
+        }
+    });
+}
+
 pub struct MemoryBackend {
     provider: Arc<dyn MemoryProvider>,
     stats: Arc<MemoryBackendStats>,
     primary_provider: Option<Arc<dyn MemoryProvider>>,
     primary_provider_name: Option<String>,
+    data_dir: String,
 }
 
 type ProviderBundle = (
@@ -177,7 +204,7 @@ type ProviderBundle = (
 );
 
 impl MemoryBackend {
-    pub fn new(db: Arc<Database>, mcp: Option<MemoryMcpClient>) -> Self {
+    pub fn new(db: Arc<Database>, mcp: Option<MemoryMcpClient>, data_dir: &str) -> Self {
         let stats = Arc::new(MemoryBackendStats::new());
         let sqlite: Arc<dyn MemoryProvider> = Arc::new(SqliteMemoryProvider::new(db.clone()));
         let (provider, primary_provider, primary_provider_name): ProviderBundle = match mcp {
@@ -201,6 +228,7 @@ impl MemoryBackend {
             stats,
             primary_provider,
             primary_provider_name,
+            data_dir: data_dir.to_string(),
         }
     }
 
@@ -210,6 +238,7 @@ impl MemoryBackend {
             stats: Arc::new(MemoryBackendStats::new()),
             primary_provider: None,
             primary_provider_name: None,
+            data_dir: String::new(),
         }
     }
 
@@ -220,6 +249,7 @@ impl MemoryBackend {
             stats: Arc::new(MemoryBackendStats::new()),
             primary_provider: None,
             primary_provider_name: None,
+            data_dir: String::new(),
         }
     }
 
@@ -234,6 +264,7 @@ impl MemoryBackend {
             stats,
             primary_provider: None,
             primary_provider_name,
+            data_dir: String::new(),
         }
     }
 
@@ -316,6 +347,21 @@ impl MemoryBackend {
         source: &str,
         confidence: f64,
     ) -> Result<i64, MicroClawError> {
+        if !self.data_dir.is_empty() {
+            audit_memory_write(
+                &self.data_dir,
+                serde_json::json!({
+                    "op": "insert",
+                    "chat_id": chat_id,
+                    "category": category,
+                    "source": source,
+                    "confidence": confidence,
+                    "content_len": content.len(),
+                    "content_preview": &content[..floor_char_boundary(content, 100)],
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                }),
+            );
+        }
         self.provider
             .insert_memory_with_metadata(chat_id, content, category, source, confidence)
             .await
@@ -1224,6 +1270,10 @@ fn parse_single_memory_strict(value: &serde_json::Value) -> Result<Memory, Strin
             .get("archived_at")
             .and_then(|v| v.as_str())
             .map(|v| v.to_string()),
+        expires_at: obj
+            .get("expires_at")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
     })
 }
 
@@ -1272,6 +1322,7 @@ mod tests {
             last_seen_at: "2026-03-10T00:00:00Z".to_string(),
             is_archived: false,
             archived_at: None,
+            expires_at: None,
         }
     }
 

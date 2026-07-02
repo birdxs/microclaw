@@ -121,15 +121,16 @@ jobs:
           exit 1
 
   build-assets:
-    name: Build ${{ matrix.label }}
-    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.target.label }}-${{ matrix.flavor }}
+    runs-on: ${{ matrix.target.os }}
     needs: verify-ci
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        flavor: [default, full]
+        target:
           - label: linux-x86_64
             os: ubuntu-latest
             bin: microclaw
@@ -183,30 +184,66 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release
+        shell: bash
+        run: |
+          if [ "${{ matrix.flavor }}" = "full" ]; then
+            cargo build --release --features full
+          else
+            cargo build --release
+          fi
 
-      - name: Package archive (Linux)
-        if: matrix.archive_ext == 'tar.gz'
+      - name: Prepare packaged binary name (Unix)
+        if: matrix.target.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          if [ "${{ matrix.flavor }}" = "full" ]; then
+            cp "target/release/${{ matrix.target.bin }}" "target/release/microclaw-full"
+          fi
+
+      - name: Package archive (Unix)
+        if: matrix.target.archive_ext == 'tar.gz'
         shell: bash
         run: |
           RELEASE_VERSION="${RELEASE_TAG#v}"
-          ASSET_NAME="microclaw-${RELEASE_VERSION}-${{ matrix.asset_triple }}.tar.gz"
-          tar -czf "$ASSET_NAME" -C target/release "${{ matrix.bin }}"
+          if [ "${{ matrix.flavor }}" = "full" ]; then
+            ASSET_PREFIX="microclaw-full"
+            PACKAGED_BIN="microclaw-full"
+          else
+            ASSET_PREFIX="microclaw"
+            PACKAGED_BIN="${{ matrix.target.bin }}"
+          fi
+          ASSET_NAME="${ASSET_PREFIX}-${RELEASE_VERSION}-${{ matrix.target.asset_triple }}.tar.gz"
+          tar -czf "$ASSET_NAME" -C target/release "${PACKAGED_BIN}"
           echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
 
+      - name: Prepare packaged binary name (Windows)
+        if: matrix.target.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          if ("${{ matrix.flavor }}" -eq "full") {
+            Copy-Item "target/release/${{ matrix.target.bin }}" "target/release/microclaw-full.exe" -Force
+          }
+
       - name: Package archive (Windows)
-        if: matrix.archive_ext == 'zip'
+        if: matrix.target.archive_ext == 'zip'
         shell: pwsh
         run: |
           $releaseVersion = $env:RELEASE_TAG -replace '^v', ''
-          $assetName = "microclaw-${releaseVersion}-${{ matrix.asset_triple }}.zip"
-          Compress-Archive -Path "target/release/${{ matrix.bin }}" -DestinationPath $assetName -Force
+          if ("${{ matrix.flavor }}" -eq "full") {
+            $assetPrefix = "microclaw-full"
+            $packagedBin = "microclaw-full.exe"
+          } else {
+            $assetPrefix = "microclaw"
+            $packagedBin = "${{ matrix.target.bin }}"
+          }
+          $assetName = "${assetPrefix}-${releaseVersion}-${{ matrix.target.asset_triple }}.zip"
+          Compress-Archive -Path "target/release/${packagedBin}" -DestinationPath $assetName -Force
           "ASSET_NAME=$assetName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.label }}
+          name: ${{ matrix.target.label }}-${{ matrix.flavor }}
           path: ${{ env.ASSET_NAME }}
           if-no-files-found: error
 

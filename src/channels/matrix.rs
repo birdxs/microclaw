@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use matrix_sdk::attachment::AttachmentConfig;
@@ -21,10 +21,12 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::agent_engine::process_with_agent_with_events;
+use crate::agent_engine::maybe_rerun_for_pending;
+use crate::agent_engine::process_with_agent_with_events_guarded;
 use crate::agent_engine::should_suppress_user_error;
 use crate::agent_engine::AgentEvent;
 use crate::agent_engine::AgentRequestContext;
+use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::{
     mark_channel_started, should_drop_pre_start_message, should_drop_recent_duplicate_message,
 };
@@ -81,21 +83,7 @@ fn matrix_sdk_clients() -> &'static RwLock<HashMap<String, Arc<MatrixSdkClient>>
     CLIENTS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn matrix_chat_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
-    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
-fn matrix_chat_lock(channel_name: &str, room_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let key = format!("{channel_name}:{room_id}");
-    let Ok(mut guard) = matrix_chat_locks().lock() else {
-        return Arc::new(tokio::sync::Mutex::new(()));
-    };
-    guard
-        .entry(key)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
 
 fn default_matrix_mention_required() -> bool {
     true
@@ -1706,9 +1694,6 @@ async fn handle_matrix_reaction(
     runtime: MatrixRuntimeContext,
     reaction: MatrixIncomingReaction,
 ) {
-    let chat_lock = matrix_chat_lock(&runtime.channel_name, &reaction.room_id);
-    let _guard = chat_lock.lock().await;
-
     let chat_id = resolve_matrix_chat_id(
         app_state.clone(),
         &runtime,
@@ -2140,9 +2125,6 @@ async fn handle_matrix_message(
         return;
     }
 
-    let chat_lock = matrix_chat_lock(&runtime.channel_name, &msg.room_id);
-    let _guard = chat_lock.lock().await;
-
     let incoming = StoredMessage {
         id: inbound_event_id.clone(),
         chat_id,
@@ -2167,6 +2149,31 @@ async fn handle_matrix_message(
         return;
     }
 
+    let matrix_chat_type = if msg.is_direct { "private" } else { "group" };
+    let turn_guard = match app_state
+        .chat_turn_queue
+        .try_start_or_enqueue(
+            &runtime.channel_name,
+            chat_id,
+            PendingMessage {
+                sender_name: msg.sender.clone(),
+                content: msg.body.clone(),
+                message_id: inbound_event_id.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+    {
+        Some(guard) => guard,
+        None => {
+            info!(
+                "Matrix: message queued (chat busy): chat_id={}, event_id={}",
+                chat_id, inbound_event_id
+            );
+            return;
+        }
+    };
+
     info!(
         "Matrix message from {} in {}: {}",
         msg.sender,
@@ -2174,22 +2181,47 @@ async fn handle_matrix_message(
         msg.body.chars().take(100).collect::<String>()
     );
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
 
     // Check if streaming is enabled for this room
     let streaming_config = runtime.streaming.clone();
     let use_streaming = streaming_config.enabled;
 
-    match process_with_agent_with_events(
+    // Live event tap: echo MidTurnInjection acks and detect send_message
+    // tool usage concurrently with the running agent loop.
+    let injection_ack: Option<crate::channels::event_tap::InjectionAck> =
+        if app_state.config.mid_turn_injection_echo {
+            let runtime_for_tap = runtime.clone();
+            let room_for_tap = msg.room_id.clone();
+            let prefer_sdk = msg.prefer_sdk_send;
+            Some(Box::new(move |count| {
+                let runtime = runtime_for_tap.clone();
+                let room = room_for_tap.clone();
+                Box::pin(async move {
+                    let text = crate::channels::event_tap::mid_turn_injection_ack_text(count);
+                    if let Err(e) =
+                        send_matrix_text_runtime(&runtime, &room, &text, prefer_sdk).await
+                    {
+                        warn!("Matrix: failed to send mid-turn injection ack: {e}");
+                    }
+                })
+            }))
+        } else {
+            None
+        };
+    let mut tap = crate::channels::event_tap::EventTap::spawn(event_rx, injection_ack);
+
+    match process_with_agent_with_events_guarded(
         &app_state,
         AgentRequestContext {
             caller_channel: &runtime.channel_name,
             chat_id,
-            chat_type: if msg.is_direct { "private" } else { "group" },
+            chat_type: matrix_chat_type,
         },
         None,
         None,
         Some(&event_tx),
+        Some(turn_guard),
     )
     .await
     {
@@ -2201,7 +2233,7 @@ async fn handle_matrix_message(
                 match send_matrix_streaming_response(
                     &runtime,
                     &msg.room_id,
-                    &mut event_rx,
+                    &mut tap.replay_rx,
                     &streaming_config,
                     msg.prefer_sdk_send,
                 )
@@ -2235,15 +2267,14 @@ async fn handle_matrix_message(
                 }
             }
 
-            // Regular (non-streaming) handling
-            let mut used_send_message_tool = false;
-            while let Some(event) = event_rx.recv().await {
-                if let AgentEvent::ToolStart { name, .. } = event {
-                    if name == "send_message" {
-                        used_send_message_tool = true;
-                    }
-                }
-            }
+            // Regular (non-streaming) handling. Drain whatever events the tap
+            // forwarded; `used_send_message_tool` is detected by the tap.
+            while tap.replay_rx.recv().await.is_some() {}
+            let used_send_message_tool = tap
+                .join
+                .await
+                .map(|r| r.used_send_message_tool)
+                .unwrap_or(false);
 
             if used_send_message_tool {
                 if !response.is_empty() {
@@ -2332,6 +2363,9 @@ async fn handle_matrix_message(
             }
         }
     }
+
+    // If messages were queued during this run, re-dispatch to process them.
+    maybe_rerun_for_pending(app_state, &runtime.channel_name, chat_id, matrix_chat_type);
 }
 
 #[cfg(test)]

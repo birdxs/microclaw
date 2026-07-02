@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文](README_CN.md)
 
-[![Website](https://img.shields.io/badge/Website-microclaw.ai-blue)](https://microclaw.ai)
+[![Website](https://img.shields.io/badge/Website-microclaw.org-blue)](https://microclaw.org)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/pvmezwkAk5)
 [![Reddit](https://img.shields.io/badge/Reddit-r%2Fmicroclaw-FF4500?logo=reddit&logoColor=white)](https://www.reddit.com/r/microclaw/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -59,7 +59,7 @@ MicroClaw 是一个面向聊天渠道的智能体运行时。它提供统一的�
 安装：
 
 ```sh
-curl -fsSL https://microclaw.ai/install.sh | bash
+curl -fsSL https://microclaw.org/install.sh | bash
 ```
 
 运行诊断：
@@ -93,13 +93,13 @@ http://127.0.0.1:10961
 ### 一键安装（推荐）
 
 ```sh
-curl -fsSL https://microclaw.ai/install.sh | bash
+curl -fsSL https://microclaw.org/install.sh | bash
 ```
 
 ### Windows PowerShell 安装
 
 ```powershell
-iwr https://microclaw.ai/install.ps1 -UseBasicParsing | iex
+iwr https://microclaw.org/install.ps1 -UseBasicParsing | iex
 ```
 
 安装脚本仅执行一种方式：
@@ -111,6 +111,33 @@ iwr https://microclaw.ai/install.ps1 -UseBasicParsing | iex
 ```sh
 microclaw upgrade
 ```
+
+### Linux 系统要求
+
+预编译的 Linux 二进制是基于 **glibc 2.39**（`ubuntu-latest` 的工具链）构建的，**未做静态链接**，因此只能在系统 glibc 为 **2.39 或更高**的发行版上运行。在更老的系统上会报类似错误：
+
+```
+microclaw: /lib64/libc.so.6: version `GLIBC_2.39' not found (required by microclaw)
+```
+
+开箱即用的发行版：
+
+| 发行版                  | glibc | 状态 |
+| ----------------------- | ----- | ---- |
+| Ubuntu 24.04 LTS+       | 2.39  | ✅ 可用 |
+| Debian 13 (trixie)+     | 2.41  | ✅ 可用 |
+| AlmaLinux / Rocky / RHEL 10+ | 2.39 | ✅ 可用 |
+| Fedora 40+              | 2.39  | ✅ 可用 |
+| Debian 12 (bookworm)    | 2.36  | ❌ 太旧 |
+| AlmaLinux / RHEL 8–9    | 2.28–2.34 | ❌ 太旧 |
+| Ubuntu 22.04 / 20.04    | 2.35 / 2.31 | ❌ 太旧 |
+
+用 `ldd --version` 查看本机版本。二进制还依赖 **OpenSSL 3**（`libssl.so.3`）；仍是 OpenSSL 1.1 的发行版需先安装 OpenSSL 3 运行库（例如 `dnf install openssl3-libs`）。
+
+如果发行版太旧，有三种办法：
+1. 升级/重装到受支持的版本（如 Ubuntu 24.04 或 AlmaLinux 10）。
+2. 用更新的基础镜像在容器里运行（`docker run ... ubuntu:24.04`）。
+3. 在目标机器上从源码构建——见 [从源码构建](#从源码构建)。用 `x86_64-unknown-linux-musl` 目标做全静态构建，可同时摆脱 glibc 和 OpenSSL 的系统依赖。
 
 ### 预检诊断（doctor）
 
@@ -139,13 +166,13 @@ microclaw doctor sandbox
 macOS/Linux：
 
 ```sh
-curl -fsSL https://microclaw.ai/uninstall.sh | bash
+curl -fsSL https://microclaw.org/uninstall.sh | bash
 ```
 
 Windows PowerShell：
 
 ```powershell
-iwr https://microclaw.ai/uninstall.ps1 -UseBasicParsing | iex
+iwr https://microclaw.org/uninstall.ps1 -UseBasicParsing | iex
 ```
 
 ### Homebrew (macOS)
@@ -254,7 +281,7 @@ sqlite3 <data_dir>/runtime/microclaw.db "SELECT id, chat_id, chat_channel, exter
 
 ## 博客文章
 
-关于项目架构与设计取舍的介绍文章：**[Building MicroClaw: An Agentic AI Assistant in Rust That Lives in Your Chats](https://microclaw.ai/blog/building-microclaw)**
+关于项目架构与设计取舍的介绍文章：**[Building MicroClaw: An Agentic AI Assistant in Rust That Lives in Your Chats](https://microclaw.org/blog/building-microclaw)**
 
 ## 功能特性
 

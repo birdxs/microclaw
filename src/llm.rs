@@ -18,11 +18,61 @@ use crate::codex_auth::{
 use crate::config::WorkingDirIsolation;
 use crate::config::{resolve_model_name_with_fallback, Config};
 use crate::http_client::llm_user_agent;
+use crate::setup::default_base_url_for_provider;
 use microclaw_core::error::MicroClawError;
 use microclaw_core::llm_types::{
     ContentBlock, ImageSource, Message, MessageContent, MessagesRequest, MessagesResponse,
     ResponseContentBlock, ToolDefinition, Usage,
 };
+
+/// HTTP statuses worth retrying: rate limit (429), Anthropic "overloaded"
+/// (529), and transient server errors (500/502/503/504). Everything else
+/// (400/401/403/404/422 …) is terminal — retrying just fails again and hides
+/// the real problem.
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 529 | 500 | 502 | 503 | 504)
+}
+
+/// Transport-level failures (connection refused, reset, timeout) are transient
+/// and safe to retry on a fresh request — the server never saw a complete
+/// request, so there is no risk of duplicating a side effect.
+pub(crate) fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+/// Parse a `Retry-After` header in delta-seconds form (the HTTP-date form is
+/// ignored — providers use seconds in practice).
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
+}
+
+/// Backoff for retry `attempt` (1-based): exponential (2^attempt seconds) capped
+/// at 32s, with "equal jitter" (half fixed, half random) so a burst of callers
+/// — e.g. many cron tasks firing at once — don't retry in lockstep and stampede
+/// the provider. Never returns less than a server-provided `Retry-After`.
+fn retry_backoff(attempt: u32, retry_after: Option<std::time::Duration>) -> std::time::Duration {
+    let exp = 2u64.saturating_pow(attempt).min(32);
+    let half = (exp / 2).max(1);
+    // Cheap jitter source; randomness quality is irrelevant, we only need to
+    // desynchronize concurrent retriers.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    let jittered = half + (nanos % (half + 1));
+    let base = std::time::Duration::from_secs(jittered);
+    match retry_after {
+        Some(ra) => base.max(ra),
+        None => base,
+    }
+}
 
 /// Remove invalid `ToolResult` blocks that cannot be matched to the most recent
 /// assistant `ToolUse` turn. This can happen after session compaction or
@@ -263,6 +313,8 @@ pub struct AnthropicProvider {
     model: String,
     max_tokens: u32,
     base_url: String,
+    prompt_cache_enabled: bool,
+    prompt_cache_ttl: String,
 }
 
 impl AnthropicProvider {
@@ -273,7 +325,24 @@ impl AnthropicProvider {
             model: config.model.clone(),
             max_tokens: config.max_tokens,
             base_url: resolve_anthropic_messages_url(config.llm_base_url.as_deref().unwrap_or("")),
+            prompt_cache_enabled: config.anthropic_prompt_cache_enabled,
+            prompt_cache_ttl: config.anthropic_prompt_cache_ttl.clone(),
         }
+    }
+
+    /// Serialize the request and, if prompt caching is enabled, mutate the
+    /// JSON body to add cache_control breakpoints.
+    fn build_request_body(
+        &self,
+        request: &MessagesRequest,
+    ) -> Result<serde_json::Value, MicroClawError> {
+        let mut body = serde_json::to_value(request).map_err(|e| {
+            MicroClawError::LlmApi(format!("failed to serialize Anthropic request: {e}"))
+        })?;
+        if self.prompt_cache_enabled {
+            crate::prompt_cache::apply_anthropic_prompt_cache(&mut body, &self.prompt_cache_ttl);
+        }
+        Ok(body)
     }
 
     async fn send_message_stream_single_pass(
@@ -292,13 +361,14 @@ impl AnthropicProvider {
             "Sending LLM stream request"
         );
 
+        let body = self.build_request_body(&streamed_request)?;
         let response = self
             .http
             .post(&self.base_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&streamed_request)
+            .json(&body)
             .send()
             .await?;
 
@@ -631,15 +701,24 @@ fn process_openai_stream_event(
 
             let entry = tool_calls.entry(index).or_default();
             if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                entry.id = id.to_string();
+                if !id.is_empty() {
+                    entry.id = id.to_string();
+                }
             }
             if let Some(function) = tc.get("function") {
                 if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                    entry.name = name.to_string();
+                    if !name.is_empty() {
+                        entry.name = name.to_string();
+                    }
                 }
                 if let Some(args) = function.get("arguments") {
                     match args {
-                        serde_json::Value::String(s) => entry.input_json.push_str(s),
+                        serde_json::Value::String(s) => {
+                            if !s.is_empty() {
+                                entry.input_json.push_str(s);
+                            }
+                        }
+                        serde_json::Value::Null => {}
                         other => entry.input_json.push_str(&other.to_string()),
                     }
                 }
@@ -688,6 +767,23 @@ fn parse_tool_input(input_json: &str) -> serde_json::Value {
         return json!({});
     }
     serde_json::from_str(trimmed).unwrap_or_else(|_| json!({}))
+}
+
+fn normalize_tool_input_for_request(input: &serde_json::Value) -> serde_json::Value {
+    match input {
+        serde_json::Value::Object(_) => input.clone(),
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return json!({});
+            }
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+                _ => json!({}),
+            }
+        }
+        _ => json!({}),
+    }
 }
 
 fn minimax_tool_wrapper_regex() -> &'static Regex {
@@ -850,7 +946,7 @@ fn build_stream_response(
         }
         if let Some(tool) = tool_blocks.get(&index) {
             content.push(ResponseContentBlock::ToolUse {
-                id: tool.id.clone(),
+                id: sanitize_tool_id(&tool.id),
                 name: tool.name.clone(),
                 input: parse_tool_input(&tool.input_json),
                 thought_signature: tool.thought_signature.clone(),
@@ -925,17 +1021,31 @@ impl LlmProvider for AnthropicProvider {
 
         let mut retries = 0u32;
         let max_retries = 3;
+        let body = self.build_request_body(&request)?;
 
         loop {
-            let response = self
+            let send_result = self
                 .http
                 .post(&self.base_url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
-                .json(&request)
+                .json(&body)
                 .send()
-                .await?;
+                .await;
+            let response = match send_result {
+                Ok(r) => r,
+                Err(e) if is_retryable_transport_error(&e) && retries < max_retries => {
+                    retries += 1;
+                    let delay = retry_backoff(retries, None);
+                    warn!(
+                        "LLM transport error ({e}), retrying in {delay:?} (attempt {retries}/{max_retries})"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             let status = response.status();
 
@@ -947,12 +1057,12 @@ impl LlmProvider for AnthropicProvider {
                 return Ok(parsed);
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            if is_retryable_status(status.as_u16()) && retries < max_retries {
                 retries += 1;
-                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                let retry_after = parse_retry_after(response.headers());
+                let delay = retry_backoff(retries, retry_after);
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
-                    delay
+                    "Transient LLM error (HTTP {status}), retrying in {delay:?} (attempt {retries}/{max_retries})"
                 );
                 tokio::time::sleep(delay).await;
                 continue;
@@ -1037,7 +1147,9 @@ fn resolve_openai_compat_base(provider: &str, configured_base: &str) -> String {
     }
 
     if trimmed.is_empty() {
-        "https://api.openai.com/v1".to_string()
+        default_base_url_for_provider(provider)
+            .unwrap_or("https://api.openai.com/v1")
+            .to_string()
     } else {
         trimmed
     }
@@ -1048,7 +1160,8 @@ impl OpenAiProvider {
         let is_openai_codex = is_openai_codex_provider(&config.llm_provider);
         let is_deepseek_provider = config.llm_provider.eq_ignore_ascii_case("deepseek");
         let is_google_provider = config.llm_provider.eq_ignore_ascii_case("google");
-        let enable_reasoning_content_bridge = is_deepseek_provider || is_google_provider;
+        let enable_reasoning_content_bridge =
+            is_google_provider || (config.show_thinking && is_deepseek_provider);
         let enable_thinking_param =
             (is_deepseek_provider || is_google_provider) && config.show_thinking;
         let configured_base = config.llm_base_url.as_deref().unwrap_or("");
@@ -1321,6 +1434,48 @@ struct OaiErrorResponse {
 #[derive(Debug, Deserialize)]
 struct OaiErrorDetail {
     message: String,
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+impl OaiErrorDetail {
+    fn display(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(code) = &self.code {
+            let code_str = match code {
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            parts.push(code_str);
+        }
+        if let Some(t) = &self.r#type {
+            if !t.is_empty() {
+                parts.push(t.clone());
+            }
+        }
+        let prefix = if parts.is_empty() {
+            String::new()
+        } else {
+            format!("{}: ", parts.join(" "))
+        };
+        // OpenRouter includes upstream error details in metadata.raw
+        let raw_detail = self
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("raw"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if raw_detail.is_empty() {
+            format!("{prefix}{}", self.message)
+        } else {
+            format!("{prefix}{} — {raw_detail}", self.message)
+        }
+    }
 }
 
 fn should_retry_with_max_completion_tokens(error_text: &str) -> bool {
@@ -1447,10 +1602,11 @@ impl LlmProvider for OpenAiProvider {
                 .await;
         }
 
+        let sanitized = sanitize_messages(messages);
         let oai_messages = if self.enable_reasoning_content_bridge {
-            translate_messages_to_oai_with_reasoning(system, &messages, true)
+            translate_messages_to_oai_with_reasoning(system, &sanitized, true)
         } else {
-            translate_messages_to_oai(system, &messages)
+            translate_messages_to_oai(system, &sanitized)
         };
 
         let mut body = json!({
@@ -1463,7 +1619,7 @@ impl LlmProvider for OpenAiProvider {
             self.prefer_max_completion_tokens,
         );
         let thinking_enabled =
-            self.enable_thinking_param && !has_visible_reply_runtime_guard(&messages);
+            self.enable_thinking_param && !has_visible_reply_runtime_guard(&sanitized);
         maybe_enable_thinking_param(&mut body, &self.provider, thinking_enabled);
         apply_openai_compat_body_overrides(
             &mut body,
@@ -1486,6 +1642,14 @@ impl LlmProvider for OpenAiProvider {
         let mut retries = 0u32;
         let max_retries = 3;
 
+        debug!(
+            provider = %self.provider,
+            model = %model,
+            url = %self.chat_url,
+            has_api_key = !self.api_key.trim().is_empty(),
+            "Sending LLM request"
+        );
+
         loop {
             let mut req = self
                 .http
@@ -1495,7 +1659,19 @@ impl LlmProvider for OpenAiProvider {
             if !self.api_key.trim().is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", self.api_key));
             }
-            let response = req.send().await?;
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) if is_retryable_transport_error(&e) && retries < max_retries => {
+                    retries += 1;
+                    let delay = retry_backoff(retries, None);
+                    warn!(
+                        "LLM transport error ({e}), retrying in {delay:?} (attempt {retries}/{max_retries})"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             let status = response.status();
 
@@ -1512,12 +1688,12 @@ impl LlmProvider for OpenAiProvider {
                 ));
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            if is_retryable_status(status.as_u16()) && retries < max_retries {
                 retries += 1;
-                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                let retry_after = parse_retry_after(response.headers());
+                let delay = retry_backoff(retries, retry_after);
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
-                    delay
+                    "Transient LLM error (HTTP {status}), retrying in {delay:?} (attempt {retries}/{max_retries})"
                 );
                 tokio::time::sleep(delay).await;
                 continue;
@@ -1533,9 +1709,16 @@ impl LlmProvider for OpenAiProvider {
                 continue;
             }
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
-                return Err(MicroClawError::LlmApi(err.error.message));
+                return Err(MicroClawError::LlmApi(format!(
+                    "{} (url={})",
+                    err.error.display(),
+                    self.chat_url
+                )));
             }
-            return Err(MicroClawError::LlmApi(format!("HTTP {status}: {text}")));
+            return Err(MicroClawError::LlmApi(format!(
+                "HTTP {status} {}: {text}",
+                self.chat_url
+            )));
         }
     }
 
@@ -1580,10 +1763,11 @@ impl LlmProvider for OpenAiProvider {
             return Ok(response);
         }
 
+        let sanitized = sanitize_messages(messages);
         let oai_messages = if self.enable_reasoning_content_bridge {
-            translate_messages_to_oai_with_reasoning(system, &messages, true)
+            translate_messages_to_oai_with_reasoning(system, &sanitized, true)
         } else {
-            translate_messages_to_oai(system, &messages)
+            translate_messages_to_oai(system, &sanitized)
         };
 
         let mut body = json!({
@@ -1597,7 +1781,7 @@ impl LlmProvider for OpenAiProvider {
             self.prefer_max_completion_tokens,
         );
         let thinking_enabled =
-            self.enable_thinking_param && !has_visible_reply_runtime_guard(&messages);
+            self.enable_thinking_param && !has_visible_reply_runtime_guard(&sanitized);
         maybe_enable_thinking_param(&mut body, &self.provider, thinking_enabled);
         apply_openai_compat_body_overrides(
             &mut body,
@@ -1630,7 +1814,7 @@ impl LlmProvider for OpenAiProvider {
             provider = %self.provider,
             model = %model,
             url = %self.chat_url,
-            messages_count = messages.len(),
+            messages_count = sanitized.len(),
             "Sending LLM stream request"
         );
 
@@ -1668,9 +1852,16 @@ impl LlmProvider for OpenAiProvider {
                 continue;
             }
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
-                return Err(MicroClawError::LlmApi(err.error.message));
+                return Err(MicroClawError::LlmApi(format!(
+                    "{} (url={})",
+                    err.error.display(),
+                    self.chat_url
+                )));
             }
-            return Err(MicroClawError::LlmApi(format!("HTTP {status}: {text}")));
+            return Err(MicroClawError::LlmApi(format!(
+                "HTTP {status} {}: {text}",
+                self.chat_url
+            )));
         };
 
         let mut byte_stream = response.bytes_stream();
@@ -1732,7 +1923,7 @@ impl LlmProvider for OpenAiProvider {
         }
         for tool in tool_calls.values() {
             content.push(ResponseContentBlock::ToolUse {
-                id: tool.id.clone(),
+                id: sanitize_tool_id(&tool.id),
                 name: tool.name.clone(),
                 input: parse_tool_input(&tool.input_json),
                 thought_signature: tool.thought_signature.clone(),
@@ -1741,7 +1932,7 @@ impl LlmProvider for OpenAiProvider {
         if let Some(parsed_raw_calls) = raw_text_tool_calls {
             for tool in parsed_raw_calls {
                 content.push(ResponseContentBlock::ToolUse {
-                    id: tool.id,
+                    id: sanitize_tool_id(&tool.id),
                     name: tool.name,
                     input: parse_tool_input(&tool.input_json),
                     thought_signature: tool.thought_signature,
@@ -1828,7 +2019,19 @@ impl OpenAiProvider {
                     req = req.header("ChatGPT-Account-ID", account_id);
                 }
             }
-            let response = req.send().await?;
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) if is_retryable_transport_error(&e) && retries < max_retries => {
+                    retries += 1;
+                    let delay = retry_backoff(retries, None);
+                    warn!(
+                        "LLM transport error ({e}), retrying in {delay:?} (attempt {retries}/{max_retries})"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             let status = response.status();
 
             if status.is_success() {
@@ -1837,12 +2040,12 @@ impl OpenAiProvider {
                 return Ok(translate_oai_responses_response(parsed));
             }
 
-            if status.as_u16() == 429 && retries < max_retries {
+            if is_retryable_status(status.as_u16()) && retries < max_retries {
                 retries += 1;
-                let delay = std::time::Duration::from_secs(2u64.pow(retries));
+                let retry_after = parse_retry_after(response.headers());
+                let delay = retry_backoff(retries, retry_after);
                 warn!(
-                    "Rate limited, retrying in {:?} (attempt {retries}/{max_retries})",
-                    delay
+                    "Transient LLM error (HTTP {status}), retrying in {delay:?} (attempt {retries}/{max_retries})"
                 );
                 tokio::time::sleep(delay).await;
                 continue;
@@ -1850,7 +2053,7 @@ impl OpenAiProvider {
 
             let text = response.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(&text) {
-                return Err(MicroClawError::LlmApi(err.error.message));
+                return Err(MicroClawError::LlmApi(err.error.display()));
             }
             return Err(MicroClawError::LlmApi(format!("HTTP {status}: {text}")));
         }
@@ -1912,6 +2115,55 @@ fn translate_messages_to_oai_with_reasoning(
 ) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
     let mut pending_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Track the index of the last assistant message that had tool_calls
+    // so we can strip orphaned calls when no tool results follow.
+    let mut last_tool_call_assistant_idx: Option<usize> = None;
+
+    // If `pending_tool_ids` is non-empty, the last assistant's tool_calls
+    // were never resolved by subsequent tool results. Strip the tool_calls
+    // from that assistant message to avoid API errors.
+    let strip_orphaned_tool_calls =
+        |out: &mut Vec<serde_json::Value>,
+         pending: &mut std::collections::HashSet<String>,
+         last_idx: &mut Option<usize>| {
+            if !pending.is_empty() {
+                if let Some(idx) = last_idx.take() {
+                    if let Some(obj) = out.get_mut(idx).and_then(|e| e.as_object_mut()) {
+                        // Keep entries whose results were already emitted; dropping the
+                        // whole array would orphan those tool messages instead.
+                        let resolved: Vec<serde_json::Value> = obj
+                            .get("tool_calls")
+                            .and_then(|tc| tc.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter(|tc| {
+                                        tc["id"].as_str().is_none_or(|id| !pending.contains(id))
+                                    })
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if resolved.is_empty() {
+                            obj.remove("tool_calls");
+                            // On the reasoning-bridge path the assistant's text lives in
+                            // reasoning_content; fold it back into content. On the plain
+                            // path content is already set — leave it untouched.
+                            if let Some(text) = obj
+                                .remove("reasoning_content")
+                                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                            {
+                                obj.insert("content".to_string(), json!(text));
+                            } else if obj.get("content").is_none_or(|c| c.is_null()) {
+                                obj.insert("content".to_string(), json!(""));
+                            }
+                        } else {
+                            obj.insert("tool_calls".to_string(), json!(resolved));
+                        }
+                    }
+                }
+                pending.clear();
+            }
+        };
 
     // System message
     if !system.is_empty() {
@@ -1921,7 +2173,11 @@ fn translate_messages_to_oai_with_reasoning(
     for msg in messages {
         match &msg.content {
             MessageContent::Text(text) => {
-                pending_tool_ids.clear();
+                strip_orphaned_tool_calls(
+                    &mut out,
+                    &mut pending_tool_ids,
+                    &mut last_tool_call_assistant_idx,
+                );
                 out.push(json!({"role": msg.role, "content": text}));
             }
             MessageContent::Blocks(blocks) => {
@@ -1952,12 +2208,13 @@ fn translate_messages_to_oai_with_reasoning(
                                 input,
                                 thought_signature,
                             } => {
+                                let arguments = normalize_tool_input_for_request(input);
                                 let mut tc = json!({
                                     "id": id,
                                     "type": "function",
                                     "function": {
                                         "name": name,
-                                        "arguments": serde_json::to_string(input).unwrap_or_default()
+                                        "arguments": serde_json::to_string(&arguments).unwrap_or_default()
                                     }
                                 });
                                 if let Some(sig) = thought_signature {
@@ -1973,6 +2230,14 @@ fn translate_messages_to_oai_with_reasoning(
                         })
                         .collect();
 
+                    // If the previous assistant's tool_calls were never resolved,
+                    // strip them before emitting a new assistant.
+                    strip_orphaned_tool_calls(
+                        &mut out,
+                        &mut pending_tool_ids,
+                        &mut last_tool_call_assistant_idx,
+                    );
+
                     let mut m = json!({"role": "assistant"});
                     if include_reasoning_for_tool_calls && !tool_calls.is_empty() {
                         m["reasoning_content"] = json!(text);
@@ -1984,7 +2249,9 @@ fn translate_messages_to_oai_with_reasoning(
                         m["tool_calls"] = json!(tool_calls);
                     }
                     out.push(m);
+                    let has_any = !assistant_tool_ids.is_empty();
                     pending_tool_ids = assistant_tool_ids;
+                    last_tool_call_assistant_idx = if has_any { Some(out.len() - 1) } else { None };
                 } else {
                     // User role — tool_results, images, or text
                     let has_tool_results = blocks
@@ -2019,10 +2286,33 @@ fn translate_messages_to_oai_with_reasoning(
                             }
                         }
                         if !emitted_any_tool {
-                            pending_tool_ids.clear();
+                            strip_orphaned_tool_calls(
+                                &mut out,
+                                &mut pending_tool_ids,
+                                &mut last_tool_call_assistant_idx,
+                            );
+                        }
+                        // Text blocks co-located with tool_results (e.g. iteration-budget
+                        // warnings, mid-turn user message injections) have no place in the
+                        // OpenAI "role=tool" scheme. Emit them as a follow-up user message
+                        // so they still reach the model instead of being silently dropped.
+                        let extra_text: String = blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !extra_text.trim().is_empty() {
+                            out.push(json!({"role": "user", "content": extra_text}));
                         }
                     } else {
-                        pending_tool_ids.clear();
+                        strip_orphaned_tool_calls(
+                            &mut out,
+                            &mut pending_tool_ids,
+                            &mut last_tool_call_assistant_idx,
+                        );
                         // Images + text → multipart content array
                         let has_images = blocks
                             .iter()
@@ -2066,6 +2356,13 @@ fn translate_messages_to_oai_with_reasoning(
             }
         }
     }
+
+    // Final cleanup: strip unresolved tool_calls from trailing assistant
+    strip_orphaned_tool_calls(
+        &mut out,
+        &mut pending_tool_ids,
+        &mut last_tool_call_assistant_idx,
+    );
 
     out
 }
@@ -2143,11 +2440,12 @@ fn translate_messages_to_oai_responses_input(messages: &[Message]) -> Vec<serde_
                             id, name, input, ..
                         } = block
                         {
+                            let arguments = normalize_tool_input_for_request(input);
                             out.push(json!({
                                 "type": "function_call",
                                 "call_id": id,
                                 "name": name,
-                                "arguments": serde_json::to_string(input).unwrap_or_default(),
+                                "arguments": serde_json::to_string(&arguments).unwrap_or_default(),
                             }));
                         }
                     }
@@ -2184,6 +2482,24 @@ fn translate_messages_to_oai_responses_input(messages: &[Message]) -> Vec<serde_
                         }
                         if !emitted_any_tool {
                             pending_tool_ids.clear();
+                        }
+                        // Preserve text blocks co-located with tool_results (budget
+                        // warnings, mid-turn injections) by emitting them as a follow-up
+                        // user message.
+                        let extra_text: String = blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !extra_text.trim().is_empty() {
+                            out.push(json!({
+                                "type": "message",
+                                "role": "user",
+                                "content": extra_text,
+                            }));
                         }
                     } else {
                         pending_tool_ids.clear();
@@ -2271,7 +2587,7 @@ fn translate_oai_responses_response(resp: OaiResponsesResponse) -> MessagesRespo
                     format!("call_{call_idx}")
                 });
                 content.push(ResponseContentBlock::ToolUse {
-                    id: call_id,
+                    id: sanitize_tool_id(&call_id),
                     name,
                     input: parsed_args,
                     thought_signature: None,
@@ -2300,6 +2616,21 @@ fn translate_oai_responses_response(resp: OaiResponsesResponse) -> MessagesRespo
             output_tokens: usage.output_tokens,
         }),
     }
+}
+
+/// Ensure a tool-call / tool-use ID only contains characters accepted by all
+/// major providers (Anthropic requires `^[a-zA-Z0-9_-]+$`).  If the ID
+/// contains any illegal characters, a fresh unique ID is generated to avoid
+/// potential collisions from character replacement.
+fn sanitize_tool_id(id: &str) -> String {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return format!("call_{}", uuid::Uuid::new_v4().simple());
+    }
+    id.to_string()
 }
 
 #[cfg(test)]
@@ -2362,7 +2693,7 @@ fn translate_oai_response_with_display_reasoning(
                 .and_then(|s| s.as_str().map(|s| s.to_string()))
                 .or(tc.function.thought_signature);
             content.push(ResponseContentBlock::ToolUse {
-                id: tc.id,
+                id: sanitize_tool_id(&tc.id),
                 name: tc.function.name,
                 input,
                 thought_signature,
@@ -2422,6 +2753,38 @@ mod tests {
         crate::test_support::env_lock()
     }
 
+    #[test]
+    fn test_is_retryable_status_classification() {
+        // Transient: rate limit, overloaded, 5xx.
+        for s in [429, 529, 500, 502, 503, 504] {
+            assert!(is_retryable_status(s), "{s} should be retryable");
+        }
+        // Terminal: client errors and success must not retry.
+        for s in [200, 400, 401, 403, 404, 422] {
+            assert!(!is_retryable_status(s), "{s} should be terminal");
+        }
+    }
+
+    #[test]
+    fn test_retry_backoff_grows_and_is_bounded() {
+        // Equal-jitter range is [2^a/2, 2^a], capped at 32s.
+        let d1 = retry_backoff(1, None).as_secs();
+        assert!((1..=2).contains(&d1), "attempt 1 backoff {d1}s out of range");
+        let d3 = retry_backoff(3, None).as_secs();
+        assert!((4..=8).contains(&d3), "attempt 3 backoff {d3}s out of range");
+        // Cap holds for large attempts.
+        let dbig = retry_backoff(20, None).as_secs();
+        assert!((16..=32).contains(&dbig), "large backoff {dbig}s exceeds cap");
+    }
+
+    #[test]
+    fn test_retry_backoff_honors_retry_after_floor() {
+        // A server-provided Retry-After is a floor the computed backoff cannot
+        // undercut.
+        let d = retry_backoff(1, Some(Duration::from_secs(45)));
+        assert_eq!(d.as_secs(), 45);
+    }
+
     // -----------------------------------------------------------------------
     // translate_messages_to_oai
     // -----------------------------------------------------------------------
@@ -2464,22 +2827,32 @@ mod tests {
 
     #[test]
     fn test_translate_messages_assistant_tool_use() {
-        let msgs = vec![Message {
-            role: "assistant".into(),
-            content: MessageContent::Blocks(vec![
-                ContentBlock::Text {
-                    text: "Let me check.".into(),
-                },
-                ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "ls"}),
-                    thought_signature: None,
-                },
-            ]),
-        }];
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "Let me check.".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "bash".into(),
+                        input: json!({"command": "ls"}),
+                        thought_signature: None,
+                    },
+                ]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: None,
+                }]),
+            },
+        ];
         let out = translate_messages_to_oai("", &msgs);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert_eq!(out[0]["role"], "assistant");
         assert_eq!(out[0]["content"], "Let me check.");
         let tc = out[0]["tool_calls"].as_array().unwrap();
@@ -2490,21 +2863,58 @@ mod tests {
 
     #[test]
     fn test_translate_messages_assistant_tool_use_includes_thought_signature() {
-        let msgs = vec![Message {
-            role: "assistant".into(),
-            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                id: "t1".into(),
-                name: "bash".into(),
-                input: json!({"command": "ls"}),
-                thought_signature: Some("sig_abc".into()),
-            }]),
-        }];
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "ls"}),
+                    thought_signature: Some("sig_abc".into()),
+                }]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: None,
+                }]),
+            },
+        ];
         let out = translate_messages_to_oai("", &msgs);
         let tc = out[0]["tool_calls"].as_array().unwrap();
         assert_eq!(
             tc[0]["extra_content"]["google"]["thought_signature"],
             "sig_abc"
         );
+    }
+
+    #[test]
+    fn test_translate_messages_assistant_tool_use_normalizes_stringified_json_input() {
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "web_search".into(),
+                    input: json!("{\"query\":\"油价\"}"),
+                    thought_signature: None,
+                }]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: None,
+                }]),
+            },
+        ];
+
+        let out = translate_messages_to_oai("", &msgs);
+        let tc = out[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(tc[0]["function"]["arguments"], "{\"query\":\"油价\"}");
     }
 
     #[test]
@@ -2522,28 +2932,159 @@ mod tests {
 
     #[test]
     fn test_translate_messages_assistant_tool_use_deepseek_reasoning() {
-        let msgs = vec![Message {
-            role: "assistant".into(),
-            content: MessageContent::Blocks(vec![
-                ContentBlock::Text {
-                    text: "reasoning".into(),
-                },
-                ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: json!({"command": "ls"}),
-                    thought_signature: None,
-                },
-            ]),
-        }];
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "reasoning".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "bash".into(),
+                        input: json!({"command": "ls"}),
+                        thought_signature: None,
+                    },
+                ]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: None,
+                }]),
+            },
+        ];
         let out = translate_messages_to_oai_with_reasoning("", &msgs, true);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert_eq!(out[0]["role"], "assistant");
         assert_eq!(out[0]["reasoning_content"], "reasoning");
         assert!(out[0]["content"].is_null());
         let tc = out[0]["tool_calls"].as_array().unwrap();
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0]["id"], "t1");
+    }
+
+    #[test]
+    fn test_translate_messages_orphaned_tool_calls_stripped_reasoning_bridge() {
+        // Compaction can split a tool_use from its tool_result across the summary
+        // boundary; the orphaned tool_calls must be stripped and the reasoning
+        // text folded back into content, or DeepSeek rejects the request.
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "thinking".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "bash".into(),
+                        input: json!({"command": "ls"}),
+                        thought_signature: None,
+                    },
+                ]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("continue".into()),
+            },
+        ];
+        let out = translate_messages_to_oai_with_reasoning("", &msgs, true);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].get("tool_calls").is_none());
+        assert!(out[0].get("reasoning_content").is_none());
+        assert_eq!(out[0]["content"], "thinking");
+        assert_eq!(out[1]["role"], "user");
+    }
+
+    #[test]
+    fn test_translate_messages_orphaned_tool_calls_stripped_trailing() {
+        let msgs = vec![Message {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: json!({"command": "ls"}),
+                thought_signature: None,
+            }]),
+        }];
+        let out = translate_messages_to_oai_with_reasoning("", &msgs, true);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].get("tool_calls").is_none());
+        assert_eq!(out[0]["content"], "");
+    }
+
+    #[test]
+    fn test_translate_messages_orphaned_tool_calls_plain_path_keeps_content() {
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "Let me check.".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "bash".into(),
+                        input: json!({"command": "ls"}),
+                        thought_signature: None,
+                    },
+                ]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("hi".into()),
+            },
+        ];
+        let out = translate_messages_to_oai("", &msgs);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].get("tool_calls").is_none());
+        assert_eq!(out[0]["content"], "Let me check.");
+    }
+
+    #[test]
+    fn test_translate_messages_partially_resolved_tool_calls_keep_resolved() {
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "bash".into(),
+                        input: json!({}),
+                        thought_signature: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "t2".into(),
+                        name: "glob".into(),
+                        input: json!({}),
+                        thought_signature: None,
+                    },
+                ]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: None,
+                }]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("continue".into()),
+            },
+        ];
+        let out = translate_messages_to_oai_with_reasoning("", &msgs, true);
+        // assistant + tool(t1) + user; only the unresolved t2 entry is stripped
+        assert_eq!(out.len(), 3);
+        let tc = out[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0]["id"], "t1");
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[1]["tool_call_id"], "t1");
     }
 
     #[test]
@@ -2598,6 +3139,47 @@ mod tests {
         ];
         let out = translate_messages_to_oai("", &msgs);
         assert_eq!(out[1]["content"], "[Error] not found");
+    }
+
+    #[test]
+    fn test_translate_messages_tool_result_with_sidecar_text_emits_user_message() {
+        // When a user turn bundles tool_result blocks with free-form Text blocks
+        // (e.g. iteration-budget warnings or mid-turn user message injections),
+        // the Text content must not be dropped — emit it as a follow-up user message.
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "glob".into(),
+                    input: json!({}),
+                    thought_signature: None,
+                }]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: "file.rs".into(),
+                        is_error: None,
+                    },
+                    ContentBlock::Text {
+                        text: "<system_notice>follow-up from user</system_notice>".into(),
+                    },
+                ]),
+            },
+        ];
+        let out = translate_messages_to_oai("", &msgs);
+        // assistant + tool + user (text sidecar) = 3 messages
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[1]["tool_call_id"], "t1");
+        assert_eq!(out[2]["role"], "user");
+        assert_eq!(
+            out[2]["content"],
+            "<system_notice>follow-up from user</system_notice>"
+        );
     }
 
     #[test]
@@ -2711,6 +3293,61 @@ mod tests {
         assert_eq!(out[0]["type"], "function_call");
         assert_eq!(out[1]["type"], "message");
         assert_eq!(out[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_translate_messages_to_oai_responses_preserves_sidecar_text_with_tool_result() {
+        let msgs = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "glob".into(),
+                    input: json!({}),
+                    thought_signature: None,
+                }]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: "file.rs".into(),
+                        is_error: None,
+                    },
+                    ContentBlock::Text {
+                        text: "<system_notice>follow-up</system_notice>".into(),
+                    },
+                ]),
+            },
+        ];
+        let out = translate_messages_to_oai_responses_input(&msgs);
+        // function_call + function_call_output + user message = 3 items
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1]["type"], "function_call_output");
+        assert_eq!(out[2]["type"], "message");
+        assert_eq!(out[2]["role"], "user");
+        assert_eq!(
+            out[2]["content"],
+            "<system_notice>follow-up</system_notice>"
+        );
+    }
+
+    #[test]
+    fn test_translate_messages_to_oai_responses_normalizes_malformed_tool_input() {
+        let msgs = vec![Message {
+            role: "assistant".into(),
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "web_search".into(),
+                input: json!("{"),
+                thought_signature: None,
+            }]),
+        }];
+
+        let out = translate_messages_to_oai_responses_input(&msgs);
+        assert_eq!(out[0]["type"], "function_call");
+        assert_eq!(out[0]["arguments"], "{}");
     }
 
     // -----------------------------------------------------------------------
@@ -3163,6 +3800,65 @@ mod tests {
         assert_eq!(call.id, "call_1");
         assert_eq!(call.name, "weather");
         assert_eq!(call.input_json, r#"{"location":"Shanghai"}"#);
+    }
+
+    #[test]
+    fn test_process_openai_stream_event_ignores_minimax_malformed_trailing_tool_chunks() {
+        let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ok","type":"function","function":{"name":"get_oil_price","arguments":""}}]}}]}"#;
+        let second = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","type":"function","function":{"name":"","arguments":"{"}}]}}]}"#;
+        let third = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","type":"function","function":{"name":"","arguments":"}"}}]}}]}"#;
+        let fourth = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","type":"function","function":{"arguments":null}}]}}]}"#;
+        let mut text = String::new();
+        let mut reasoning_text = String::new();
+        let mut stop_reason = None;
+        let mut usage = None;
+        let mut tool_calls = std::collections::BTreeMap::new();
+
+        for data in [first, second, third, fourth] {
+            process_openai_stream_event(
+                data,
+                None,
+                &mut text,
+                &mut reasoning_text,
+                &mut stop_reason,
+                &mut usage,
+                &mut tool_calls,
+            );
+        }
+
+        let call = tool_calls.get(&0).unwrap();
+        assert_eq!(call.id, "call_ok");
+        assert_eq!(call.name, "get_oil_price");
+        assert_eq!(call.input_json, "{}");
+    }
+
+    #[test]
+    fn test_process_openai_stream_event_ignores_qwen_malformed_trailing_tool_chunks() {
+        let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ok","type":"function","function":{"name":"get_oil_price","arguments":""}}]}}]}"#;
+        let second = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","type":"function","function":{"arguments":"{}"}}]}}]}"#;
+        let third = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","type":"function","function":{"arguments":""}}]}}]}"#;
+        let mut text = String::new();
+        let mut reasoning_text = String::new();
+        let mut stop_reason = None;
+        let mut usage = None;
+        let mut tool_calls = std::collections::BTreeMap::new();
+
+        for data in [first, second, third] {
+            process_openai_stream_event(
+                data,
+                None,
+                &mut text,
+                &mut reasoning_text,
+                &mut stop_reason,
+                &mut usage,
+                &mut tool_calls,
+            );
+        }
+
+        let call = tool_calls.get(&0).unwrap();
+        assert_eq!(call.id, "call_ok");
+        assert_eq!(call.name, "get_oil_price");
+        assert_eq!(call.input_json, "{}");
     }
 
     #[test]
@@ -3951,6 +4647,45 @@ mod tests {
     fn test_resolve_openai_compat_base_defaults_openai() {
         let base = resolve_openai_compat_base("openai", "");
         assert_eq!(base, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn test_resolve_openai_compat_base_defaults_openrouter() {
+        let base = resolve_openai_compat_base("openrouter", "");
+        assert_eq!(base, "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn test_resolve_openai_compat_base_defaults_deepseek() {
+        let base = resolve_openai_compat_base("deepseek", "");
+        assert_eq!(base, "https://api.deepseek.com/v1");
+    }
+
+    #[test]
+    fn test_resolve_openai_compat_base_defaults_ollama() {
+        let base = resolve_openai_compat_base("ollama", "");
+        assert_eq!(base, "http://127.0.0.1:11434/v1");
+    }
+
+    #[test]
+    fn test_resolve_openai_compat_base_defaults_google() {
+        let base = resolve_openai_compat_base("google", "");
+        assert_eq!(
+            base,
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+    }
+
+    #[test]
+    fn test_resolve_openai_compat_base_unknown_provider_falls_back_to_openai() {
+        let base = resolve_openai_compat_base("some-unknown-provider", "");
+        assert_eq!(base, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn test_resolve_openai_compat_base_custom_overrides_provider_default() {
+        let base = resolve_openai_compat_base("openrouter", "https://custom.example.com/v1");
+        assert_eq!(base, "https://custom.example.com/v1");
     }
 
     #[test]

@@ -113,9 +113,59 @@ fn compute_child_token_budget(
     Ok(desired.clamp(2_000, configured_max))
 }
 
+/// Whether the sub-agent's terminal text actually carries the structured
+/// output contract — a JSON object with a non-empty `summary` or `final_answer`
+/// — as opposed to raw prose or leaked reasoning. Drives the one-shot repair
+/// re-ask in the sub-agent loop before falling back to best-effort
+/// normalization.
+pub(crate) fn subagent_output_is_structured(raw_text: &str) -> bool {
+    let cleaned = crate::agent_engine::strip_thinking(raw_text);
+    let text = cleaned.trim();
+    let parsed = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .or_else(|| {
+            let start = text.find('{')?;
+            let end = text.rfind('}')?;
+            if end > start {
+                serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok()
+            } else {
+                None
+            }
+        });
+    parsed
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            ["final_answer", "summary"].iter().any(|k| {
+                obj.get(*k)
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) fn normalize_subagent_artifact_payload(raw_text: &str) -> (String, String) {
-    let text = raw_text.trim();
-    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    // Strip any chain-of-thought the model emitted so it never leaks into the
+    // chat announcement, and so a JSON object that follows a <think> block can
+    // still be parsed (a leading reasoning block makes a whole-string parse fail).
+    let cleaned = crate::agent_engine::strip_thinking(raw_text);
+    let text = cleaned.trim();
+    // Prefer a clean whole-string parse; otherwise recover an embedded {...}
+    // object (model wrapped the JSON in prose) so we don't fall back to dumping
+    // raw reasoning as the answer.
+    let parsed = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .or_else(|| {
+            let start = text.find('{')?;
+            let end = text.rfind('}')?;
+            if end > start {
+                serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok()
+            } else {
+                None
+            }
+        });
     let mut summary = String::new();
     let mut final_answer = String::new();
     let mut findings: Vec<String> = Vec::new();
@@ -276,6 +326,7 @@ struct RunSubAgentTaskParams {
     run_token_budget: i64,
     task: String,
     context: String,
+    specialist: String,
     local_cancel: Arc<AtomicBool>,
 }
 
@@ -294,6 +345,7 @@ async fn run_sub_agent_task(
         run_token_budget,
         task,
         context,
+        specialist,
         local_cancel,
     } = params;
     if matches!(runtime, SubagentExecutionRuntime::Acp) {
@@ -325,7 +377,11 @@ async fn run_sub_agent_task(
     );
     let tool_defs = tools.definitions().to_vec();
 
-    let system_prompt = "You are a sub-agent assistant. Complete the task thoroughly with tool use when needed.\nOutput contract (required): return a JSON object with keys:\n- summary: string\n- findings: string[]\n- artifacts: {type,path,description}[]\n- next_actions: string[]\n- final_answer: string\nReturn only JSON in the final turn.".to_string();
+    let profile = crate::tools::specialists::resolve_specialist(Some(specialist.as_str()));
+    let system_prompt = format!(
+        "{persona}\n\nComplete the task thoroughly with tool use when needed.\nYou are a background worker: you have NO tools to message the chat, write memory, or schedule tasks (no `send_message`, `write_memory`, or `schedule` — do not look for them or stall when they are missing). `read_memory` and `structured_memory_search` are read-only lookups. Any durable facts you surface in `findings`/`final_answer` are persisted by the orchestrator automatically — just report them, don't try to save them yourself.\nFor long tasks, call `report_progress` at meaningful milestones with a one-line status so the user gets colleague-style updates while you work.\nIf a sub-problem falls outside your expertise, get a quick second opinion from the right specialist with `consult_specialist` (e.g. as a researcher, hand a draft to the writer; as a coder, ask the mathematician to check a formula) and weave their answer into your work — don't fake expertise you don't have. If a sub-problem is large enough to need its own run and you're allowed to spawn, delegate it with `sessions_spawn`; otherwise name the right specialist in next_actions.\nOutput contract (required): return a JSON object with keys:\n- summary: string\n- findings: string[]\n- artifacts: {{type,path,description}}[]\n- next_actions: string[]\n- final_answer: string\nReturn only JSON in the final turn.",
+        persona = profile.persona
+    );
 
     let user_content = if context.is_empty() {
         task.to_string()
@@ -339,6 +395,10 @@ async fn run_sub_agent_task(
     }];
     let mut input_tokens_sum = 0_i64;
     let mut output_tokens_sum = 0_i64;
+    // Bounded (one-shot) repair: if the model ends without the required JSON
+    // contract, we re-ask exactly once before falling back to best-effort
+    // normalization. Prevents an unbounded re-ask loop.
+    let mut repair_attempted = false;
 
     for _ in 0..MAX_SUB_AGENT_ITERATIONS {
         if is_cancelled(db.clone(), &run_id, &local_cancel).await? {
@@ -393,6 +453,31 @@ async fn run_sub_agent_task(
                 })
                 .collect::<Vec<_>>()
                 .join("");
+            // One-shot repair re-ask: the contract requires a JSON object, but
+            // models sometimes stop on prose or leaked reasoning. Ask once for
+            // clean JSON before falling back to best-effort normalization. Only
+            // for a natural `end_turn`; a `max_tokens` stop is truncation, where
+            // re-asking would just burn more budget without fixing the shape.
+            if stop_reason == "end_turn"
+                && !repair_attempted
+                && !text.trim().is_empty()
+                && !subagent_output_is_structured(&text)
+            {
+                repair_attempted = true;
+                log_subagent_event(db.clone(), &run_id, "output_repair", None).await;
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: MessageContent::Text(text),
+                });
+                messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(
+                        "Your previous reply was not the required output. Respond with ONLY a single JSON object matching the contract: {\"summary\":string,\"findings\":string[],\"artifacts\":[],\"next_actions\":string[],\"final_answer\":string}. No prose, no markdown fences, no <think> tags."
+                            .into(),
+                    ),
+                });
+                continue;
+            }
             let source = if text.is_empty() {
                 "(sub-agent produced no output)".to_string()
             } else {
@@ -508,6 +593,89 @@ async fn run_sub_agent_task(
     }
 
     Err("Sub-agent reached maximum iterations without completing the task.".into())
+}
+
+/// When the last child of a parent finishes, post one consolidated summary of
+/// the whole batch. Idempotent: the announce is keyed on `<parent>:fanin`, whose
+/// UNIQUE constraint means only one fan-in message is ever enqueued even if
+/// several children finish at once.
+async fn maybe_post_fan_in_summary(
+    config: &Config,
+    channel_registry: Arc<ChannelRegistry>,
+    db: Arc<Database>,
+    chat_id: i64,
+    parent_id: &str,
+) {
+    let parent_owned = parent_id.to_string();
+    let active = call_blocking(db.clone(), {
+        let p = parent_owned.clone();
+        move |db| db.count_active_subagent_children(&p)
+    })
+    .await
+    .unwrap_or(0);
+    if active > 0 {
+        return;
+    }
+    let children = match call_blocking(db.clone(), {
+        let p = parent_owned.clone();
+        move |db| db.list_subagent_children(&p)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("fan-in: failed to list children of {parent_id}: {e}");
+            return;
+        }
+    };
+    // Only summarize genuine batches (the single-child case is covered by its
+    // own completion message).
+    if children.len() < 2 {
+        return;
+    }
+
+    let n = children.len();
+    let mut lines = vec![format!("🧩 All {n} sub-tasks done:")];
+    let mut caller_channel = String::new();
+    for c in &children {
+        if caller_channel.is_empty() {
+            caller_channel = c.caller_channel.clone();
+        }
+        let emoji = match c.status.as_str() {
+            "completed" => "✅",
+            "cancelled" => "🛑",
+            "timed_out" => "⏱️",
+            _ => "❌",
+        };
+        let name = c
+            .label
+            .clone()
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| c.task.chars().take(40).collect::<String>());
+        let detail = c
+            .result_text
+            .clone()
+            .or_else(|| c.error_text.clone())
+            .map(|t| {
+                let snippet: String = t.trim().chars().take(120).collect();
+                format!(" — {snippet}")
+            })
+            .unwrap_or_default();
+        lines.push(format!("{emoji} {name}{detail}"));
+    }
+    let summary = lines.join("\n");
+
+    let announce_id = format!("{parent_owned}:fanin");
+    let enqueue = call_blocking(db.clone(), {
+        let channel = caller_channel.clone();
+        let summary = summary.clone();
+        move |db| db.enqueue_subagent_announce(&announce_id, chat_id, &channel, &summary)
+    })
+    .await;
+    // A UNIQUE violation here just means another sibling already enqueued it.
+    if enqueue.is_ok() {
+        let _ = flush_pending_announces_once(config, channel_registry, db, 10).await;
+    }
 }
 
 async fn build_announce_payload(
@@ -637,7 +805,10 @@ impl Tool for SessionsSpawnTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "sessions_spawn".into(),
-            description: "Spawn an asynchronous sub-agent run for long tasks. Returns immediately with a run id. Use subagents_list/subagents_info/subagents_kill to manage runs.".into(),
+            description: format!(
+                "Spawn an asynchronous sub-agent run for long tasks. Returns immediately with a run id. Use subagents_list/subagents_info/subagents_kill to manage runs. Pick a `specialist` to route the work to a focused expert. Available specialists: {}.",
+                crate::tools::specialists::specialist_catalog()
+            ),
             input_schema: schema_object(
                 json!({
                     "task": {
@@ -647,6 +818,15 @@ impl Tool for SessionsSpawnTool {
                     "context": {
                         "type": "string",
                         "description": "Optional extra context passed to the sub-agent"
+                    },
+                    "specialist": {
+                        "type": "string",
+                        "enum": crate::tools::specialists::specialist_names(),
+                        "description": "Which specialist persona the sub-agent adopts. Defaults to generalist."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Short human-friendly name for this task (e.g. 'competitor research'), shown when listing/reporting progress. Recommended when running several tasks at once."
                     },
                     "runtime": {
                         "type": "string",
@@ -699,6 +879,19 @@ impl Tool for SessionsSpawnTool {
             .unwrap_or("")
             .trim()
             .to_string();
+        // Resolve the requested specialist (falls back to generalist for unknown/empty).
+        let specialist = crate::tools::specialists::resolve_specialist(
+            input.get("specialist").and_then(|v| v.as_str()),
+        )
+        .name
+        .to_string();
+        // Optional human-friendly label ("competitor research") for "what am I working on".
+        let label = input
+            .get("label")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.chars().take(80).collect::<String>());
         let parent_meta = subagent_runtime_meta_from_input(&input);
         let execution_runtime =
             match SubagentExecutionRuntime::from_input(&input, parent_meta.as_ref()) {
@@ -822,6 +1015,7 @@ impl Tool for SessionsSpawnTool {
         let context_for_insert = context.clone();
         let caller_channel_for_insert = auth.caller_channel.clone();
         let parent_for_insert = parent_run_id.clone();
+        let label_for_insert = label.clone();
         if let Err(e) = call_blocking(self.db.clone(), move |db| {
             db.create_subagent_run(CreateSubagentRunParams {
                 run_id: &run_id_for_insert,
@@ -834,6 +1028,7 @@ impl Tool for SessionsSpawnTool {
                 context: &context_for_insert,
                 provider: &provider,
                 model: &model,
+                label: label_for_insert.as_deref(),
             })
         })
         .await
@@ -845,7 +1040,7 @@ impl Tool for SessionsSpawnTool {
             &run_id,
             "accepted",
             Some(format!(
-                "depth={child_depth} runtime={}{}",
+                "depth={child_depth} runtime={} specialist={specialist}{}",
                 execution_runtime.as_str(),
                 runtime_target
                     .as_deref()
@@ -862,6 +1057,8 @@ impl Tool for SessionsSpawnTool {
         let run_id_async = run_id.clone();
         let task_async = task.clone();
         let context_async = context.clone();
+        let specialist_async = specialist.clone();
+        let parent_run_id_async = parent_run_id.clone();
         let auth_async = ToolAuthContext {
             caller_channel: auth.caller_channel.clone(),
             caller_chat_id: chat_id,
@@ -870,6 +1067,7 @@ impl Tool for SessionsSpawnTool {
         };
         let channel_registry = self.channel_registry.clone();
         let subagent_channel_registry = self.channel_registry.clone();
+        let fan_in_channel_registry = self.channel_registry.clone();
         tokio::spawn(async move {
             let run_id_for_finish = run_id_async.clone();
             let _ = call_blocking(db.clone(), {
@@ -919,6 +1117,7 @@ impl Tool for SessionsSpawnTool {
                 run_token_budget: child_token_budget,
                 task: task_async,
                 context: context_async,
+                specialist: specialist_async,
                 local_cancel,
             });
 
@@ -1017,11 +1216,28 @@ impl Tool for SessionsSpawnTool {
                             db.enqueue_subagent_announce(&rid, chat_id, &caller_channel, &payload)
                         })
                         .await;
-                        let _ = flush_pending_announces_once(&cfg, channel_registry, db, 10).await;
+                        let _ =
+                            flush_pending_announces_once(&cfg, channel_registry, db.clone(), 10)
+                                .await;
                     }
                     Err(e) => {
                         warn!("failed to build announce payload for run {run_id_async}: {e}");
                     }
+                }
+            }
+
+            // Fan-in: when this was the last active child of a parent run, post one
+            // consolidated summary of the whole batch (opt-in).
+            if cfg.subagents.fan_in_summary {
+                if let Some(parent_id) = parent_run_id_async.as_ref() {
+                    maybe_post_fan_in_summary(
+                        &cfg,
+                        fan_in_channel_registry,
+                        db,
+                        chat_id,
+                        parent_id,
+                    )
+                    .await;
                 }
             }
         });
@@ -1033,6 +1249,8 @@ impl Tool for SessionsSpawnTool {
                 "run_id": run_id,
                 "chat_id": chat_id,
                 "depth": child_depth,
+                "specialist": specialist,
+                "label": label,
                 "runtime": execution_runtime.as_str(),
                 "runtime_target": runtime_target,
                 "token_budget": child_token_budget,
@@ -1108,6 +1326,7 @@ impl Tool for SubagentsListTool {
             .map(|r| {
                 json!({
                     "run_id": r.run_id,
+                    "label": r.label,
                     "parent_run_id": r.parent_run_id,
                     "depth": r.depth,
                     "token_budget": r.token_budget,
@@ -1117,6 +1336,8 @@ impl Tool for SubagentsListTool {
                     "finished_at": r.finished_at,
                     "cancel_requested": r.cancel_requested,
                     "task": r.task,
+                    "progress": r.progress_text,
+                    "last_progress_at": r.last_progress_at,
                     "input_tokens": r.input_tokens,
                     "output_tokens": r.output_tokens,
                     "artifact_json": r.artifact_json,
@@ -1126,6 +1347,21 @@ impl Tool for SubagentsListTool {
 
         ToolResult::success(json!({"chat_id": chat_id, "runs": payload}).to_string())
     }
+}
+
+/// Resolve a run reference (exact run_id or human-friendly label) to a run_id
+/// within the given chat. Shared by subagents_info / subagents_kill.
+async fn resolve_subagent_ref(
+    db: &Arc<Database>,
+    chat_id: i64,
+    run_ref: &str,
+) -> Result<Option<String>, String> {
+    let run_ref_owned = run_ref.to_string();
+    call_blocking(db.clone(), move |db| {
+        db.resolve_subagent_run_id(chat_id, &run_ref_owned)
+    })
+    .await
+    .map_err(|e| format!("Failed resolving subagent reference: {e}"))
 }
 
 pub struct SubagentsInfoTool {
@@ -1147,10 +1383,10 @@ impl Tool for SubagentsInfoTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "subagents_info".into(),
-            description: "Get detailed information for one subagent run.".into(),
+            description: "Get detailed information for one subagent run, by run id or task label.".into(),
             input_schema: schema_object(
                 json!({
-                    "run_id": {"type": "string"},
+                    "run_id": {"type": "string", "description": "Run id or the task label given at spawn."},
                     "chat_id": {"type": "integer"}
                 }),
                 &["run_id"],
@@ -1174,9 +1410,16 @@ impl Tool for SubagentsInfoTool {
         if let Err(e) = authorize_chat_access(&input, chat_id) {
             return ToolResult::error(e);
         }
-        let run_id = match input.get("run_id").and_then(|v| v.as_str()) {
+        let run_ref = match input.get("run_id").and_then(|v| v.as_str()) {
             Some(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => return ToolResult::error("Missing required parameter: run_id".into()),
+        };
+        let run_id = match resolve_subagent_ref(&self.db, chat_id, &run_ref).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return ToolResult::error(format!("No subagent run matching '{run_ref}'"))
+            }
+            Err(e) => return ToolResult::error(e),
         };
 
         let run = match call_blocking(self.db.clone(), move |db| {
@@ -1192,6 +1435,7 @@ impl Tool for SubagentsInfoTool {
         ToolResult::success(
             json!({
                 "run_id": run.run_id,
+                "label": run.label,
                 "parent_run_id": run.parent_run_id,
                 "depth": run.depth,
                 "chat_id": run.chat_id,
@@ -1203,6 +1447,8 @@ impl Tool for SubagentsInfoTool {
                 "started_at": run.started_at,
                 "finished_at": run.finished_at,
                 "cancel_requested": run.cancel_requested,
+                "progress": run.progress_text,
+                "last_progress_at": run.last_progress_at,
                 "error_text": run.error_text,
                 "result_text": run.result_text,
                 "input_tokens": run.input_tokens,
@@ -1241,10 +1487,10 @@ impl Tool for SubagentsKillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "subagents_kill".into(),
-            description: "Request cancellation for one running subagent run, or all active runs in current chat with run_id=all.".into(),
+            description: "Request cancellation for one running subagent run (by run id or task label), or all active runs in current chat with run_id=all.".into(),
             input_schema: schema_object(
                 json!({
-                    "run_id": {"type": "string", "description": "Run id or 'all'"},
+                    "run_id": {"type": "string", "description": "Run id, task label, or 'all'"},
                     "chat_id": {"type": "integer"}
                 }),
                 &["run_id"],
@@ -1268,14 +1514,14 @@ impl Tool for SubagentsKillTool {
         if let Err(e) = authorize_chat_access(&input, chat_id) {
             return ToolResult::error(e);
         }
-        let run_id = match input.get("run_id").and_then(|v| v.as_str()) {
+        let run_ref = match input.get("run_id").and_then(|v| v.as_str()) {
             Some(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => return ToolResult::error("Missing required parameter: run_id".into()),
         };
 
         let runtime = subagent_runtime(&self.config);
 
-        if run_id.eq_ignore_ascii_case("all") {
+        if run_ref.eq_ignore_ascii_case("all") {
             let rows = match call_blocking(self.db.clone(), move |db| {
                 db.list_subagent_runs(chat_id, 200)
             })
@@ -1310,6 +1556,14 @@ impl Tool for SubagentsKillTool {
                 json!({"status": "ok", "cancelled": cancelled, "chat_id": chat_id}).to_string(),
             );
         }
+
+        let run_id = match resolve_subagent_ref(&self.db, chat_id, &run_ref).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return ToolResult::error(format!("No subagent run matching '{run_ref}'"))
+            }
+            Err(e) => return ToolResult::error(e),
+        };
 
         let run_id_for_db = run_id.clone();
         let requested = match call_blocking(self.db.clone(), move |db| {
@@ -2181,6 +2435,46 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("run_id"));
+    }
+
+    #[test]
+    fn test_normalize_strips_leaked_thinking() {
+        // A sub-agent that emits only chain-of-thought (no JSON) must not leak
+        // the <think> block into the announced answer.
+        let raw = "<think>The write_memory tool is not available - I see read_memory \
+                   but not write_memory. Let me inform the user.</think>";
+        let (answer, envelope) = normalize_subagent_artifact_payload(raw);
+        assert!(!answer.contains("<think>"));
+        assert!(!answer.contains("write_memory"));
+        assert!(!envelope.contains("<think>"));
+    }
+
+    #[test]
+    fn test_subagent_output_is_structured() {
+        // Prose / leaked reasoning is NOT structured (would trigger a repair).
+        assert!(!subagent_output_is_structured(
+            "<think>no write_memory tool</think> I can't save this."
+        ));
+        assert!(!subagent_output_is_structured("Done, everything looks good."));
+        // A contract object (even after a thinking block) IS structured.
+        assert!(subagent_output_is_structured(
+            "<think>ok</think>{\"summary\":\"s\",\"final_answer\":\"done\"}"
+        ));
+        // An object with only empty contract fields is not structured.
+        assert!(!subagent_output_is_structured(
+            "{\"summary\":\"\",\"final_answer\":\"\"}"
+        ));
+    }
+
+    #[test]
+    fn test_normalize_recovers_json_after_thinking() {
+        // Reasoning block followed by the contract JSON: the JSON must win, not
+        // the raw text fallback.
+        let raw = "<think>let me structure this</think>\n\
+                   {\"summary\":\"done\",\"findings\":[\"a\"],\"artifacts\":[],\
+                   \"next_actions\":[],\"final_answer\":\"All set.\"}";
+        let (answer, _envelope) = normalize_subagent_artifact_payload(raw);
+        assert_eq!(answer, "All set.");
     }
 
     #[test]

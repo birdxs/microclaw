@@ -11,9 +11,14 @@ members = [
 ]
 resolver = "2"
 
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
 [package]
 name = "microclaw"
-version = "0.1.30"
+version = "0.2.6"
 edition = "2021"
 license = "MIT"
 default-run = "microclaw"
@@ -22,6 +27,8 @@ default-run = "microclaw"
 default = []
 sqlite-vec = ["microclaw-storage/sqlite-vec"]
 journald = ["microclaw-app/journald"]
+channel-matrix = ["dep:matrix-sdk"]
+full = ["channel-matrix"]
 
 [dependencies]
 microclaw-core = { version = "0.1.0", path = "crates/microclaw-core" }
@@ -46,7 +53,7 @@ regex = "1"
 thiserror = "2"
 anyhow = "1"
 async-trait = "0.1"
-agent-client-protocol = "0.10.2"
+agent-client-protocol = "0.10.4"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde_yaml = "0.9"
@@ -63,29 +70,37 @@ md5 = "0.7"
 axum = { version = "0.7", features = ["ws"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "cache", "rustls_backend"] }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "cache", "native_tls_backend"] }
 include_dir = "0.7"
 async-stream = "0.3"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 argon2 = "0.5"
 opentelemetry-proto = { version = "0.28", features = ["gen-tonic-messages"] }
 opentelemetry-semantic-conventions = { version = "0.30", features = ["semconv_experimental"] }
 prost = "0.13"
-matrix-sdk = { version = "0.16.0", default-features = false, features = ["e2e-encryption", "automatic-room-key-forwarding", "native-tls", "sqlite", "bundled-sqlite"] }
+matrix-sdk = { version = "0.16.1", optional = true, default-features = false, features = ["e2e-encryption", "automatic-room-key-forwarding", "native-tls", "sqlite", "bundled-sqlite"] }
 clap = { version = "4.6", features = ["derive"] }
 http = "1"
-rmcp = { version = "1.2", features = [
+rmcp = { version = "1.7", features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
 ] }
 shellexpand = "3.1.2"
 qrcode = "0.14"
+yaml-edit = "0.2.0"
+pulldown-cmark = { version = "0.12", default-features = false }
+# Typst typesetting backend for render_pdf: handles layout, CJK, and font
+# subsetting (so CJK PDFs stay small instead of embedding a whole ~23MB font).
+typst = "0.15"
+typst-pdf = "0.15"
+typst-layout = "0.15"
 
 [dev-dependencies]
 tower = "0.5"
 
 [target.'cfg(windows)'.dependencies]
-windows-service = "0.8.0"
+windows-service = "0.8.1"
