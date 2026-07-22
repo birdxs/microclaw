@@ -1,5 +1,5 @@
 use rusqlite::OptionalExtension;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use std::path::Path;
 #[cfg(feature = "sqlite-vec")]
 use std::sync::Once;
@@ -234,7 +234,7 @@ pub struct AuditLogRecord {
 pub type SessionMetaRow = (String, String, Option<String>, Option<i64>);
 pub type SessionTreeRow = (i64, Option<String>, Option<i64>, String);
 
-const SCHEMA_VERSION_CURRENT: i64 = 27;
+const SCHEMA_VERSION_CURRENT: i64 = 30;
 
 /// Genesis link for the tamper-evident audit hash chain — the `prev_hash` of the
 /// first sealed entry.
@@ -253,6 +253,89 @@ pub struct ScheduledTask {
     pub last_run: Option<String>,
     pub status: String, // "active", "paused", "completed", "cancelled"
     pub created_at: String,
+    /// Optional completion contract: JSON array of exit criteria, verified
+    /// after each run (see src/completion_contract.rs).
+    pub exit_criteria: Option<String>,
+    /// Number of times this task has run (success or failure).
+    pub run_count: i64,
+    /// Retire as `completed` after this many runs. NULL = unlimited.
+    pub max_runs: Option<i64>,
+    /// Retire as `completed` once the next firing would pass this instant.
+    pub not_after: Option<String>,
+}
+
+/// An interactive turn that was in flight when the previous process died.
+#[derive(Debug, Clone)]
+pub struct InterruptedTurn {
+    pub chat_id: i64,
+    pub channel: String,
+    pub started_at: String,
+    /// Rolling "step N: tool, tool" snapshot from the agent loop, if the run
+    /// got far enough to execute tools.
+    pub progress_text: Option<String>,
+}
+
+/// A final reply queued for redelivery after a failed channel send.
+#[derive(Debug, Clone)]
+pub struct OutboxMessageRecord {
+    pub id: i64,
+    pub delivery_id: String,
+    pub chat_id: i64,
+    pub channel: String,
+    pub payload_text: String,
+    pub full_payload_text: String,
+    pub chunk_index: i64,
+    pub total_chunks: i64,
+    pub idempotency_key: String,
+    pub status: String,
+    pub attempts: i64,
+    pub next_attempt_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundDeliveryHealth {
+    pub total_deliveries: i64,
+    pub delivered_deliveries: i64,
+    pub pending_chunks: i64,
+    pub sending_chunks: i64,
+    pub retry_chunks: i64,
+    pub failed_chunks: i64,
+    pub oldest_unfinished_at: Option<String>,
+}
+
+fn refresh_delivery_status(
+    tx: &Transaction<'_>,
+    chunk_id: i64,
+    now: &str,
+) -> Result<(), MicroClawError> {
+    let delivery_id: String = tx.query_row(
+        "SELECT delivery_id FROM outbound_delivery_chunks WHERE id=?1",
+        params![chunk_id],
+        |row| row.get(0),
+    )?;
+    let (total, delivered, failed): (i64, i64, i64) = tx.query_row(
+        "SELECT COUNT(*),
+                SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END)
+         FROM outbound_delivery_chunks WHERE delivery_id=?1",
+        params![delivery_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let status = if failed > 0 {
+        "failed"
+    } else if total > 0 && delivered == total {
+        "delivered"
+    } else if delivered > 0 {
+        "partial"
+    } else {
+        "pending"
+    };
+    tx.execute(
+        "UPDATE outbound_deliveries SET status=?2, updated_at=?3 WHERE delivery_id=?1",
+        params![delivery_id, status, now],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -776,6 +859,27 @@ fn apply_schema_migrations(conn: &Connection) -> Result<(), MicroClawError> {
         version = 11;
     }
     if version < 12 {
+        if !table_has_column(conn, "scheduled_tasks", "exit_criteria")? {
+            conn.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN exit_criteria TEXT",
+                [],
+            )?;
+        }
+        if !table_has_column(conn, "scheduled_tasks", "run_count")? {
+            conn.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !table_has_column(conn, "scheduled_tasks", "max_runs")? {
+            conn.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN max_runs INTEGER",
+                [],
+            )?;
+        }
+        if !table_has_column(conn, "scheduled_tasks", "not_after")? {
+            conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN not_after TEXT", [])?;
+        }
         if !table_has_column(conn, "scheduled_tasks", "timezone")? {
             conn.execute(
                 "ALTER TABLE scheduled_tasks ADD COLUMN timezone TEXT NOT NULL DEFAULT ''",
@@ -1093,6 +1197,108 @@ fn apply_schema_migrations(conn: &Connection) -> Result<(), MicroClawError> {
         set_schema_version(conn, 27)?;
         version = 27;
     }
+    if version < 28 {
+        // Interrupted-turn recovery: one row per interactive turn in flight.
+        // Inserted when the agent loop starts a user-facing turn, deleted when
+        // the turn finishes (any outcome). Rows found at startup mean the
+        // process died mid-reply — those chats get an "I was interrupted"
+        // notice and the rows are cleared.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS active_turns (
+                chat_id INTEGER PRIMARY KEY,
+                channel TEXT NOT NULL,
+                started_at TEXT NOT NULL
+            );",
+        )?;
+        set_schema_version(conn, 28)?;
+        version = 28;
+    }
+    if version < 29 {
+        // Delivery outbox: final agent replies that failed to send are queued
+        // here and retried with backoff by a supervised background loop, so a
+        // transient channel outage can't silently drop a finished answer.
+        // Also: `active_turns.progress_text` — a rolling "step N: tool, tool"
+        // snapshot so the interrupted-turn notice can say how far the run got.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS outbox_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                payload_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_outbox_status_next
+                ON outbox_messages(status, next_attempt_at);",
+        )?;
+        if !table_has_column(conn, "active_turns", "progress_text")? {
+            conn.execute("ALTER TABLE active_turns ADD COLUMN progress_text TEXT", [])?;
+        }
+        set_schema_version(conn, 29)?;
+        version = 29;
+    }
+    if version < 30 {
+        // Durable chunk delivery ledger. The parent row represents one
+        // user-visible message; child rows are independently retryable chunks
+        // with stable idempotency keys. Legacy whole-message outbox rows are
+        // migrated as single-chunk deliveries.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS outbound_deliveries (
+                delivery_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                full_payload_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                stored_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS outbound_delivery_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                delivery_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                total_chunks INTEGER NOT NULL,
+                payload_text TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(delivery_id, chunk_index),
+                UNIQUE(idempotency_key),
+                FOREIGN KEY(delivery_id) REFERENCES outbound_deliveries(delivery_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_delivery_chunks_status_next
+                ON outbound_delivery_chunks(status, next_attempt_at);
+            INSERT OR IGNORE INTO outbound_deliveries(
+                delivery_id, chat_id, channel, full_payload_text, status,
+                stored_at, created_at, updated_at
+            )
+            SELECT 'legacy-' || id, chat_id, channel, payload_text,
+                   CASE WHEN status = 'delivered' THEN 'delivered'
+                        WHEN status = 'failed' THEN 'failed' ELSE 'pending' END,
+                   CASE WHEN status = 'delivered' THEN updated_at ELSE NULL END,
+                   created_at, updated_at
+            FROM outbox_messages;
+            INSERT OR IGNORE INTO outbound_delivery_chunks(
+                delivery_id, chunk_index, total_chunks, payload_text,
+                idempotency_key, status, attempts, next_attempt_at,
+                last_error, created_at, updated_at
+            )
+            SELECT 'legacy-' || id, 0, 1, payload_text, 'legacy-' || id,
+                   status, attempts, next_attempt_at, last_error,
+                   created_at, updated_at
+            FROM outbox_messages;",
+        )?;
+        set_schema_version(conn, 30)?;
+        version = 30;
+    }
     if version != SCHEMA_VERSION_CURRENT {
         set_schema_version(conn, SCHEMA_VERSION_CURRENT)?;
     }
@@ -1225,7 +1431,11 @@ impl Database {
                 next_run TEXT NOT NULL,
                 last_run TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                exit_criteria TEXT,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                max_runs INTEGER,
+                not_after TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status_next
@@ -1867,11 +2077,59 @@ impl Database {
         timezone: &str,
         next_run: &str,
     ) -> Result<i64, MicroClawError> {
+        self.create_scheduled_task_full(
+            chat_id,
+            prompt,
+            schedule_type,
+            schedule_value,
+            timezone,
+            next_run,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_scheduled_task_full(
+        &self,
+        chat_id: i64,
+        prompt: &str,
+        schedule_type: &str,
+        schedule_value: &str,
+        timezone: &str,
+        next_run: &str,
+        exit_criteria: Option<&str>,
+    ) -> Result<i64, MicroClawError> {
+        self.create_scheduled_task_lifecycle(
+            chat_id,
+            prompt,
+            schedule_type,
+            schedule_value,
+            timezone,
+            next_run,
+            exit_criteria,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_scheduled_task_lifecycle(
+        &self,
+        chat_id: i64,
+        prompt: &str,
+        schedule_type: &str,
+        schedule_value: &str,
+        timezone: &str,
+        next_run: &str,
+        exit_criteria: Option<&str>,
+        max_runs: Option<i64>,
+        not_after: Option<&str>,
+    ) -> Result<i64, MicroClawError> {
         let conn = self.lock_conn();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO scheduled_tasks (chat_id, prompt, schedule_type, schedule_value, timezone, next_run, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
+            "INSERT INTO scheduled_tasks (chat_id, prompt, schedule_type, schedule_value, timezone, next_run, status, created_at, exit_criteria, max_runs, not_after)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10)",
             params![
                 chat_id,
                 prompt,
@@ -1879,7 +2137,10 @@ impl Database {
                 schedule_value,
                 timezone,
                 next_run,
-                now
+                now,
+                exit_criteria,
+                max_runs,
+                not_after
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1888,7 +2149,7 @@ impl Database {
     pub fn get_due_tasks(&self, now: &str) -> Result<Vec<ScheduledTask>, MicroClawError> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, prompt, schedule_type, schedule_value, timezone, next_run, last_run, status, created_at
+            "SELECT id, chat_id, prompt, schedule_type, schedule_value, timezone, next_run, last_run, status, created_at, exit_criteria, run_count, max_runs, not_after
              FROM scheduled_tasks
              WHERE status = 'active' AND next_run <= ?1",
         )?;
@@ -1905,6 +2166,10 @@ impl Database {
                     last_run: row.get(7)?,
                     status: row.get(8)?,
                     created_at: row.get(9)?,
+                    exit_criteria: row.get(10)?,
+                    run_count: row.get(11)?,
+                    max_runs: row.get(12)?,
+                    not_after: row.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1920,7 +2185,7 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
 
         let mut stmt = tx.prepare(
-            "SELECT id, chat_id, prompt, schedule_type, schedule_value, timezone, next_run, last_run, status, created_at
+            "SELECT id, chat_id, prompt, schedule_type, schedule_value, timezone, next_run, last_run, status, created_at, exit_criteria, run_count, max_runs, not_after
              FROM scheduled_tasks
              WHERE status = 'active' AND next_run <= ?1
              ORDER BY next_run ASC, id ASC
@@ -1939,6 +2204,10 @@ impl Database {
                     last_run: row.get(7)?,
                     status: row.get(8)?,
                     created_at: row.get(9)?,
+                    exit_criteria: row.get(10)?,
+                    run_count: row.get(11)?,
+                    max_runs: row.get(12)?,
+                    not_after: row.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1966,7 +2235,7 @@ impl Database {
     pub fn get_tasks_for_chat(&self, chat_id: i64) -> Result<Vec<ScheduledTask>, MicroClawError> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, prompt, schedule_type, schedule_value, timezone, next_run, last_run, status, created_at
+            "SELECT id, chat_id, prompt, schedule_type, schedule_value, timezone, next_run, last_run, status, created_at, exit_criteria, run_count, max_runs, not_after
              FROM scheduled_tasks
              WHERE chat_id = ?1 AND status IN ('active', 'paused')
              ORDER BY id",
@@ -1984,6 +2253,48 @@ impl Database {
                     last_run: row.get(7)?,
                     status: row.get(8)?,
                     created_at: row.get(9)?,
+                    exit_criteria: row.get(10)?,
+                    run_count: row.get(11)?,
+                    max_runs: row.get(12)?,
+                    not_after: row.get(13)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    /// List scheduled tasks across all chats for management views.
+    /// `status` filters to one status; `None` returns every task. Newest first.
+    pub fn list_scheduled_tasks(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ScheduledTask>, MicroClawError> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, prompt, schedule_type, schedule_value, timezone, next_run, last_run, status, created_at, exit_criteria, run_count, max_runs, not_after
+             FROM scheduled_tasks
+             WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        let tasks = stmt
+            .query_map(params![status, limit as i64], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    prompt: row.get(2)?,
+                    schedule_type: row.get(3)?,
+                    schedule_value: row.get(4)?,
+                    timezone: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                    exit_criteria: row.get(10)?,
+                    run_count: row.get(11)?,
+                    max_runs: row.get(12)?,
+                    not_after: row.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1993,7 +2304,7 @@ impl Database {
     pub fn get_task_by_id(&self, task_id: i64) -> Result<Option<ScheduledTask>, MicroClawError> {
         let conn = self.lock_conn();
         let result = conn.query_row(
-            "SELECT id, chat_id, prompt, schedule_type, schedule_value, timezone, next_run, last_run, status, created_at
+            "SELECT id, chat_id, prompt, schedule_type, schedule_value, timezone, next_run, last_run, status, created_at, exit_criteria, run_count, max_runs, not_after
              FROM scheduled_tasks
              WHERE id = ?1",
             params![task_id],
@@ -2009,6 +2320,10 @@ impl Database {
                     last_run: row.get(7)?,
                     status: row.get(8)?,
                     created_at: row.get(9)?,
+                    exit_criteria: row.get(10)?,
+                    run_count: row.get(11)?,
+                    max_runs: row.get(12)?,
+                    not_after: row.get(13)?,
                 })
             },
         );
@@ -2017,6 +2332,41 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Fetch one scheduled task by id regardless of status (management/
+    /// detail views and tests need retired tasks too).
+    pub fn get_scheduled_task(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<ScheduledTask>, MicroClawError> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, prompt, schedule_type, schedule_value, timezone, next_run, last_run, status, created_at, exit_criteria, run_count, max_runs, not_after
+             FROM scheduled_tasks WHERE id = ?1",
+        )?;
+        let task = stmt
+            .query_map(params![task_id], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    prompt: row.get(2)?,
+                    schedule_type: row.get(3)?,
+                    schedule_value: row.get(4)?,
+                    timezone: row.get(5)?,
+                    next_run: row.get(6)?,
+                    last_run: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                    exit_criteria: row.get(10)?,
+                    run_count: row.get(11)?,
+                    max_runs: row.get(12)?,
+                    not_after: row.get(13)?,
+                })
+            })?
+            .next()
+            .transpose()?;
+        Ok(task)
     }
 
     pub fn update_task_status(&self, task_id: i64, status: &str) -> Result<bool, MicroClawError> {
@@ -2050,6 +2400,21 @@ impl Database {
         next_run: Option<&str>,
         success: bool,
     ) -> Result<(), MicroClawError> {
+        self.update_task_after_run_lifecycle(task_id, last_run, next_run, success, false)
+    }
+
+    /// `lifecycle_finished` marks a RECURRING task that just retired on
+    /// purpose (max_runs reached / not_after passed): it becomes `completed`
+    /// regardless of this run's outcome, so DLQ auto-replay never resurrects
+    /// a task whose lifecycle has ended. `run_count` increments on every run.
+    pub fn update_task_after_run_lifecycle(
+        &self,
+        task_id: i64,
+        last_run: &str,
+        next_run: Option<&str>,
+        success: bool,
+        lifecycle_finished: bool,
+    ) -> Result<(), MicroClawError> {
         let conn = self.lock_conn();
         match next_run {
             Some(next) => {
@@ -2057,7 +2422,8 @@ impl Database {
                 // run's outcome (a transient failure retries on the next tick).
                 conn.execute(
                     "UPDATE scheduled_tasks
-                     SET last_run = ?1, next_run = ?2, status = 'active'
+                     SET last_run = ?1, next_run = ?2, status = 'active',
+                         run_count = run_count + 1
                      WHERE id = ?3",
                     params![last_run, next, task_id],
                 )?;
@@ -2065,10 +2431,17 @@ impl Database {
             None => {
                 // One-shot task: reflect the actual outcome. A failed one-shot
                 // becomes 'failed' (and is recorded in the DLQ) rather than
-                // masquerading as 'completed'.
-                let status = if success { "completed" } else { "failed" };
+                // masquerading as 'completed'. A lifecycle retirement is always
+                // 'completed' — the task did all the running it was asked to.
+                let status = if lifecycle_finished || success {
+                    "completed"
+                } else {
+                    "failed"
+                };
                 conn.execute(
-                    "UPDATE scheduled_tasks SET last_run = ?1, status = ?2 WHERE id = ?3",
+                    "UPDATE scheduled_tasks
+                     SET last_run = ?1, status = ?2, run_count = run_count + 1
+                     WHERE id = ?3",
                     params![last_run, status, task_id],
                 )?;
             }
@@ -3103,8 +3476,8 @@ impl Database {
              ORDER BY id ASC",
         )?;
         // Collect first so the statement borrow is released before we iterate.
-        let rows: Vec<AuditChainRow> =
-            stmt.query_map([], |row| {
+        let rows: Vec<AuditChainRow> = stmt
+            .query_map([], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -3122,7 +3495,9 @@ impl Database {
 
         let mut expected_prev = AUDIT_GENESIS_HASH.to_string();
         let mut sealed = 0usize;
-        for (id, kind, actor, action, target, status, detail, created_at, prev_hash, entry_hash) in &rows {
+        for (id, kind, actor, action, target, status, detail, created_at, prev_hash, entry_hash) in
+            &rows
+        {
             sealed += 1;
             let prev = prev_hash.as_deref().unwrap_or("");
             if prev != expected_prev {
@@ -3150,7 +3525,9 @@ impl Database {
                     sealed_entries: sealed,
                     intact: false,
                     broken_at: Some(*id),
-                    reason: Some("entry_hash does not match content (an entry was modified)".to_string()),
+                    reason: Some(
+                        "entry_hash does not match content (an entry was modified)".to_string(),
+                    ),
                 });
             }
             expected_prev = entry_hash.clone();
@@ -4489,7 +4866,9 @@ impl Database {
              LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![chat_id, limit as i64], |row| row.get::<_, String>(0))?
+            .query_map(params![chat_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -4539,7 +4918,8 @@ impl Database {
             })
         };
 
-        let mut visited_entities: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut visited_entities: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut seen_triples: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut frontier: Vec<String> = Vec::new();
         for s in seeds {
@@ -5117,6 +5497,374 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// Startup crash recovery: sub-agent runs execute in-process, so any run
+    /// still marked in-flight when a new process boots was killed mid-run.
+    /// Retire them as `interrupted` so lists and gates stop counting them,
+    /// and return how many rows were fixed.
+    pub fn recover_orphaned_subagent_runs(&self) -> Result<usize, MicroClawError> {
+        let conn = self.lock_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let affected = conn.execute(
+            "UPDATE subagent_runs
+             SET status = 'interrupted',
+                 finished_at = ?1,
+                 error_text = COALESCE(error_text, 'process restarted while this run was in flight')
+             WHERE status IN ('accepted', 'queued', 'running')",
+            params![now],
+        )?;
+        Ok(affected)
+    }
+
+    /// Record that an interactive turn is in flight for `chat_id`. One row per
+    /// chat: a re-entrant start (queued follow-up in the same chat) just
+    /// refreshes the timestamp.
+    pub fn mark_turn_active(&self, chat_id: i64, channel: &str) -> Result<(), MicroClawError> {
+        let conn = self.lock_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO active_turns (chat_id, channel, started_at, progress_text)
+             VALUES (?1, ?2, ?3, NULL)
+             ON CONFLICT(chat_id) DO UPDATE SET channel = ?2, started_at = ?3, progress_text = NULL",
+            params![chat_id, channel, now],
+        )?;
+        Ok(())
+    }
+
+    /// Update the rolling progress snapshot for an in-flight interactive turn.
+    /// No-op for chats without an active turn (e.g. scheduler-driven runs).
+    pub fn update_turn_progress(&self, chat_id: i64, progress: &str) -> Result<(), MicroClawError> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE active_turns SET progress_text = ?2 WHERE chat_id = ?1",
+            params![chat_id, progress],
+        )?;
+        Ok(())
+    }
+
+    /// The interactive turn for `chat_id` finished (any outcome).
+    pub fn clear_turn_active(&self, chat_id: i64) -> Result<(), MicroClawError> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "DELETE FROM active_turns WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
+        Ok(())
+    }
+
+    /// Startup crash recovery: return-and-clear every turn that was in flight
+    /// when the previous process died. The table is emptied in the same
+    /// transaction so a second caller can never double-notify.
+    pub fn take_interrupted_turns(&self) -> Result<Vec<InterruptedTurn>, MicroClawError> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let rows: Vec<InterruptedTurn> = {
+            let mut stmt = tx.prepare(
+                "SELECT chat_id, channel, started_at, progress_text
+                 FROM active_turns ORDER BY started_at",
+            )?;
+            let collected = stmt
+                .query_map([], |row| {
+                    Ok(InterruptedTurn {
+                        chat_id: row.get(0)?,
+                        channel: row.get(1)?,
+                        started_at: row.get(2)?,
+                        progress_text: row.get(3)?,
+                    })
+                })?
+                .collect::<Result<Vec<InterruptedTurn>, _>>()?;
+            collected
+        };
+        tx.execute("DELETE FROM active_turns", [])?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    /// Queue a final reply whose direct channel delivery failed. The outbox
+    /// flush loop retries it with backoff until delivered or terminally
+    /// failed.
+    pub fn enqueue_outbox_message(
+        &self,
+        chat_id: i64,
+        channel: &str,
+        payload_text: &str,
+    ) -> Result<i64, MicroClawError> {
+        let delivery_id = format!("delivery-{}", uuid::Uuid::new_v4());
+        let ids = self.create_outbound_delivery(
+            &delivery_id,
+            chat_id,
+            channel,
+            payload_text,
+            &[payload_text.to_string()],
+        )?;
+        Ok(ids[0])
+    }
+
+    /// Persist a complete outbound message and its independently retryable
+    /// chunks before the first network call.
+    pub fn create_outbound_delivery(
+        &self,
+        delivery_id: &str,
+        chat_id: i64,
+        channel: &str,
+        full_payload_text: &str,
+        chunks: &[String],
+    ) -> Result<Vec<i64>, MicroClawError> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO outbound_deliveries(
+                delivery_id, chat_id, channel, full_payload_text, status,
+                created_at, updated_at
+             ) VALUES(?1, ?2, ?3, ?4, 'pending', ?5, ?5)",
+            params![delivery_id, chat_id, channel, full_payload_text, now],
+        )?;
+        let total = chunks.len().max(1) as i64;
+        let mut ids = Vec::with_capacity(chunks.len());
+        for (index, chunk) in chunks.iter().enumerate() {
+            let idempotency_key = format!("{delivery_id}:{}", index + 1);
+            tx.execute(
+                "INSERT INTO outbound_delivery_chunks(
+                    delivery_id, chunk_index, total_chunks, payload_text,
+                    idempotency_key, status, attempts, next_attempt_at,
+                    created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?6, ?6)",
+                params![
+                    delivery_id,
+                    index as i64,
+                    total,
+                    chunk,
+                    idempotency_key,
+                    now
+                ],
+            )?;
+            ids.push(tx.last_insert_rowid());
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    pub fn list_due_outbox_messages(
+        &self,
+        now_iso: &str,
+        limit: usize,
+    ) -> Result<Vec<OutboxMessageRecord>, MicroClawError> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.delivery_id, d.chat_id, d.channel,
+                    c.payload_text, d.full_payload_text, c.chunk_index,
+                    c.total_chunks, c.idempotency_key, c.status, c.attempts,
+                    c.next_attempt_at, c.last_error
+             FROM outbound_delivery_chunks c
+             JOIN outbound_deliveries d ON d.delivery_id = c.delivery_id
+             WHERE c.status IN ('pending', 'retry')
+               AND (c.next_attempt_at IS NULL OR unixepoch(c.next_attempt_at) <= unixepoch(?1))
+             ORDER BY c.id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now_iso, limit.max(1) as i64], |row| {
+            Ok(OutboxMessageRecord {
+                id: row.get(0)?,
+                delivery_id: row.get(1)?,
+                chat_id: row.get(2)?,
+                channel: row.get(3)?,
+                payload_text: row.get(4)?,
+                full_payload_text: row.get(5)?,
+                chunk_index: row.get(6)?,
+                total_chunks: row.get(7)?,
+                idempotency_key: row.get(8)?,
+                status: row.get(9)?,
+                attempts: row.get(10)?,
+                next_attempt_at: row.get(11)?,
+                last_error: row.get(12)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn mark_outbox_delivered(&self, id: i64) -> Result<(), MicroClawError> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE outbound_delivery_chunks
+             SET status='delivered', updated_at=?2 WHERE id=?1",
+            params![id, now],
+        )?;
+        refresh_delivery_status(&tx, id, &now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_outbox_sending(&self, id: i64) -> Result<bool, MicroClawError> {
+        let conn = self.lock_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = conn.execute(
+            "UPDATE outbound_delivery_chunks
+             SET status='sending', updated_at=?2
+             WHERE id=?1 AND status IN ('pending', 'retry')",
+            params![id, now],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn mark_outbox_retry(
+        &self,
+        id: i64,
+        attempts: i64,
+        next_attempt_at: Option<&str>,
+        last_error: &str,
+        terminal_fail: bool,
+    ) -> Result<(), MicroClawError> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let status = if terminal_fail { "failed" } else { "retry" };
+        tx.execute(
+            "UPDATE outbound_delivery_chunks
+             SET status=?2, attempts=?3, next_attempt_at=?4, last_error=?5, updated_at=?6
+             WHERE id=?1",
+            params![id, status, attempts, next_attempt_at, last_error, now],
+        )?;
+        refresh_delivery_status(&tx, id, &now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Reset chunks left in `sending` by an unclean shutdown. Stable channel
+    /// idempotency keys make replay safe on supporting transports (Weixin).
+    pub fn recover_sending_outbox_messages(&self) -> Result<usize, MicroClawError> {
+        let conn = self.lock_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = conn.execute(
+            "UPDATE outbound_delivery_chunks
+             SET status='retry', next_attempt_at=?1,
+                 last_error='recovered after interrupted delivery', updated_at=?1
+             WHERE status='sending'",
+            params![now],
+        )?;
+        Ok(changed)
+    }
+
+    pub fn outbound_delivery_is_complete(&self, delivery_id: &str) -> Result<bool, MicroClawError> {
+        let conn = self.lock_conn();
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM outbound_delivery_chunks
+             WHERE delivery_id=?1 AND status != 'delivered'",
+            params![delivery_id],
+            |row| row.get(0),
+        )?;
+        Ok(remaining == 0)
+    }
+
+    /// Store the full logical message once, after every external chunk is
+    /// delivered. Returns true only for the caller that performed the insert.
+    pub fn finalize_outbound_delivery(
+        &self,
+        delivery_id: &str,
+        sender_name: &str,
+    ) -> Result<bool, MicroClawError> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let delivery = tx.query_row(
+            "SELECT chat_id, full_payload_text, stored_at
+             FROM outbound_deliveries WHERE delivery_id=?1",
+            params![delivery_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        if delivery.2.is_some() {
+            return Ok(false);
+        }
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM outbound_delivery_chunks
+             WHERE delivery_id=?1 AND status != 'delivered'",
+            params![delivery_id],
+            |row| row.get(0),
+        )?;
+        if remaining != 0 {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO messages(id, chat_id, sender_name, content, is_from_bot, timestamp)
+             VALUES(?1, ?2, ?3, ?4, 1, ?5)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                delivery.0,
+                sender_name,
+                delivery.1,
+                now
+            ],
+        )?;
+        tx.execute(
+            "UPDATE outbound_deliveries
+             SET status='delivered', stored_at=?2, updated_at=?2
+             WHERE delivery_id=?1 AND stored_at IS NULL",
+            params![delivery_id, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Pending + retry outbox depth (governance/observability).
+    pub fn count_outbox_pending(&self) -> Result<i64, MicroClawError> {
+        let conn = self.lock_conn();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM outbound_delivery_chunks
+             WHERE status IN ('pending', 'retry', 'sending')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Read-only delivery health snapshot for diagnostics and monitoring.
+    pub fn outbound_delivery_health(&self) -> Result<OutboundDeliveryHealth, MicroClawError> {
+        let conn = self.lock_conn();
+        let (total_deliveries, delivered_deliveries): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END), 0)
+             FROM outbound_deliveries",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (pending_chunks, sending_chunks, retry_chunks, failed_chunks, oldest_unfinished_at) =
+            conn.query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status='sending' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status='retry' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), 0),
+                    MIN(CASE WHEN status != 'delivered' THEN created_at END)
+                 FROM outbound_delivery_chunks",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+        Ok(OutboundDeliveryHealth {
+            total_deliveries,
+            delivered_deliveries,
+            pending_chunks,
+            sending_chunks,
+            retry_chunks,
+            failed_chunks,
+            oldest_unfinished_at,
+        })
     }
 
     pub fn request_subagent_cancel(
@@ -5844,9 +6592,19 @@ mod tests {
     #[test]
     fn audit_chain_intact_after_appends() {
         let (db, dir) = test_db();
-        db.log_audit_event("auth", "alice", "login", None, "ok", None).unwrap();
-        db.log_audit_event("tool", "bot", "web_fetch", Some("https://x"), "ok", Some("200")).unwrap();
-        db.log_audit_event("auth", "alice", "logout", None, "ok", None).unwrap();
+        db.log_audit_event("auth", "alice", "login", None, "ok", None)
+            .unwrap();
+        db.log_audit_event(
+            "tool",
+            "bot",
+            "web_fetch",
+            Some("https://x"),
+            "ok",
+            Some("200"),
+        )
+        .unwrap();
+        db.log_audit_event("auth", "alice", "logout", None, "ok", None)
+            .unwrap();
         let status = db.verify_audit_chain().unwrap();
         assert!(status.intact, "reason: {:?}", status.reason);
         assert_eq!(status.sealed_entries, 3);
@@ -5857,15 +6615,20 @@ mod tests {
     #[test]
     fn audit_chain_detects_modification() {
         let (db, dir) = test_db();
-        db.log_audit_event("auth", "alice", "login", None, "ok", None).unwrap();
+        db.log_audit_event("auth", "alice", "login", None, "ok", None)
+            .unwrap();
         let id = db
             .log_audit_event("tool", "bot", "web_fetch", Some("https://x"), "ok", None)
             .unwrap();
-        db.log_audit_event("auth", "alice", "logout", None, "ok", None).unwrap();
+        db.log_audit_event("auth", "alice", "logout", None, "ok", None)
+            .unwrap();
         {
             let conn = db.lock_conn();
-            conn.execute("UPDATE audit_logs SET status='tampered' WHERE id=?1", params![id])
-                .unwrap();
+            conn.execute(
+                "UPDATE audit_logs SET status='tampered' WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
         }
         let status = db.verify_audit_chain().unwrap();
         assert!(!status.intact);
@@ -5877,14 +6640,17 @@ mod tests {
     #[test]
     fn audit_chain_detects_deletion() {
         let (db, dir) = test_db();
-        db.log_audit_event("auth", "alice", "login", None, "ok", None).unwrap();
+        db.log_audit_event("auth", "alice", "login", None, "ok", None)
+            .unwrap();
         let id = db
             .log_audit_event("tool", "bot", "web_fetch", Some("https://x"), "ok", None)
             .unwrap();
-        db.log_audit_event("auth", "alice", "logout", None, "ok", None).unwrap();
+        db.log_audit_event("auth", "alice", "logout", None, "ok", None)
+            .unwrap();
         {
             let conn = db.lock_conn();
-            conn.execute("DELETE FROM audit_logs WHERE id=?1", params![id]).unwrap();
+            conn.execute("DELETE FROM audit_logs WHERE id=?1", params![id])
+                .unwrap();
         }
         let status = db.verify_audit_chain().unwrap();
         assert!(!status.intact);
@@ -6604,8 +7370,13 @@ mod tests {
             .create_scheduled_task(100, "test", "cron", "0 * * * * *", "2024-01-01T00:00:00Z")
             .unwrap();
 
-        db.update_task_after_run(id, "2024-01-01T00:01:00Z", Some("2024-01-01T00:02:00Z"), true)
-            .unwrap();
+        db.update_task_after_run(
+            id,
+            "2024-01-01T00:01:00Z",
+            Some("2024-01-01T00:02:00Z"),
+            true,
+        )
+        .unwrap();
 
         let tasks = db.get_tasks_for_chat(100).unwrap();
         assert_eq!(tasks[0].last_run.as_deref(), Some("2024-01-01T00:01:00Z"));
@@ -7451,8 +8222,17 @@ mod tests {
             .unwrap();
         db.kg_insert_triple("Acme", "located_in", "Berlin", chat, vf, 0.8, "test", None)
             .unwrap();
-        db.kg_insert_triple("Berlin", "capital_of", "Germany", chat, vf, 0.7, "test", None)
-            .unwrap();
+        db.kg_insert_triple(
+            "Berlin",
+            "capital_of",
+            "Germany",
+            chat,
+            vf,
+            0.7,
+            "test",
+            None,
+        )
+        .unwrap();
         db.kg_insert_triple("Zoe", "likes", "Tea", chat, vf, 0.6, "test", None)
             .unwrap();
 
@@ -7462,17 +8242,23 @@ mod tests {
         assert!(ents.iter().any(|e| e == "Germany"));
 
         // 1 hop from Alice reaches the works_at edge but not located_in.
-        let one = db.kg_neighborhood(chat, &["Alice".to_string()], 1, 10).unwrap();
+        let one = db
+            .kg_neighborhood(chat, &["Alice".to_string()], 1, 10)
+            .unwrap();
         assert!(one.iter().any(|t| t.predicate == "works_at"));
         assert!(!one.iter().any(|t| t.predicate == "located_in"));
 
         // 2 hops from Alice pulls in Acme's edges (multi-hop), but never Zoe's.
-        let two = db.kg_neighborhood(chat, &["Alice".to_string()], 2, 10).unwrap();
+        let two = db
+            .kg_neighborhood(chat, &["Alice".to_string()], 2, 10)
+            .unwrap();
         assert!(two.iter().any(|t| t.predicate == "located_in"));
         assert!(!two.iter().any(|t| t.subject == "Zoe"));
 
         // total_limit is respected.
-        let capped = db.kg_neighborhood(chat, &["Alice".to_string()], 3, 1).unwrap();
+        let capped = db
+            .kg_neighborhood(chat, &["Alice".to_string()], 3, 1)
+            .unwrap();
         assert_eq!(capped.len(), 1);
 
         // Empty seeds → empty result, no panic.
@@ -8136,6 +8922,207 @@ mod tests {
     }
 
     #[test]
+    fn test_active_turns_mark_clear_and_take() {
+        let (db, dir) = test_db();
+
+        // Nothing tracked → nothing to recover.
+        assert!(db.take_interrupted_turns().unwrap().is_empty());
+
+        db.mark_turn_active(10, "telegram").unwrap();
+        db.mark_turn_active(20, "discord").unwrap();
+        // Re-entrant mark for the same chat refreshes rather than duplicates.
+        db.mark_turn_active(10, "telegram").unwrap();
+        // Progress snapshots attach to the in-flight turn; unknown chat = no-op.
+        db.update_turn_progress(10, "step 3: web_search, read_file")
+            .unwrap();
+        db.update_turn_progress(999, "ignored").unwrap();
+        // A turn that finished cleanly leaves no residue.
+        db.clear_turn_active(20).unwrap();
+
+        let orphans = db.take_interrupted_turns().unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].chat_id, 10);
+        assert_eq!(orphans[0].channel, "telegram");
+        assert!(!orphans[0].started_at.is_empty());
+        assert_eq!(
+            orphans[0].progress_text.as_deref(),
+            Some("step 3: web_search, read_file")
+        );
+
+        // take is destructive: a second sweep can never double-notify.
+        assert!(db.take_interrupted_turns().unwrap().is_empty());
+        // Clearing an unknown chat is a no-op, not an error.
+        db.clear_turn_active(999).unwrap();
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_outbox_lifecycle() {
+        let (db, dir) = test_db();
+        assert_eq!(db.count_outbox_pending().unwrap(), 0);
+
+        let id = db
+            .enqueue_outbox_message(42, "telegram", "the answer is 42")
+            .unwrap();
+        assert_eq!(db.count_outbox_pending().unwrap(), 1);
+
+        // Due immediately (next_attempt_at = enqueue time).
+        let due = db
+            .list_due_outbox_messages("2999-01-01T00:00:00Z", 10)
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, id);
+        assert_eq!(due[0].chat_id, 42);
+        assert_eq!(due[0].payload_text, "the answer is 42");
+        assert_eq!(due[0].status, "pending");
+
+        // Retry with a future next attempt → not due before that instant.
+        db.mark_outbox_retry(id, 1, Some("2999-06-01T00:00:00Z"), "network down", false)
+            .unwrap();
+        assert!(db
+            .list_due_outbox_messages("2999-01-01T00:00:00Z", 10)
+            .unwrap()
+            .is_empty());
+        let due = db
+            .list_due_outbox_messages("2999-07-01T00:00:00Z", 10)
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].attempts, 1);
+        assert_eq!(due[0].last_error.as_deref(), Some("network down"));
+
+        // Delivered → gone from the queue and the pending count.
+        db.mark_outbox_delivered(id).unwrap();
+        assert!(db
+            .list_due_outbox_messages("2999-07-01T00:00:00Z", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.count_outbox_pending().unwrap(), 0);
+
+        // Terminal failure also leaves the queue.
+        let id2 = db.enqueue_outbox_message(43, "slack", "bye").unwrap();
+        db.mark_outbox_retry(id2, 8, None, "gave up", true).unwrap();
+        assert!(db
+            .list_due_outbox_messages("2999-07-01T00:00:00Z", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.count_outbox_pending().unwrap(), 0);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_chunked_delivery_resumes_and_stores_logical_message_once() {
+        let (db, dir) = test_db();
+        let ids = db
+            .create_outbound_delivery(
+                "delivery-test",
+                77,
+                "weixin",
+                "first second third",
+                &["first".into(), "second".into(), "third".into()],
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        let health = db.outbound_delivery_health().unwrap();
+        assert_eq!(health.total_deliveries, 1);
+        assert_eq!(health.pending_chunks, 3);
+
+        assert!(db.mark_outbox_sending(ids[0]).unwrap());
+        db.mark_outbox_delivered(ids[0]).unwrap();
+        assert!(db.mark_outbox_sending(ids[1]).unwrap());
+        assert_eq!(db.recover_sending_outbox_messages().unwrap(), 1);
+
+        let due = db
+            .list_due_outbox_messages("2999-01-01T00:00:00Z", 10)
+            .unwrap();
+        assert_eq!(due.len(), 2);
+        assert_eq!(due[0].chunk_index, 1);
+        assert_eq!(due[0].idempotency_key, "delivery-test:2");
+        assert_eq!(due[1].chunk_index, 2);
+
+        for row in due {
+            assert!(db.mark_outbox_sending(row.id).unwrap());
+            db.mark_outbox_delivered(row.id).unwrap();
+        }
+        assert!(db.outbound_delivery_is_complete("delivery-test").unwrap());
+        assert!(db
+            .finalize_outbound_delivery("delivery-test", "bot")
+            .unwrap());
+        assert!(!db
+            .finalize_outbound_delivery("delivery-test", "bot")
+            .unwrap());
+
+        let messages = db.get_all_messages(77).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "first second third");
+        let health = db.outbound_delivery_health().unwrap();
+        assert_eq!(health.delivered_deliveries, 1);
+        assert_eq!(
+            health.pending_chunks + health.sending_chunks + health.retry_chunks,
+            0
+        );
+        assert_eq!(health.failed_chunks, 0);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_recover_orphaned_subagent_runs() {
+        let (db, dir) = test_db();
+        for (run_id, status) in [
+            ("orph-accepted", None),
+            ("orph-running", Some("running")),
+            ("done-ok", Some("done")),
+        ] {
+            db.create_subagent_run(CreateSubagentRunParams {
+                run_id,
+                parent_run_id: None,
+                depth: 1,
+                token_budget: 0,
+                chat_id: 7,
+                caller_channel: "telegram",
+                task: "t",
+                context: "",
+                provider: "anthropic",
+                model: "claude-test",
+                label: None,
+            })
+            .unwrap();
+            match status {
+                Some("running") => db.mark_subagent_running(run_id).unwrap(),
+                Some(s) => db
+                    .mark_subagent_finished(FinishSubagentRunParams {
+                        run_id,
+                        status: s,
+                        error_text: None,
+                        result_text: Some("ok"),
+                        artifact_json: None,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    })
+                    .unwrap(),
+                None => {}
+            }
+        }
+
+        let fixed = db.recover_orphaned_subagent_runs().unwrap();
+        assert_eq!(fixed, 2, "accepted + running rows must be retired");
+
+        for run_id in ["orph-accepted", "orph-running"] {
+            let run = db.get_subagent_run(run_id, 7).unwrap().unwrap();
+            assert_eq!(run.status, "interrupted");
+            assert!(run.finished_at.is_some());
+            assert!(run.error_text.as_deref().unwrap().contains("restarted"));
+        }
+        // Finished runs are untouched, and nothing counts as active anymore.
+        let done = db.get_subagent_run("done-ok", 7).unwrap().unwrap();
+        assert_eq!(done.status, "done");
+        assert!(done.error_text.is_none());
+        assert!(db.list_active_subagent_runs().unwrap().is_empty());
+        // Idempotent: a second recovery pass finds nothing.
+        assert_eq!(db.recover_orphaned_subagent_runs().unwrap(), 0);
+        cleanup(&dir);
+    }
+
+    #[test]
     fn test_subagent_run_label_and_progress() {
         let (db, dir) = test_db();
         db.create_subagent_run(CreateSubagentRunParams {
@@ -8170,7 +9157,9 @@ mod tests {
 
         // Resolve by exact run_id, by label, and a miss.
         assert_eq!(
-            db.resolve_subagent_run_id(42, "subrun-1").unwrap().as_deref(),
+            db.resolve_subagent_run_id(42, "subrun-1")
+                .unwrap()
+                .as_deref(),
             Some("subrun-1")
         );
         assert_eq!(
@@ -8181,7 +9170,10 @@ mod tests {
         );
         assert!(db.resolve_subagent_run_id(42, "nope").unwrap().is_none());
         // Wrong chat → no match.
-        assert!(db.resolve_subagent_run_id(99, "competitor research").unwrap().is_none());
+        assert!(db
+            .resolve_subagent_run_id(99, "competitor research")
+            .unwrap()
+            .is_none());
 
         // Children listing for fan-in: a child of subrun-1.
         db.create_subagent_run(CreateSubagentRunParams {
@@ -8219,10 +9211,7 @@ mod tests {
             .unwrap();
         assert!(prev2.is_some());
         let events = db.list_subagent_events("subrun-1", 50).unwrap();
-        let progress_events = events
-            .iter()
-            .filter(|e| e.event_type == "progress")
-            .count();
+        let progress_events = events.iter().filter(|e| e.event_type == "progress").count();
         assert_eq!(progress_events, 2);
 
         cleanup(&dir);

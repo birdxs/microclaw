@@ -677,7 +677,55 @@ impl EventHandler for Handler {
             } else {
                 None
             };
-        let mut tap = crate::channels::event_tap::EventTap::spawn(event_rx, injection_ack);
+        // Phase-3 progress heartbeat (opt-in via channels.discord.progress_updates):
+        // first emission sends a "working…" message, later emissions edit it in
+        // place, and the terminal emission finalizes it when the turn ends.
+        let progress_settings = crate::channels::event_tap::progress_updates_settings(
+            &self.app_state.config,
+            "discord",
+        );
+        let is_private_chat = msg.guild_id.is_none();
+        let progress: Option<(
+            crate::channels::event_tap::ProgressConfig,
+            crate::channels::event_tap::ProgressEmit,
+        )> = if progress_settings.enabled && (is_private_chat || progress_settings.groups) {
+            let http_for_progress = ctx.http.clone();
+            let channel_for_progress = msg.channel_id;
+            let progress_msg: Arc<tokio::sync::Mutex<Option<serenity::model::id::MessageId>>> =
+                Arc::new(tokio::sync::Mutex::new(None));
+            let emit: crate::channels::event_tap::ProgressEmit =
+                Box::new(move |text, _terminal| {
+                    let http = http_for_progress.clone();
+                    let channel = channel_for_progress;
+                    let progress_msg = progress_msg.clone();
+                    Box::pin(async move {
+                        let mut slot = progress_msg.lock().await;
+                        match *slot {
+                            Some(message_id) => {
+                                let edit =
+                                    serenity::builder::EditMessage::new().content(text);
+                                if let Err(e) =
+                                    channel.edit_message(&http, message_id, edit).await
+                                {
+                                    warn!("Discord: progress edit failed: {e}");
+                                }
+                            }
+                            None => match channel.say(&http, text).await {
+                                Ok(sent) => *slot = Some(sent.id),
+                                Err(e) => warn!("Discord: progress send failed: {e}"),
+                            },
+                        }
+                    })
+                });
+            Some((progress_settings.config, emit))
+        } else {
+            None
+        };
+        let mut tap = crate::channels::event_tap::EventTap::spawn_with_progress(
+            event_rx,
+            injection_ack,
+            progress,
+        );
         // Process with shared agent engine (reuses the same loop as Telegram)
         match process_with_agent_with_events_guarded(
             &self.app_state,
@@ -712,21 +760,34 @@ impl EventHandler for Handler {
                         );
                     }
                 } else if !response.is_empty() {
-                    send_discord_response(&ctx, msg.channel_id, &response).await;
+                    let delivered = send_discord_response(&ctx, msg.channel_id, &response).await;
 
-                    // Store bot response
-                    let bot_msg = StoredMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        chat_id: channel_id,
-                        sender_name: self.runtime.bot_username.clone(),
-                        content: response,
-                        is_from_bot: true,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                    };
-                    let _ = call_blocking(self.app_state.db.clone(), move |db| {
-                        db.store_message(&bot_msg)
-                    })
-                    .await;
+                    if delivered {
+                        // Store bot response
+                        let bot_msg = StoredMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            chat_id: channel_id,
+                            sender_name: self.runtime.bot_username.clone(),
+                            content: response,
+                            is_from_bot: true,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let _ = call_blocking(self.app_state.db.clone(), move |db| {
+                            db.store_message(&bot_msg)
+                        })
+                        .await;
+                    } else {
+                        // Delivery outbox: queue the finished answer for
+                        // background redelivery instead of dropping it.
+                        warn!(
+                            "Discord: final reply delivery failed for chat {channel_id}; queued to outbox"
+                        );
+                        let channel_name = self.runtime.channel_name.clone();
+                        let _ = call_blocking(self.app_state.db.clone(), move |db| {
+                            db.enqueue_outbox_message(channel_id, &channel_name, &response)
+                        })
+                        .await;
+                    }
                 } else {
                     let fallback = "I couldn't produce a visible reply after an automatic retry. Please try again.".to_string();
                     send_discord_response(&ctx, msg.channel_id, &fallback).await;
@@ -807,14 +868,21 @@ impl EventHandler for Handler {
 }
 
 /// Split and send long messages (Discord limit is 2000 chars).
-async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) {
+/// Returns `true` if every chunk was delivered.
+async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str) -> bool {
     const MAX_LEN: usize = 2000;
 
     if text.len() <= MAX_LEN {
-        let _ = channel_id.say(&ctx.http, text).await;
-        return;
+        return match channel_id.say(&ctx.http, text).await {
+            Ok(_) => true,
+            Err(e) => {
+                warn!("Discord: send failed: {e}");
+                false
+            }
+        };
     }
 
+    let mut all_ok = true;
     let mut remaining = text;
     while !remaining.is_empty() {
         let chunk_len = if remaining.len() <= MAX_LEN {
@@ -825,13 +893,17 @@ async fn send_discord_response(ctx: &Context, channel_id: ChannelId, text: &str)
         };
 
         let chunk = &remaining[..chunk_len];
-        let _ = channel_id.say(&ctx.http, chunk).await;
+        if let Err(e) = channel_id.say(&ctx.http, chunk).await {
+            warn!("Discord: chunk send failed: {e}");
+            all_ok = false;
+        }
         remaining = &remaining[chunk_len..];
 
         if remaining.starts_with('\n') {
             remaining = &remaining[1..];
         }
     }
+    all_ok
 }
 
 async fn run_discord_client(

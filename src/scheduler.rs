@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -21,45 +20,50 @@ use crate::agent_engine::AgentRequestContext;
 use crate::memory_service::apply_reflector_extractions;
 use crate::runtime::AppState;
 use microclaw_channels::channel::{
-    deliver_and_store_bot_message, get_chat_routing, ChatRouting, ConversationKind,
+    deliver_and_store_bot_message, deliver_and_store_bot_message_with_status, get_chat_routing,
+    ChatRouting, ConversationKind, DeliveryOutcome,
 };
 use microclaw_core::llm_types::{Message, MessageContent, ResponseContentBlock};
 use microclaw_core::text::floor_char_boundary;
 use microclaw_storage::db::call_blocking;
 
 pub fn spawn_scheduler(state: Arc<AppState>) {
-    tokio::spawn(async move {
-        info!("Scheduler started");
-        if let Ok(recovered) =
-            call_blocking(state.db.clone(), move |db| db.recover_running_tasks()).await
-        {
-            if recovered > 0 {
-                warn!(
+    crate::supervision::spawn_supervised("scheduler", move || {
+        let state = state.clone();
+        async move {
+            info!("Scheduler started");
+            if let Ok(recovered) =
+                call_blocking(state.db.clone(), move |db| db.recover_running_tasks()).await
+            {
+                if recovered > 0 {
+                    warn!(
                     "Scheduler: recovered {} task(s) left in running state from previous process",
                     recovered
                 );
+                }
             }
-        }
-        // Run once at startup so overdue tasks are not delayed until the first tick.
-        run_due_tasks(&state).await;
-
-        // Align polling to wall-clock minute boundaries for stable "every minute" behavior.
-        let now = Utc::now();
-        let secs_into_minute = now.timestamp().rem_euclid(60) as u64;
-        let nanos = now.timestamp_subsec_nanos() as u64;
-        let mut delay = Duration::from_secs(60 - secs_into_minute);
-        if secs_into_minute == 0 {
-            delay = Duration::from_secs(60);
-        }
-        delay = delay.saturating_sub(Duration::from_nanos(nanos));
-
-        let mut ticker = tokio::time::interval_at(Instant::now() + delay, Duration::from_secs(60));
-        // If processing falls behind, skip missed ticks instead of burst catch-up runs.
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            ticker.tick().await;
+            // Run once at startup so overdue tasks are not delayed until the first tick.
             run_due_tasks(&state).await;
+
+            // Align polling to wall-clock minute boundaries for stable "every minute" behavior.
+            let now = Utc::now();
+            let secs_into_minute = now.timestamp().rem_euclid(60) as u64;
+            let nanos = now.timestamp_subsec_nanos() as u64;
+            let mut delay = Duration::from_secs(60 - secs_into_minute);
+            if secs_into_minute == 0 {
+                delay = Duration::from_secs(60);
+            }
+            delay = delay.saturating_sub(Duration::from_nanos(nanos));
+
+            let mut ticker =
+                tokio::time::interval_at(Instant::now() + delay, Duration::from_secs(60));
+            // If processing falls behind, skip missed ticks instead of burst catch-up runs.
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                ticker.tick().await;
+                run_due_tasks(&state).await;
+            }
         }
     });
 }
@@ -90,11 +94,11 @@ async fn deliver_scheduler_message_with_backoff(
     bot_username: &str,
     chat_id: i64,
     text: &str,
-) -> Result<(), String> {
+) -> Result<DeliveryOutcome, String> {
     let mut attempt = 0u32;
     let max_attempts = 3u32;
     loop {
-        match deliver_and_store_bot_message(
+        match deliver_and_store_bot_message_with_status(
             &state.channel_registry,
             state.db.clone(),
             bot_username,
@@ -103,7 +107,7 @@ async fn deliver_scheduler_message_with_backoff(
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(outcome) => return Ok(outcome),
             Err(err) if attempt + 1 < max_attempts && is_retryable_delivery_rate_limit(&err) => {
                 attempt += 1;
                 let delay = Duration::from_secs(2u64.pow(attempt));
@@ -165,6 +169,96 @@ async fn run_due_tasks(state: &Arc<AppState>) {
     while set.join_next().await.is_some() {}
 }
 
+/// Bash-backed command runner for scheduled-task contracts: routes through
+/// the shared ToolRegistry choke point (sandbox, dangerous-pattern checks,
+/// tool_policy all apply).
+struct SchedulerBashRunner<'a> {
+    state: &'a Arc<AppState>,
+    auth: microclaw_tools::runtime::ToolAuthContext,
+}
+
+#[async_trait::async_trait]
+impl crate::completion_contract::CommandRunner for SchedulerBashRunner<'_> {
+    async fn run(&self, command: &str) -> (bool, String) {
+        let result = self
+            .state
+            .tools
+            .execute_with_auth(
+                "bash",
+                serde_json::json!({ "command": command }),
+                &self.auth,
+            )
+            .await;
+        (!result.is_error, result.content)
+    }
+}
+
+/// Verify a finished scheduled-task run against its stored completion
+/// contract (if any). Returns the (possibly annotated) response and whether
+/// the contract failed. Malformed stored criteria count as failure — a
+/// contract that can't be checked must not report success.
+async fn verify_task_contract(
+    state: &Arc<AppState>,
+    task: &microclaw_storage::db::ScheduledTask,
+    routing: &ChatRouting,
+    response: String,
+) -> (String, bool) {
+    let Some(raw) = task
+        .exit_criteria
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return (response, false);
+    };
+    let criteria: Vec<crate::completion_contract::ExitCriterion> = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Scheduler: task #{} has malformed exit_criteria: {e}",
+                task.id
+            );
+            return (
+                format!(
+                    "[completion contract] FAILED — stored criteria are malformed: {e}\n{response}"
+                ),
+                true,
+            );
+        }
+    };
+    if criteria.is_empty() {
+        return (response, false);
+    }
+    let base = std::path::Path::new(&state.config.working_dir);
+    let working_dir = match state.config.working_dir_isolation {
+        crate::config::WorkingDirIsolation::Shared => base.join("shared"),
+        crate::config::WorkingDirIsolation::Chat => {
+            microclaw_tools::runtime::chat_working_dir(base, &routing.channel_name, task.chat_id)
+        }
+    };
+    let runner = SchedulerBashRunner {
+        state,
+        auth: microclaw_tools::runtime::ToolAuthContext {
+            caller_channel: routing.channel_name.clone(),
+            caller_chat_id: task.chat_id,
+            control_chat_ids: state.config.control_chat_ids.clone(),
+            env_files: Vec::new(),
+        },
+    };
+    let outcomes = crate::completion_contract::verify_criteria(
+        &criteria,
+        &response,
+        &working_dir,
+        Some(&runner),
+    )
+    .await;
+    let failed = outcomes.iter().any(|o| !o.passed);
+    let annotated = format!(
+        "{}\n{response}",
+        crate::completion_contract::render_report(&outcomes)
+    );
+    (annotated, failed)
+}
+
 /// Execute a single claimed scheduled task end-to-end: run the agent (bounded by
 /// a wall-clock timeout so a hung run can't pin a slot forever), deliver the
 /// reply, log the run, enqueue a DLQ entry on failure, and reschedule (or mark
@@ -177,6 +271,27 @@ async fn run_one_due_task(state: Arc<AppState>, task: microclaw_storage::db::Sch
 
     let started_at = Utc::now();
     let started_at_str = started_at.to_rfc3339();
+
+    // Deadline gate at claim time: a task that was already queued when its
+    // not_after passed must retire, not fire late.
+    if crate::schedule_lifecycle::deadline_passed(task.not_after.as_deref(), started_at) {
+        info!(
+            "Scheduler: task #{} retired without running — not_after {} has passed",
+            task.id,
+            task.not_after.as_deref().unwrap_or("?")
+        );
+        let task_id = task.id;
+        if let Err(e) = call_blocking(state.db.clone(), move |db| {
+            db.update_task_status(task_id, "completed")?;
+            Ok(())
+        })
+        .await
+        {
+            error!("Scheduler: failed to retire task #{}: {e}", task.id);
+        }
+        return;
+    }
+
     let routing = get_chat_routing(&state.channel_registry, state.db.clone(), task.chat_id)
         .await
         .ok()
@@ -228,9 +343,44 @@ async fn run_one_due_task(state: Arc<AppState>, task: microclaw_storage::db::Sch
             )
         }
         Ok(Ok(response)) => {
-            if !response.is_empty() {
+            // Completion contract: verify the run's outcome with real checks
+            // before deciding success. A failed contract marks the run failed,
+            // so one-shot tasks flow into the existing DLQ + auto-replay
+            // (bounded retry) instead of being recorded as done.
+            let (response, contract_failed) =
+                verify_task_contract(&state, &task, &routing, response).await;
+            if response.starts_with(crate::agent_engine::TOKEN_BUDGET_REFUSAL_PREFIX) {
+                // Budget-refused turn: don't deliver the canned notice to the
+                // chat; record it in the run history instead.
+                warn!(
+                    "Scheduler: task #{} skipped — chat {} token budget exhausted",
+                    task.id, task.chat_id
+                );
+                (true, Some("skipped: token budget exhausted".to_string()))
+            } else if contract_failed {
+                // Deliver the annotated response so the user sees the evidence,
+                // but record the run as failed.
+                if !response.is_empty() {
+                    let bot_username = state.config.bot_username_for_channel(&routing.channel_name);
+                    let _ = deliver_scheduler_message_with_backoff(
+                        &state,
+                        &bot_username,
+                        task.chat_id,
+                        &response,
+                    )
+                    .await;
+                }
+                let summary_end = floor_char_boundary(&response, 200);
+                (
+                    false,
+                    Some(format!(
+                        "completion contract failed: {}",
+                        &response[..summary_end]
+                    )),
+                )
+            } else if !response.is_empty() {
                 let bot_username = state.config.bot_username_for_channel(&routing.channel_name);
-                if let Err(delivery_err) = deliver_scheduler_message_with_backoff(
+                match deliver_scheduler_message_with_backoff(
                     &state,
                     &bot_username,
                     task.chat_id,
@@ -238,18 +388,31 @@ async fn run_one_due_task(state: Arc<AppState>, task: microclaw_storage::db::Sch
                 )
                 .await
                 {
-                    error!(
-                        "Scheduler: task #{} generated a reply but delivery failed: {}",
-                        task.id, delivery_err
-                    );
-                    (false, Some(format!("Delivery error: {delivery_err}")))
-                } else {
-                    let summary = if response.len() > 200 {
-                        format!("{}...", &response[..floor_char_boundary(&response, 200)])
-                    } else {
-                        response
-                    };
-                    (true, Some(summary))
+                    Err(delivery_err) => {
+                        error!(
+                            "Scheduler: task #{} generated a reply but delivery failed: {}",
+                            task.id, delivery_err
+                        );
+                        (false, Some(format!("Delivery error: {delivery_err}")))
+                    }
+                    Ok(outcome) => {
+                        let mut summary = if response.len() > 200 {
+                            format!("{}...", &response[..floor_char_boundary(&response, 200)])
+                        } else {
+                            response
+                        };
+                        if let DeliveryOutcome::Queued {
+                            delivery_id,
+                            failed_chunk,
+                            total_chunks,
+                        } = outcome
+                        {
+                            summary.push_str(&format!(
+                                " [delivery queued: {delivery_id}, chunk {failed_chunk}/{total_chunks}]"
+                            ));
+                        }
+                        (true, Some(summary))
+                    }
                 }
             } else {
                 (true, None)
@@ -267,7 +430,10 @@ async fn run_one_due_task(state: Arc<AppState>, task: microclaw_storage::db::Sch
             )
             .await
             {
-                Ok(()) => format!("Error: {e}"),
+                Ok(DeliveryOutcome::Delivered) => format!("Error: {e}"),
+                Ok(DeliveryOutcome::Queued { delivery_id, .. }) => {
+                    format!("Error: {e}; notification queued: {delivery_id}")
+                }
                 Err(delivery_err) => {
                     warn!(
                         "Scheduler: failed to notify chat {} about task #{} failure: {}",
@@ -322,49 +488,229 @@ async fn run_one_due_task(state: Arc<AppState>, task: microclaw_storage::db::Sch
         })
         .await
         {
-            error!("Scheduler: failed to enqueue DLQ for task #{}: {e}", task.id);
+            error!(
+                "Scheduler: failed to enqueue DLQ for task #{}: {e}",
+                task.id
+            );
         }
     }
 
-    // Compute next run (prefer task-specific timezone; fallback to app timezone).
+    // Lifecycle decision (prefer task-specific timezone; fallback to app
+    // timezone): recurring cadences (cron | random) either produce a concrete
+    // next_run or retire the task as completed with a logged reason;
+    // one-shots keep their success/failed semantics.
     let tz = resolve_task_timezone(&task.timezone, &state.config.timezone);
-    let next_run = if task.schedule_type == "cron" {
-        match cron::Schedule::from_str(&task.schedule_value) {
-            Ok(schedule) => schedule
-                .upcoming(tz)
-                .next()
-                .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339()),
-            Err(e) => {
-                error!("Scheduler: invalid cron for task #{}: {e}", task.id);
-                None
+    let not_after_parsed = task
+        .not_after
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc));
+    let (next_run, lifecycle_finished) = if task.schedule_type == "once" {
+        (None, false)
+    } else {
+        match crate::schedule_lifecycle::decide_next_run(
+            &task.schedule_type,
+            &task.schedule_value,
+            tz,
+            Utc::now(),
+            task.run_count + 1,
+            task.max_runs,
+            not_after_parsed,
+            crate::schedule_lifecycle::random_unit(),
+        ) {
+            crate::schedule_lifecycle::NextRunDecision::RunAt(ts) => (Some(ts), false),
+            crate::schedule_lifecycle::NextRunDecision::Finished(reason) => {
+                info!("Scheduler: task #{} retiring — {reason}", task.id);
+                (None, true)
             }
         }
-    } else {
-        None // one-shot
     };
 
     match &next_run {
         Some(nr) => info!(
-            "Scheduler: task #{} finished (success={}, {}ms); next run at {}",
-            task.id, success, duration_ms, nr
-        ),
-        None => info!(
-            "Scheduler: one-shot task #{} finished (success={}, {}ms); marked {}",
+            "Scheduler: task #{} finished (success={}, {}ms, run #{}); next run at {}",
             task.id,
             success,
             duration_ms,
-            if success { "completed" } else { "failed" }
+            task.run_count + 1,
+            nr
+        ),
+        None => info!(
+            "Scheduler: task #{} finished (success={}, {}ms); marked {}",
+            task.id,
+            success,
+            duration_ms,
+            if lifecycle_finished || success {
+                "completed"
+            } else {
+                "failed"
+            }
         ),
     }
 
     let started_for_update = started_at_str.clone();
     if let Err(e) = call_blocking(state.db.clone(), move |db| {
-        db.update_task_after_run(task.id, &started_for_update, next_run.as_deref(), success)?;
+        db.update_task_after_run_lifecycle(
+            task.id,
+            &started_for_update,
+            next_run.as_deref(),
+            success,
+            lifecycle_finished,
+        )?;
         Ok(())
     })
     .await
     {
         error!("Scheduler: failed to update task #{}: {e}", task.id);
+    }
+}
+
+/// What to do with a dead-lettered task during the auto-replay sweep.
+#[derive(Debug, PartialEq, Eq)]
+enum DlqReplayAction {
+    /// Re-activate the task for one more attempt.
+    Requeue,
+    /// Out of attempts — leave it in the DLQ for manual inspection.
+    GiveUp,
+    /// Not eligible (e.g. a cron task that reschedules itself, or a task that
+    /// was cancelled/completed since it failed).
+    Skip,
+}
+
+/// Pure replay decision so the policy is unit-testable without a DB.
+///
+/// Auto-replay only rescues tasks currently in `failed` state — i.e. one-shot
+/// tasks that hit a transient failure. Recurring (cron) tasks reschedule
+/// themselves on the next tick, so requeueing them would just run them
+/// off-schedule. `failure_count` is the cumulative number of DLQ entries for
+/// the task; once it reaches `max_attempts` we stop and leave it for a human.
+fn dlq_replay_action(task_status: &str, failure_count: u32, max_attempts: u32) -> DlqReplayAction {
+    if task_status != "failed" {
+        return DlqReplayAction::Skip;
+    }
+    if failure_count >= max_attempts {
+        return DlqReplayAction::GiveUp;
+    }
+    DlqReplayAction::Requeue
+}
+
+/// Periodically retry scheduled tasks that landed in the dead-letter queue.
+/// A one-shot task that failed transiently is re-activated for another attempt,
+/// bounded by `dlq_max_replay_attempts`; after that it's left in the DLQ for
+/// manual inspection. OFF only if `dlq_replay_enabled` is false.
+pub fn spawn_dlq_replay(state: Arc<AppState>) {
+    if !state.config.dlq_replay_enabled {
+        info!("DLQ auto-replay disabled by config");
+        return;
+    }
+    let interval_secs = state.config.dlq_replay_interval_secs.max(30);
+    crate::supervision::spawn_supervised("dlq_replay", move || {
+        let state = state.clone();
+        async move {
+            info!("DLQ auto-replay started (interval: {}s)", interval_secs);
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                run_dlq_replay(&state).await;
+            }
+        }
+    });
+}
+
+async fn run_dlq_replay(state: &Arc<AppState>) {
+    let max_attempts = state.config.dlq_max_replay_attempts.max(1);
+    let entries = match call_blocking(state.db.clone(), |db| {
+        db.list_scheduled_task_dlq(None, None, false, 100)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("DLQ auto-replay: failed to list dead-lettered tasks: {e}");
+            return;
+        }
+    };
+    if entries.is_empty() {
+        return;
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let mut requeued = 0usize;
+    for entry in entries {
+        let task_id = entry.task_id;
+        let dlq_id = entry.id;
+
+        let task = call_blocking(state.db.clone(), move |db| db.get_task_by_id(task_id))
+            .await
+            .ok()
+            .flatten();
+        let Some(task) = task else {
+            // Parent task is gone; close out the DLQ entry so we don't rescan it.
+            let _ = call_blocking(state.db.clone(), move |db| {
+                db.mark_scheduled_task_dlq_replayed(dlq_id, Some("task no longer exists"))
+            })
+            .await;
+            continue;
+        };
+
+        // Cumulative failure count for this task == number of DLQ rows.
+        let failure_count = call_blocking(state.db.clone(), move |db| {
+            db.list_scheduled_task_dlq(None, Some(task_id), true, 1000)
+        })
+        .await
+        .map(|v| v.len() as u32)
+        .unwrap_or(0);
+
+        match dlq_replay_action(&task.status, failure_count, max_attempts) {
+            DlqReplayAction::Skip => {
+                let _ = call_blocking(state.db.clone(), move |db| {
+                    db.mark_scheduled_task_dlq_replayed(
+                        dlq_id,
+                        Some("task not in failed state; no replay needed"),
+                    )
+                })
+                .await;
+            }
+            DlqReplayAction::GiveUp => {
+                warn!(
+                    "DLQ auto-replay: task #{} exhausted {} attempt(s); leaving in DLQ for manual inspection",
+                    task_id, max_attempts
+                );
+                let _ = call_blocking(state.db.clone(), move |db| {
+                    db.mark_scheduled_task_dlq_replayed(
+                        dlq_id,
+                        Some("max replay attempts reached; left for manual inspection"),
+                    )
+                })
+                .await;
+            }
+            DlqReplayAction::Requeue => {
+                let now_for_requeue = now.clone();
+                let ok = call_blocking(state.db.clone(), move |db| {
+                    db.requeue_scheduled_task(task_id, &now_for_requeue)
+                })
+                .await
+                .unwrap_or(false);
+                if ok {
+                    let note = format!("auto-replay attempt {failure_count}/{max_attempts}");
+                    let _ = call_blocking(state.db.clone(), move |db| {
+                        db.mark_scheduled_task_dlq_replayed(dlq_id, Some(&note))
+                    })
+                    .await;
+                    info!(
+                        "DLQ auto-replay: requeued task #{} (attempt {}/{})",
+                        task_id, failure_count, max_attempts
+                    );
+                    requeued += 1;
+                } else {
+                    warn!("DLQ auto-replay: failed to requeue task #{}", task_id);
+                }
+            }
+        }
+    }
+    if requeued > 0 {
+        info!("DLQ auto-replay: requeued {requeued} task(s) for retry");
     }
 }
 
@@ -435,14 +781,17 @@ pub fn spawn_reflector(state: Arc<AppState>) {
         return;
     }
     let interval_secs = state.config.reflector_interval_mins * 60;
-    tokio::spawn(async move {
-        info!(
-            "Reflector started (interval: {}min)",
-            state.config.reflector_interval_mins
-        );
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-            run_reflector(&state).await;
+    crate::supervision::spawn_supervised("reflector", move || {
+        let state = state.clone();
+        async move {
+            info!(
+                "Reflector started (interval: {}min)",
+                state.config.reflector_interval_mins
+            );
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                run_reflector(&state).await;
+            }
         }
     });
 }
@@ -455,15 +804,18 @@ pub fn spawn_task_standup(state: Arc<AppState>) {
         return;
     }
     let interval_secs = state.config.subagents.standup.interval_secs.max(60);
-    tokio::spawn(async move {
-        info!("Task standup started (interval: {}s)", interval_secs);
-        // Per-chat last standup time, so each chat gets at most one per interval.
-        let mut last_standup: HashMap<i64, Instant> = HashMap::new();
-        let mut ticker = tokio::time::interval(Duration::from_secs(60));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            run_task_standup(&state, interval_secs, &mut last_standup).await;
+    crate::supervision::spawn_supervised("task_standup", move || {
+        let state = state.clone();
+        async move {
+            info!("Task standup started (interval: {}s)", interval_secs);
+            // Per-chat last standup time, so each chat gets at most one per interval.
+            let mut last_standup: HashMap<i64, Instant> = HashMap::new();
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                run_task_standup(&state, interval_secs, &mut last_standup).await;
+            }
         }
     });
 }
@@ -548,28 +900,95 @@ pub fn spawn_idle_checkin(state: Arc<AppState>) {
     if !state.config.idle_checkin.enabled {
         return;
     }
-    tokio::spawn(async move {
-        info!(
-            "Idle check-in started (idle_hours={}, min_interval_hours={})",
-            state.config.idle_checkin.idle_hours, state.config.idle_checkin.min_interval_hours
-        );
-        let mut last_checkin: HashMap<i64, Instant> = HashMap::new();
-        let mut ticker = tokio::time::interval(Duration::from_secs(1800));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            run_idle_checkin(&state, &mut last_checkin).await;
+    crate::supervision::spawn_supervised("idle_checkin", move || {
+        let state = state.clone();
+        async move {
+            info!(
+                "Idle check-in started (idle_hours={}, min_interval_hours={})",
+                state.config.idle_checkin.idle_hours, state.config.idle_checkin.min_interval_hours
+            );
+            let mut last_checkin: HashMap<i64, Instant> = HashMap::new();
+            let mut ticker = tokio::time::interval(Duration::from_secs(1800));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                run_idle_checkin(&state, &mut last_checkin).await;
+            }
         }
     });
 }
 
-const IDLE_CHECKIN_PROMPT: &str = "[Proactive idle check-in] This chat has been quiet for a while. \
-Review what you know about this user and any pending follow-ups, due reminders, or promises you made.\n\
-- If — and ONLY if — you have something genuinely useful or kind to say right now (a due follow-up, a \
-relevant update, a gentle nudge on something they asked for), write ONE short, friendly message.\n\
-- Otherwise, reply with exactly: SKIP\n\
+/// SKIP contract appended to every proactive prompt. One copy — the sentinel
+/// wording and the parser in [`proactive_deliverable`] must stay in sync.
+const PROACTIVE_SKIP_CONTRACT: &str = "\n- Otherwise, reply with exactly: SKIP\n\
 Do not invent reasons to message; silence is the right default. Do not use the send_message tool — just \
 return the message text, or SKIP.";
+
+const IDLE_CHECKIN_PROMPT_BODY: &str = "[Proactive idle check-in] This chat has been quiet for a while. \
+Review what you know about this user and any pending follow-ups, due reminders, or promises you made.\n\
+- If — and ONLY if — you have something genuinely useful or kind to say right now (a due follow-up, a \
+relevant update, a gentle nudge on something they asked for), write ONE short, friendly message.";
+
+/// Decide whether a proactive agent reply should be delivered. `None` means
+/// stay silent: empty replies, the SKIP sentinel (tolerating trailing
+/// punctuation like "SKIP."), and system refusals (token budget) that would
+/// otherwise be re-delivered on every sweep.
+fn proactive_deliverable(response: &str) -> Option<&str> {
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .eq_ignore_ascii_case("skip")
+    {
+        return None;
+    }
+    if trimmed.starts_with(crate::agent_engine::TOKEN_BUDGET_REFUSAL_PREFIX) {
+        return None;
+    }
+    Some(trimmed)
+}
+
+/// Shared tail of every proactive loop: run one agent turn over `prompt` and
+/// deliver the reply unless [`proactive_deliverable`] says to stay silent.
+/// Returns `Err` when the agent run itself failed so callers can do their own
+/// bookkeeping; delivery failures are logged here.
+async fn proactive_turn_and_deliver(
+    state: &Arc<AppState>,
+    routing: &ChatRouting,
+    chat_id: i64,
+    prompt: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    let response = process_with_agent(
+        state,
+        AgentRequestContext {
+            caller_channel: &routing.channel_name,
+            chat_id,
+            chat_type: routing.conversation.as_agent_chat_type(),
+        },
+        Some(prompt),
+        None,
+    )
+    .await?;
+
+    if let Some(reply) = proactive_deliverable(&response) {
+        let bot_username = state.config.bot_username_for_channel(&routing.channel_name);
+        if let Err(e) = deliver_and_store_bot_message(
+            &state.channel_registry,
+            state.db.clone(),
+            &bot_username,
+            chat_id,
+            reply,
+        )
+        .await
+        {
+            warn!("{label}: delivery failed for chat {chat_id}: {e}");
+        }
+    }
+    Ok(())
+}
 
 async fn run_idle_checkin(state: &Arc<AppState>, last_checkin: &mut HashMap<i64, Instant>) {
     let idle_hours = state.config.idle_checkin.idle_hours.max(1) as i64;
@@ -582,15 +1001,14 @@ async fn run_idle_checkin(state: &Arc<AppState>, last_checkin: &mut HashMap<i64,
             .saturating_mul(3600),
     );
     let cutoff = (Utc::now() - chrono::Duration::hours(idle_hours)).to_rfc3339();
-    let chats = match call_blocking(state.db.clone(), move |db| db.list_idle_chats(&cutoff, 100))
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("idle check-in: failed to list idle chats: {e}");
-            return;
-        }
-    };
+    let chats =
+        match call_blocking(state.db.clone(), move |db| db.list_idle_chats(&cutoff, 100)).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("idle check-in: failed to list idle chats: {e}");
+                return;
+            }
+        };
 
     for chat_id in chats {
         // Respect the per-chat min interval.
@@ -618,45 +1036,160 @@ async fn run_idle_checkin(state: &Arc<AppState>, last_checkin: &mut HashMap<i64,
             None => continue,
         };
 
-        let response = match process_with_agent(
-            state,
-            AgentRequestContext {
-                caller_channel: &routing.channel_name,
-                chat_id,
-                chat_type: routing.conversation.as_agent_chat_type(),
-            },
-            Some(IDLE_CHECKIN_PROMPT),
-            None,
-        )
-        .await
+        let prompt = format!("{IDLE_CHECKIN_PROMPT_BODY}{PROACTIVE_SKIP_CONTRACT}");
+        if let Err(e) =
+            proactive_turn_and_deliver(state, &routing, chat_id, &prompt, "idle check-in").await
         {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("idle check-in: agent run failed for chat {chat_id}: {e}");
-                last_checkin.insert(chat_id, Instant::now());
+            warn!("idle check-in: agent run failed for chat {chat_id}: {e}");
+        }
+        // Mark as checked-in regardless of outcome, so we don't retry every tick.
+        last_checkin.insert(chat_id, Instant::now());
+    }
+}
+
+/// OpenClaw-style proactive heartbeat: every `interval_mins`, read each
+/// chat's HEARTBEAT.md checklist and run an agent turn over it. The agent may
+/// use tools to check on items and messages the chat only when something
+/// genuinely needs attention (otherwise it replies SKIP and the sweep stays
+/// silent). OFF by default; chats without a HEARTBEAT.md are never touched,
+/// so enabling the loop alone changes nothing until a checklist exists.
+///
+/// Checklists are looked up in both per-chat layouts:
+/// `<data_dir>/groups/<channel>/<chat_id>/HEARTBEAT.md` (next to the chat's
+/// AGENTS.md — the canonical spot) and the flat
+/// `<data_dir>/runtime/groups/<chat_id>/HEARTBEAT.md` (SOUL-override layout).
+pub fn spawn_heartbeat(state: Arc<AppState>) {
+    if !state.config.heartbeat.enabled {
+        return;
+    }
+    crate::supervision::spawn_supervised("heartbeat", move || {
+        let state = state.clone();
+        async move {
+            let interval_mins = state.config.heartbeat.interval_mins.max(1);
+            info!("Heartbeat started (interval_mins={interval_mins})");
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_mins * 60));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // The first interval tick completes immediately; consume it so a
+            // restart doesn't instantly re-run every checklist.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                run_heartbeat(&state).await;
+            }
+        }
+    });
+}
+
+const HEARTBEAT_PROMPT_BODY: &str = "[Heartbeat] Periodic proactive check for this chat. Below is \
+the chat's HEARTBEAT.md checklist, maintained by the user (and you, via file tools).\n\
+- Work through the items. Use tools where needed to check on things (schedules, files, web, memory).\n\
+- If — and ONLY if — something needs the user's attention right now, write ONE short message about it. \
+Do not narrate checks that came back clean.";
+
+/// Collect `(chat_id, checklist)` pairs from every configured heartbeat root.
+/// Each root is scanned one level deep: a numeric child dir is a chat dir
+/// (flat layout); a non-numeric child is a channel dir whose numeric children
+/// are chat dirs. First root wins on duplicate chat ids.
+fn heartbeat_checklists(roots: &[std::path::PathBuf], max_chars: usize) -> Vec<(i64, String)> {
+    let mut out: Vec<(i64, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let visit_chat_dir = |dir: &std::path::Path,
+                          chat_id: i64,
+                          out: &mut Vec<(i64, String)>,
+                          seen: &mut std::collections::HashSet<i64>| {
+        if seen.contains(&chat_id) {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(dir.join("HEARTBEAT.md")) else {
+            return;
+        };
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let capped = if trimmed.len() > max_chars {
+            let end = floor_char_boundary(trimmed, max_chars);
+            format!("{}\n[... truncated at {max_chars} chars]", &trimmed[..end])
+        } else {
+            trimmed.to_string()
+        };
+        seen.insert(chat_id);
+        out.push((chat_id, capped));
+    };
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
                 continue;
             }
-        };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Ok(chat_id) = name.parse::<i64>() {
+                visit_chat_dir(&entry.path(), chat_id, &mut out, &mut seen);
+            } else {
+                // Channel dir: scan its numeric children.
+                let Ok(children) = std::fs::read_dir(entry.path()) else {
+                    continue;
+                };
+                for child in children.flatten() {
+                    let Some(chat_id) = child
+                        .file_name()
+                        .to_str()
+                        .and_then(|s| s.parse::<i64>().ok())
+                    else {
+                        continue;
+                    };
+                    visit_chat_dir(&child.path(), chat_id, &mut out, &mut seen);
+                }
+            }
+        }
+    }
+    out.sort_by_key(|(id, _)| *id);
+    out
+}
 
-        // Mark as checked-in regardless, so we don't retry every tick.
-        last_checkin.insert(chat_id, Instant::now());
+/// The two roots heartbeat checklists may live under, in priority order.
+fn heartbeat_roots(config: &crate::config::Config) -> Vec<std::path::PathBuf> {
+    vec![
+        // Canonical channel-aware layout, where per-chat AGENTS.md lives.
+        std::path::PathBuf::from(&config.data_dir).join("groups"),
+        // Flat legacy layout used by per-chat SOUL.md overrides.
+        crate::agent_engine::effective_runtime_data_dir(config).join("groups"),
+    ]
+}
 
-        let trimmed = response.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("skip") {
+async fn run_heartbeat(state: &Arc<AppState>) {
+    let roots = heartbeat_roots(&state.config);
+    let checklists = heartbeat_checklists(&roots, state.config.heartbeat.max_chars);
+    for (chat_id, checklist) in checklists {
+        // Chats with active background work already get their own updates.
+        let active = call_blocking(state.db.clone(), move |db| {
+            db.count_active_subagent_runs_for_chat(chat_id)
+        })
+        .await
+        .unwrap_or(0);
+        if active > 0 {
             continue;
         }
 
-        let bot_username = state.config.bot_username_for_channel(&routing.channel_name);
-        if let Err(e) = deliver_and_store_bot_message(
-            &state.channel_registry,
-            state.db.clone(),
-            &bot_username,
-            chat_id,
-            trimmed,
-        )
-        .await
+        let routing = match get_chat_routing(&state.channel_registry, state.db.clone(), chat_id)
+            .await
+            .ok()
+            .flatten()
         {
-            warn!("idle check-in: delivery failed for chat {chat_id}: {e}");
+            Some(r) => r,
+            None => continue,
+        };
+
+        let prompt = format!(
+            "{HEARTBEAT_PROMPT_BODY}{PROACTIVE_SKIP_CONTRACT}\n\n--- HEARTBEAT.md ---\n{checklist}"
+        );
+        if let Err(e) =
+            proactive_turn_and_deliver(state, &routing, chat_id, &prompt, "heartbeat").await
+        {
+            warn!("heartbeat: agent run failed for chat {chat_id}: {e}");
         }
     }
 }
@@ -668,19 +1201,22 @@ pub fn spawn_memory_consolidation(state: Arc<AppState>) {
     if !state.config.sleep_time.enabled {
         return;
     }
-    tokio::spawn(async move {
-        info!(
+    crate::supervision::spawn_supervised("memory_consolidation", move || {
+        let state = state.clone();
+        async move {
+            info!(
             "Sleep-time consolidation started (idle_hours={}, min_interval_hours={}, threshold={})",
             state.config.sleep_time.idle_hours,
             state.config.sleep_time.min_interval_hours,
             state.config.sleep_time.similarity_threshold
         );
-        let mut last_run: HashMap<i64, Instant> = HashMap::new();
-        let mut ticker = tokio::time::interval(Duration::from_secs(1800));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            run_memory_consolidation(&state, &mut last_run).await;
+            let mut last_run: HashMap<i64, Instant> = HashMap::new();
+            let mut ticker = tokio::time::interval(Duration::from_secs(1800));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                run_memory_consolidation(&state, &mut last_run).await;
+            }
         }
     });
 }
@@ -693,15 +1229,14 @@ async fn run_memory_consolidation(state: &Arc<AppState>, last_run: &mut HashMap<
     let max_archived = cfg.max_archived_per_pass.max(1);
     let cutoff = (Utc::now() - chrono::Duration::hours(idle_hours)).to_rfc3339();
 
-    let chats = match call_blocking(state.db.clone(), move |db| db.list_idle_chats(&cutoff, 100))
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("sleep-time consolidation: failed to list idle chats: {e}");
-            return;
-        }
-    };
+    let chats =
+        match call_blocking(state.db.clone(), move |db| db.list_idle_chats(&cutoff, 100)).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("sleep-time consolidation: failed to list idle chats: {e}");
+                return;
+            }
+        };
 
     for chat_id in chats {
         // Respect the per-chat min interval.
@@ -729,7 +1264,12 @@ async fn run_memory_consolidation(state: &Arc<AppState>, last_run: &mut HashMap<
         let mut active: Vec<_> = memories
             .into_iter()
             .filter(|m| !m.is_archived)
-            .filter(|m| m.expires_at.as_deref().map(|e| e > now.as_str()).unwrap_or(true))
+            .filter(|m| {
+                m.expires_at
+                    .as_deref()
+                    .map(|e| e > now.as_str())
+                    .unwrap_or(true)
+            })
             .collect();
         active.sort_by(|a, b| {
             b.confidence
@@ -785,22 +1325,27 @@ pub fn spawn_interjection(state: Arc<AppState>) {
     if !state.config.interjection.enabled {
         return;
     }
-    tokio::spawn(async move {
-        info!(
-            "Interjection started (min_interval_secs={}, lookback_mins={})",
-            state.config.interjection.min_interval_secs, state.config.interjection.lookback_mins
-        );
-        let mut last_interjection: HashMap<i64, Instant> = HashMap::new();
-        let mut ticker = tokio::time::interval(Duration::from_secs(120));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            run_interjection(&state, &mut last_interjection).await;
+    crate::supervision::spawn_supervised("interjection", move || {
+        let state = state.clone();
+        async move {
+            info!(
+                "Interjection started (min_interval_secs={}, lookback_mins={})",
+                state.config.interjection.min_interval_secs,
+                state.config.interjection.lookback_mins
+            );
+            let mut last_interjection: HashMap<i64, Instant> = HashMap::new();
+            let mut ticker = tokio::time::interval(Duration::from_secs(120));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                run_interjection(&state, &mut last_interjection).await;
+            }
         }
     });
 }
 
-const INTERJECTION_PROMPT: &str = "[Group interjection check] You were NOT addressed in this group, \
+const INTERJECTION_PROMPT: &str =
+    "[Group interjection check] You were NOT addressed in this group, \
 but the recent conversation is visible to you.\n\
 - Only if you have something genuinely valuable, welcome, and on-topic to add (a useful fact, a \
 correction of a clear factual error, a helpful pointer), write ONE short message that fits in \
@@ -878,10 +1423,9 @@ async fn run_interjection(state: &Arc<AppState>, last_interjection: &mut HashMap
         // Mark regardless so we don't re-evaluate every tick.
         last_interjection.insert(chat_id, Instant::now());
 
-        let trimmed = response.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("skip") {
+        let Some(reply) = proactive_deliverable(&response) else {
             continue;
-        }
+        };
 
         let bot_username = state.config.bot_username_for_channel(&routing.channel_name);
         if let Err(e) = deliver_and_store_bot_message(
@@ -889,7 +1433,7 @@ async fn run_interjection(state: &Arc<AppState>, last_interjection: &mut HashMap
             state.db.clone(),
             &bot_username,
             chat_id,
-            trimmed,
+            reply,
         )
         .await
         {
@@ -941,7 +1485,11 @@ fn format_standup(
             .map(|c| (now - c.with_timezone(&Utc)).num_seconds().max(0));
         let stale_progress = progress_age.map(|a| a >= interval).unwrap_or(true);
         let stalled = age_secs.map(|a| a >= 2 * interval).unwrap_or(false) && stale_progress;
-        let flag = if stalled { " ⚠️ no recent progress" } else { "" };
+        let flag = if stalled {
+            " ⚠️ no recent progress"
+        } else {
+            ""
+        };
         // Rough ETA from the chat's historical average run duration, shown only
         // while the task is still under that average (and not flagged stalled).
         let eta = match (avg_duration_secs, age_secs) {
@@ -1182,11 +1730,8 @@ async fn run_reflector(state: &Arc<AppState>) {
     if archive_days > 0 {
         let skills_root = std::path::PathBuf::from(state.config.skills_data_dir());
         let _ = call_blocking(state.db.clone(), move |db| {
-            match crate::skill_review::archive_inactive_agent_skills(
-                &skills_root,
-                db,
-                archive_days,
-            ) {
+            match crate::skill_review::archive_inactive_agent_skills(&skills_root, db, archive_days)
+            {
                 Ok(n) if n > 0 => {
                     info!("Reflector: archived {n} inactive agent-created skill(s)");
                 }
@@ -1280,11 +1825,13 @@ async fn reflect_for_chat(state: &Arc<AppState>, chat_id: i64) {
     // Strip thinking tags from message content so they don't confuse the LLM's JSON output
     let conversation = messages
         .iter()
-        .map(|m| format!(
-            "[{}]: {}",
-            m.sender_name,
-            strip_reflector_thinking_tags(&m.content)
-        ))
+        .map(|m| {
+            format!(
+                "[{}]: {}",
+                m.sender_name,
+                strip_reflector_thinking_tags(&m.content)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -1518,9 +2065,7 @@ async fn reflect_for_chat(state: &Arc<AppState>, chat_id: i64) {
             kg_inserted += 1;
         }
         if kg_inserted > 0 {
-            info!(
-                "Reflector: chat {chat_id} -> {kg_inserted} knowledge graph triples added"
-            );
+            info!("Reflector: chat {chat_id} -> {kg_inserted} knowledge graph triples added");
         }
     }
 
@@ -1622,7 +2167,10 @@ fn persist_curated_user_model(
     {
         return;
     }
-    match state.memory.write_chat_user_model(channel, chat_id, &capped) {
+    match state
+        .memory
+        .write_chat_user_model(channel, chat_id, &capped)
+    {
         Ok(()) => info!(
             "Reflector: USER.md updated for chat {chat_id} ({} chars)",
             capped.chars().count()
@@ -1635,11 +2183,109 @@ fn persist_curated_user_model(
 mod tests {
     use super::*;
 
+    /// Unique per-test temp dir; callers clean up with remove_dir_all.
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "microclaw-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     #[test]
-    fn test_format_duration_secs() {
-        assert_eq!(format_duration_secs(5), "5s");
-        assert_eq!(format_duration_secs(125), "2m");
-        assert_eq!(format_duration_secs(3 * 3600 + 25 * 60), "3h25m");
+    fn test_heartbeat_checklists_scans_both_layouts() {
+        let root = unique_temp_dir("heartbeat-test");
+        let canonical = root.join("groups"); // channel-aware layout
+        let flat = root.join("runtime/groups"); // SOUL-override layout
+                                                // chat 42 in canonical layout under a channel dir
+        std::fs::create_dir_all(canonical.join("telegram/42")).unwrap();
+        std::fs::write(
+            canonical.join("telegram/42/HEARTBEAT.md"),
+            "- check the deploy\n",
+        )
+        .unwrap();
+        // chat 8 in the flat legacy layout
+        std::fs::create_dir_all(flat.join("8")).unwrap();
+        std::fs::write(flat.join("8/HEARTBEAT.md"), "- water the plants\n").unwrap();
+        // chat 7: empty checklist -> skipped
+        std::fs::create_dir_all(canonical.join("web/7")).unwrap();
+        std::fs::write(canonical.join("web/7/HEARTBEAT.md"), "   \n").unwrap();
+        // chat 9: no HEARTBEAT.md -> skipped
+        std::fs::create_dir_all(canonical.join("telegram/9")).unwrap();
+        // chat 42 duplicated in flat layout -> first root wins
+        std::fs::create_dir_all(flat.join("42")).unwrap();
+        std::fs::write(flat.join("42/HEARTBEAT.md"), "- stale duplicate\n").unwrap();
+
+        let got = heartbeat_checklists(&[canonical.clone(), flat.clone()], 8000);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, 8);
+        assert_eq!(got[0].1, "- water the plants");
+        assert_eq!(got[1].0, 42);
+        assert_eq!(got[1].1, "- check the deploy");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_heartbeat_checklists_caps_content() {
+        let root = unique_temp_dir("heartbeat-cap-test");
+        let groups = root.join("groups");
+        std::fs::create_dir_all(groups.join("1")).unwrap();
+        std::fs::write(groups.join("1/HEARTBEAT.md"), "x".repeat(100)).unwrap();
+
+        let got = heartbeat_checklists(std::slice::from_ref(&groups), 10);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].1.starts_with("xxxxxxxxxx"));
+        assert!(got[0].1.contains("truncated"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_heartbeat_checklists_missing_dir_is_empty() {
+        let got = heartbeat_checklists(
+            &[std::path::PathBuf::from("/nonexistent/heartbeat-test")],
+            100,
+        );
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn test_proactive_deliverable_filters_skip_and_refusals() {
+        assert_eq!(proactive_deliverable("  hello there "), Some("hello there"));
+        assert_eq!(proactive_deliverable(""), None);
+        assert_eq!(proactive_deliverable("SKIP"), None);
+        assert_eq!(proactive_deliverable("skip"), None);
+        assert_eq!(proactive_deliverable("SKIP."), None);
+        assert_eq!(proactive_deliverable("SKIP!!\n"), None);
+        // A real sentence starting with "Skip" is still delivered.
+        assert_eq!(
+            proactive_deliverable("Skip the 3pm meeting — it moved to Friday"),
+            Some("Skip the 3pm meeting — it moved to Friday")
+        );
+        // Token-budget refusal stays silent.
+        let refusal = format!(
+            "{} for this chat (5000 of 4000 tokens in the last 24h).",
+            crate::agent_engine::TOKEN_BUDGET_REFUSAL_PREFIX
+        );
+        assert_eq!(proactive_deliverable(&refusal), None);
+    }
+
+    #[test]
+    fn test_dlq_replay_action_policy() {
+        // A failed one-shot under the attempt cap is requeued.
+        assert_eq!(dlq_replay_action("failed", 1, 3), DlqReplayAction::Requeue);
+        assert_eq!(dlq_replay_action("failed", 2, 3), DlqReplayAction::Requeue);
+        // At/over the cap we give up and leave it for manual inspection.
+        assert_eq!(dlq_replay_action("failed", 3, 3), DlqReplayAction::GiveUp);
+        assert_eq!(dlq_replay_action("failed", 9, 3), DlqReplayAction::GiveUp);
+        // Non-failed tasks (active cron, cancelled, completed) are skipped.
+        assert_eq!(dlq_replay_action("active", 1, 3), DlqReplayAction::Skip);
+        assert_eq!(dlq_replay_action("cancelled", 1, 3), DlqReplayAction::Skip);
+        assert_eq!(dlq_replay_action("completed", 1, 3), DlqReplayAction::Skip);
     }
 
     #[test]
@@ -1678,7 +2324,7 @@ mod tests {
         assert!(out.contains("competitor research"));
         assert!(out.contains("checked 3/5 vendors"));
         assert!(out.contains("10m")); // 630s rounds to 10m
-        // Fresh progress + short interval-relative age → not flagged stalled.
+                                      // Fresh progress + short interval-relative age → not flagged stalled.
         assert!(!out.contains("no recent progress"));
     }
 
@@ -1714,7 +2360,10 @@ mod tests {
             last_progress_at: None,
         };
         let out = format_standup(std::slice::from_ref(&run), now, 1800, Some(600));
-        assert!(out.contains("no recent progress"), "expected stalled flag: {out}");
+        assert!(
+            out.contains("no recent progress"),
+            "expected stalled flag: {out}"
+        );
     }
 
     #[test]
@@ -1762,7 +2411,10 @@ mod tests {
         }"#;
         let out = super::parse_reflector_response(raw, 1);
         assert_eq!(out.memories.len(), 1);
-        assert_eq!(out.user_model.as_deref(), Some("Senior Rust engineer at Acme."));
+        assert_eq!(
+            out.user_model.as_deref(),
+            Some("Senior Rust engineer at Acme.")
+        );
     }
 
     #[test]
@@ -1797,10 +2449,7 @@ mod tests {
             let out = super::parse_reflector_response(raw, 42);
             assert!(out.memories.is_empty(), "raw={raw:?} memories not empty");
             assert!(out.triples.is_empty(), "raw={raw:?} triples not empty");
-            assert!(
-                out.user_model.is_none(),
-                "raw={raw:?} user_model not None"
-            );
+            assert!(out.user_model.is_none(), "raw={raw:?} user_model not None");
         }
     }
 

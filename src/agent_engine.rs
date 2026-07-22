@@ -185,6 +185,26 @@ pub async fn process_with_agent_with_events_guarded(
     });
     let (run_id, cancelled, notify) =
         run_control::register_run(context.caller_channel, context.chat_id, source_message_id).await;
+    // Interrupted-turn recovery bookkeeping: while an interactive (user-facing)
+    // turn is in flight, a row exists in `active_turns`. If the process dies
+    // mid-turn the row survives and startup recovery notifies the chat.
+    // Scheduler-driven runs (override_prompt) have their own recovery path
+    // (recover_running_tasks + DLQ), so they are not tracked here.
+    let track_turn = override_prompt.is_none();
+    if track_turn {
+        let chat_id = context.chat_id;
+        let channel = context.caller_channel.to_string();
+        if let Err(e) = call_blocking(state.db.clone(), move |db| {
+            db.mark_turn_active(chat_id, &channel)
+        })
+        .await
+        {
+            warn!(
+                "failed to mark turn active for chat {}: {e}",
+                context.chat_id
+            );
+        }
+    }
     let engine = DefaultAgentEngine;
     let result = tokio::select! {
         _ = async {
@@ -210,6 +230,17 @@ pub async fn process_with_agent_with_events_guarded(
         out = engine.process_with_events(state, context, override_prompt, image_data, event_tx) => out,
     };
     run_control::unregister_run(context.caller_channel, context.chat_id, run_id).await;
+    if track_turn {
+        let chat_id = context.chat_id;
+        if let Err(e) =
+            call_blocking(state.db.clone(), move |db| db.clear_turn_active(chat_id)).await
+        {
+            warn!(
+                "failed to clear active turn for chat {}: {e}",
+                context.chat_id
+            );
+        }
+    }
 
     // Outbound guardrail on the final reply (covers every channel's main reply,
     // which is delivered by the adapter rather than via the shared funnel).
@@ -565,6 +596,11 @@ struct AgentMetrics {
     input_text: String,
 }
 
+/// Prefix of the canned reply returned when the token budget refuses a turn.
+/// Proactive loops (heartbeat / idle check-in / interjection / scheduler)
+/// match on this to stay silent instead of delivering the refusal to chat.
+pub const TOKEN_BUDGET_REFUSAL_PREFIX: &str = "Daily token budget reached";
+
 pub(crate) async fn process_with_agent_impl(
     state: &AppState,
     context: AgentRequestContext<'_>,
@@ -677,6 +713,33 @@ async fn process_with_agent_logic(
             "Agent request completed via fast path"
         );
         return Ok(reply);
+    }
+
+    // Per-chat token budget: refuse to start a turn once the chat's rolling
+    // 24h usage exceeds the configured cap. Checked once per turn — a turn
+    // already in flight may overshoot, which keeps the check cheap. Control
+    // chats can be exempted so operators can always reach the bot; exempt
+    // chats skip the usage aggregate entirely (they're typically the busiest).
+    let budget = state.config.token_budget.daily_per_chat;
+    let is_control_chat = state.config.is_control_chat(chat_id);
+    if budget > 0 && !(state.config.token_budget.exempt_control_chats && is_control_chat) {
+        let since = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let used = call_blocking(state.db.clone(), move |db| {
+            db.get_llm_usage_summary_since(Some(chat_id), Some(&since))
+        })
+        .await?
+        .total_tokens;
+        if state.config.token_budget.blocks(is_control_chat, used) {
+            warn!(
+                chat_id,
+                used, budget, "Token budget exhausted; refusing turn"
+            );
+            return Ok(format!(
+                "{TOKEN_BUDGET_REFUSAL_PREFIX} for this chat ({used} of {budget} tokens in the \
+                 last 24h). I'll be available again once usage rolls out of the window. \
+                 An operator can raise `token_budget.daily_per_chat` in the config."
+            ));
+        }
     }
 
     // Load messages first so we can use the latest user message as the relevance query
@@ -1277,6 +1340,27 @@ async fn process_with_agent_logic(
             "Agent iteration completed"
         );
 
+        // Checkpoint-lite: keep a rolling "how far did we get" snapshot on the
+        // interactive-turn row so a crash mid-run can tell the user where the
+        // work stopped. No-op for scheduler runs (no active_turns row).
+        if stop_reason == "tool_use" {
+            let tool_names: Vec<&str> = response
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ResponseContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !tool_names.is_empty() {
+                let progress = format!("step {}: {}", iteration + 1, tool_names.join(", "));
+                let _ = call_blocking(state.db.clone(), move |db| {
+                    db.update_turn_progress(chat_id, &progress)
+                })
+                .await;
+            }
+        }
+
         if iteration == 0 {
             let raw_first_reply = response
                 .content
@@ -1317,9 +1401,11 @@ async fn process_with_agent_logic(
             }
 
             // Always compute visible text without thinking tags for retry/fallback decisions.
-            let visible_text = strip_thinking(&text);
+            let visible_text = sanitize_user_visible_text(&text);
             // Keep raw thinking text only when show_thinking is enabled.
-            let display_text = if effective_profile.show_thinking {
+            let is_weixin_channel =
+                context.caller_channel == "weixin" || context.caller_channel.starts_with("weixin.");
+            let display_text = if effective_profile.show_thinking && !is_weixin_channel {
                 text.clone()
             } else {
                 visible_text.clone()
@@ -1891,7 +1977,7 @@ fn effective_data_root_dir(config: &crate::config::Config) -> std::path::PathBuf
     }
 }
 
-fn effective_runtime_data_dir(config: &crate::config::Config) -> std::path::PathBuf {
+pub(crate) fn effective_runtime_data_dir(config: &crate::config::Config) -> std::path::PathBuf {
     let data_dir = std::path::PathBuf::from(&config.data_dir);
     let is_runtime_dir = data_dir
         .file_name()
@@ -2431,6 +2517,13 @@ pub(crate) fn strip_thinking(text: &str) -> String {
     no_reasoning.trim().to_string()
 }
 
+/// Remove model/runtime protocol artifacts that must never be rendered as
+/// ordinary user-facing text. Real tool calls travel as structured content;
+/// a textual `[tool_use: ...]` line is therefore always an implementation leak.
+pub(crate) fn sanitize_user_visible_text(text: &str) -> String {
+    microclaw_core::text::sanitize_user_visible_text(text)
+}
+
 /// Extract text content from a Message for summarization/display.
 pub(crate) fn message_to_text(msg: &Message) -> String {
     match &msg.content {
@@ -2705,7 +2798,8 @@ async fn compact_messages(
 mod tests {
     use super::{
         build_db_memory_context, duplicate_call_key, format_mid_turn_injection,
-        history_to_claude_messages, process_with_agent, strip_thinking, AgentRequestContext,
+        history_to_claude_messages, process_with_agent, sanitize_user_visible_text, strip_thinking,
+        AgentRequestContext,
     };
     use crate::chat_turn_queue::PendingMessage;
     use crate::config::{Config, WorkingDirIsolation};
@@ -2998,11 +3092,21 @@ mod tests {
             .unwrap();
 
         let memory_backend = Arc::new(crate::memory_backend::MemoryBackend::local_only(db.clone()));
-        let context =
-            build_db_memory_context(
-                &memory_backend, &db, None, 100, "short", 20, 20, 30, 30.0, true, 2, 10,
-            )
-            .await;
+        let context = build_db_memory_context(
+            &memory_backend,
+            &db,
+            None,
+            100,
+            "short",
+            20,
+            20,
+            30,
+            30.0,
+            true,
+            2,
+            10,
+        )
+        .await;
         assert!(context.contains("<structured_memories>"));
         // With a tiny budget (20 tokens), not all memories fit — some are available via deep search
         assert!(
@@ -3175,6 +3279,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_interactive_turn_leaves_no_active_turn_residue() {
+        let base_dir =
+            std::env::temp_dir().join(format!("mc_agent_turn_track_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let state = test_state_with_base_dir(&base_dir);
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("web", "turn-track-chat", Some("turns"), "web")
+            .unwrap();
+        store_user_message(&state.db, chat_id, "hello there");
+
+        process_with_agent(
+            &state,
+            AgentRequestContext {
+                caller_channel: "web",
+                chat_id,
+                chat_type: "web",
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // A cleanly finished interactive turn must not leave an `active_turns`
+        // row behind — otherwise the next restart would send a spurious
+        // "I was interrupted" notice to this chat.
+        assert!(
+            state.db.take_interrupted_turns().unwrap().is_empty(),
+            "clean turn left an active_turns row behind"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
     async fn test_explicit_memory_topic_conflict_supersedes_old_value() {
         let base_dir =
             std::env::temp_dir().join(format!("mc_agent_topic_conflict_{}", uuid::Uuid::new_v4()));
@@ -3292,6 +3433,23 @@ mod tests {
     fn test_strip_thinking_removes_thinking_and_reasoning_tags() {
         let text = "<thinking>plan</thinking>\n<reasoning>private</reasoning>\nVisible";
         assert_eq!(strip_thinking(text), "Visible");
+    }
+
+    #[test]
+    fn test_sanitize_user_visible_text_removes_protocol_artifacts() {
+        let text = "<think>private</think>\nAnswer one.\n\n[tool_use: read_memory({\"chat_id\":1})]\nAnswer two.";
+        assert_eq!(
+            sanitize_user_visible_text(text),
+            "Answer one.\n\nAnswer two."
+        );
+    }
+
+    #[test]
+    fn test_sanitize_user_visible_text_keeps_normal_bracketed_text() {
+        assert_eq!(
+            sanitize_user_visible_text("[note] visible\nUse [tool_use] as a label."),
+            "[note] visible\nUse [tool_use] as a label."
+        );
     }
 
     #[test]

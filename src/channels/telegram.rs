@@ -465,6 +465,7 @@ fn microclaw_command_menu() -> Vec<BotCommand> {
         ("provider", "Show or set the provider for this chat"),
         ("providers", "List configured providers"),
         ("skills", "List available skills"),
+        ("learn", "Distill this session into a reusable skill"),
         ("user", "View or clear your USER.md profile"),
         ("usage", "Token usage report for this chat"),
         ("rewind", "List or restore conversation checkpoints"),
@@ -1176,7 +1177,56 @@ async fn handle_message(
         } else {
             None
         };
-    let mut tap = crate::channels::event_tap::EventTap::spawn(event_rx, injection_ack);
+    // Phase-3 progress heartbeat (opt-in via channels.telegram.progress_updates):
+    // first emission sends a "working…" message, later emissions edit it in
+    // place, and the terminal emission finalizes it when the turn ends.
+    let progress_settings =
+        crate::channels::event_tap::progress_updates_settings(&state.config, "telegram");
+    let is_private_chat = matches!(msg.chat.kind, teloxide::types::ChatKind::Private(_));
+    let progress: Option<(
+        crate::channels::event_tap::ProgressConfig,
+        crate::channels::event_tap::ProgressEmit,
+    )> = if progress_settings.enabled && (is_private_chat || progress_settings.groups) {
+        let bot_for_progress = bot.clone();
+        let chat_for_progress = msg.chat.id;
+        let thread_for_progress = msg.thread_id;
+        let progress_msg: std::sync::Arc<tokio::sync::Mutex<Option<MessageId>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let emit: crate::channels::event_tap::ProgressEmit = Box::new(move |text, _terminal| {
+            let bot = bot_for_progress.clone();
+            let chat = chat_for_progress;
+            let tid = thread_for_progress;
+            let progress_msg = progress_msg.clone();
+            Box::pin(async move {
+                let mut slot = progress_msg.lock().await;
+                match *slot {
+                    Some(message_id) => {
+                        if let Err(e) = bot.edit_message_text(chat, message_id, text).await {
+                            warn!("Telegram: progress edit failed: {e}");
+                        }
+                    }
+                    None => {
+                        let mut req = bot.send_message(chat, text);
+                        if let Some(tid) = tid {
+                            req = req.message_thread_id(tid);
+                        }
+                        match req.await {
+                            Ok(sent) => *slot = Some(sent.id),
+                            Err(e) => warn!("Telegram: progress send failed: {e}"),
+                        }
+                    }
+                }
+            })
+        });
+        Some((progress_settings.config, emit))
+    } else {
+        None
+    };
+    let mut tap = crate::channels::event_tap::EventTap::spawn_with_progress(
+        event_rx,
+        injection_ack,
+        progress,
+    );
     match process_with_agent_with_events_guarded(
         &state,
         AgentRequestContext {
@@ -1258,19 +1308,37 @@ async fn handle_message(
                         );
                     }
                 } else if !response.is_empty() {
-                    send_response(&bot, msg.chat.id, &response, msg.thread_id, Some(msg.id)).await;
+                    let delivered =
+                        send_response(&bot, msg.chat.id, &response, msg.thread_id, Some(msg.id))
+                            .await;
 
-                    // Store bot response
-                    let bot_msg = StoredMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        chat_id,
-                        sender_name: tg_bot_username.clone(),
-                        content: response,
-                        is_from_bot: true,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                    };
-                    let _ =
-                        call_blocking(state.db.clone(), move |db| db.store_message(&bot_msg)).await;
+                    if delivered {
+                        // Store bot response
+                        let bot_msg = StoredMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            chat_id,
+                            sender_name: tg_bot_username.clone(),
+                            content: response,
+                            is_from_bot: true,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let _ = call_blocking(state.db.clone(), move |db| {
+                            db.store_message(&bot_msg)
+                        })
+                        .await;
+                    } else {
+                        // Delivery outbox: don't drop a finished answer on a
+                        // channel hiccup — queue it for background redelivery
+                        // (which also stores it in history on success).
+                        warn!(
+                            "Telegram: final reply delivery failed for chat {chat_id}; queued to outbox"
+                        );
+                        let channel_name = tg_channel_name.clone();
+                        let _ = call_blocking(state.db.clone(), move |db| {
+                            db.enqueue_outbox_message(chat_id, &channel_name, &response)
+                        })
+                        .await;
+                    }
                 } else {
                     let fallback = "I couldn't produce a visible reply after an automatic retry. Please try again.".to_string();
                     send_response(&bot, msg.chat.id, &fallback, msg.thread_id, Some(msg.id)).await;
@@ -1738,13 +1806,15 @@ async fn send_streaming_response(
     Ok(())
 }
 
+/// Returns `true` if the chunk reached Telegram through any of the attempts
+/// (markdown, plain preference, or plain fallback).
 async fn send_telegram_markdown_or_plain(
     bot: &Bot,
     chat_id: ChatId,
     text: &str,
     message_thread_id: Option<ThreadId>,
     reply_to_message_id: Option<MessageId>,
-) {
+) -> bool {
     if should_prefer_plain_text(text) {
         let mut plain_req = bot.send_message(chat_id, text);
         if let Some(tid) = message_thread_id {
@@ -1753,10 +1823,13 @@ async fn send_telegram_markdown_or_plain(
         if let Some(reply_id) = reply_to_message_id {
             plain_req = plain_req.reply_parameters(ReplyParameters::new(reply_id));
         }
-        if let Err(err) = plain_req.await {
-            warn!("Telegram plain text send failed: {err}");
-        }
-        return;
+        return match plain_req.await {
+            Ok(_) => true,
+            Err(err) => {
+                warn!("Telegram plain text send failed: {err}");
+                false
+            }
+        };
     }
 
     let markdown_text = render_markdown_v2_safe(text);
@@ -1782,22 +1855,30 @@ async fn send_telegram_markdown_or_plain(
         }
         if let Err(err) = plain_req.await {
             warn!("Telegram plain text fallback send failed: {err}");
+            return false;
         }
     }
+    true
 }
 
+/// Returns `true` if every chunk was delivered.
 pub async fn send_response(
     bot: &Bot,
     chat_id: ChatId,
     text: &str,
     message_thread_id: Option<ThreadId>,
     reply_to_message_id: Option<MessageId>,
-) {
+) -> bool {
     let chunks = split_response_text(text);
+    let mut all_ok = true;
     for (idx, chunk) in chunks.iter().enumerate() {
         let reply_id = if idx == 0 { reply_to_message_id } else { None };
-        send_telegram_markdown_or_plain(bot, chat_id, chunk, message_thread_id, reply_id).await;
+        if !send_telegram_markdown_or_plain(bot, chat_id, chunk, message_thread_id, reply_id).await
+        {
+            all_ok = false;
+        }
     }
+    all_ok
 }
 
 #[cfg(test)]

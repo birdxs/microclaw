@@ -298,7 +298,7 @@ fn default_subagent_run_timeout_secs() -> u64 {
     900
 }
 fn default_subagent_announce() -> bool {
-    true
+    false
 }
 fn default_subagent_progress_min_interval_secs() -> u64 {
     45
@@ -336,6 +336,15 @@ fn default_reflector_enabled() -> bool {
 }
 fn default_reflector_interval_mins() -> u64 {
     15
+}
+fn default_dlq_replay_enabled() -> bool {
+    true
+}
+fn default_dlq_replay_interval_secs() -> u64 {
+    300
+}
+fn default_dlq_max_replay_attempts() -> u32 {
+    3
 }
 fn default_soul_path() -> Option<String> {
     None
@@ -975,7 +984,7 @@ pub struct SubagentConfig {
     pub announce_to_chat: bool,
     #[serde(default)]
     pub fan_in_summary: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub progress_reports: bool,
     #[serde(default = "default_subagent_progress_min_interval_secs")]
     pub progress_min_interval_secs: u64,
@@ -1005,7 +1014,7 @@ impl Default for SubagentConfig {
             run_timeout_secs: default_subagent_run_timeout_secs(),
             announce_to_chat: default_subagent_announce(),
             fan_in_summary: false,
-            progress_reports: true,
+            progress_reports: false,
             progress_min_interval_secs: default_subagent_progress_min_interval_secs(),
             max_spawn_depth: default_subagent_max_spawn_depth(),
             max_children_per_run: default_subagent_max_children_per_run(),
@@ -1088,6 +1097,81 @@ impl Default for SleepTimeConfig {
             min_interval_hours: default_sleep_time_min_interval_hours(),
             similarity_threshold: default_sleep_time_similarity_threshold(),
             max_archived_per_pass: default_sleep_time_max_archived_per_pass(),
+        }
+    }
+}
+
+fn default_token_budget_exempt_control_chats() -> bool {
+    true
+}
+
+/// Per-chat token spend cap. Counters Hermes-style "week-3 bill" drift:
+/// once a chat's rolling-24h total (input+output, all request kinds) hits
+/// `daily_per_chat`, new turns are refused with a notice until usage rolls
+/// out of the window. 0 (default) = unlimited; control chats exempt by
+/// default so operators can always reach the bot.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenBudgetConfig {
+    /// Total tokens (input+output) allowed per chat per rolling 24h. 0 = off.
+    #[serde(default)]
+    pub daily_per_chat: i64,
+    #[serde(default = "default_token_budget_exempt_control_chats")]
+    pub exempt_control_chats: bool,
+}
+
+impl Default for TokenBudgetConfig {
+    fn default() -> Self {
+        Self {
+            daily_per_chat: 0,
+            exempt_control_chats: default_token_budget_exempt_control_chats(),
+        }
+    }
+}
+
+impl TokenBudgetConfig {
+    /// True when a chat that has already spent `used` tokens in the window
+    /// must be refused a new turn.
+    pub fn blocks(&self, is_control_chat: bool, used: i64) -> bool {
+        if self.daily_per_chat <= 0 {
+            return false;
+        }
+        if self.exempt_control_chats && is_control_chat {
+            return false;
+        }
+        used >= self.daily_per_chat
+    }
+}
+
+fn default_heartbeat_interval_mins() -> u64 {
+    30
+}
+fn default_heartbeat_max_chars() -> usize {
+    8000
+}
+
+/// OpenClaw-style proactive heartbeat. When enabled, every `interval_mins`
+/// the bot reads each chat's `runtime/groups/<chat_id>/HEARTBEAT.md` checklist
+/// and runs an agent turn over it; the agent messages the chat only when
+/// something on the list genuinely needs attention, otherwise stays silent.
+/// OFF by default — and chats without a HEARTBEAT.md file are never touched.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HeartbeatConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minutes between heartbeat sweeps. Default: 30.
+    #[serde(default = "default_heartbeat_interval_mins")]
+    pub interval_mins: u64,
+    /// Max characters of HEARTBEAT.md injected into the prompt. Default: 8000.
+    #[serde(default = "default_heartbeat_max_chars")]
+    pub max_chars: usize,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_mins: default_heartbeat_interval_mins(),
+            max_chars: default_heartbeat_max_chars(),
         }
     }
 }
@@ -1228,6 +1312,12 @@ pub struct Config {
     /// compaction). Empty by default, in which case the main model is used.
     #[serde(default)]
     pub aux_models: AuxModels,
+    /// Optional fallback model used when the primary model's provider keeps
+    /// failing (after retries) or its circuit breaker is open. None disables
+    /// fallback (and the breaker wrapper) entirely — behaviour is then
+    /// identical to the primary provider alone.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
     #[serde(default = "default_max_history_messages")]
     pub max_history_messages: usize,
     #[serde(default = "default_max_document_size_mb")]
@@ -1342,6 +1432,10 @@ pub struct Config {
     #[serde(default)]
     pub idle_checkin: IdleCheckinConfig,
     #[serde(default)]
+    pub heartbeat: HeartbeatConfig,
+    #[serde(default)]
+    pub token_budget: TokenBudgetConfig,
+    #[serde(default)]
     pub sleep_time: SleepTimeConfig,
     #[serde(default)]
     pub interjection: InterjectionConfig,
@@ -1449,6 +1543,10 @@ pub struct Config {
     /// scans delivered bot messages for credential-like strings.
     #[serde(default)]
     pub output_guardrail: OutputGuardrailConfig,
+    /// Pre-tool-call policy (mode off | warn | block, deny_tools, max_risk,
+    /// allow_tools). Off by default; violations are sealed into the audit log.
+    #[serde(default)]
+    pub tool_policy: crate::tool_guardrails::ToolPolicyConfig,
 
     // --- Embedding ---
     #[serde(default)]
@@ -1473,6 +1571,19 @@ pub struct Config {
     pub reflector_enabled: bool,
     #[serde(default = "default_reflector_interval_mins")]
     pub reflector_interval_mins: u64,
+    // --- Scheduled-task DLQ auto-replay ---
+    /// Automatically retry scheduled tasks that landed in the dead-letter
+    /// queue (e.g. a one-shot task that hit a transient failure), up to
+    /// `dlq_max_replay_attempts` times. Default: true.
+    #[serde(default = "default_dlq_replay_enabled")]
+    pub dlq_replay_enabled: bool,
+    /// How often the DLQ auto-replay sweep runs, in seconds. Default: 300.
+    #[serde(default = "default_dlq_replay_interval_secs")]
+    pub dlq_replay_interval_secs: u64,
+    /// Maximum automatic replay attempts per task before it is left in the
+    /// DLQ for manual inspection. Default: 3.
+    #[serde(default = "default_dlq_max_replay_attempts")]
+    pub dlq_max_replay_attempts: u32,
     /// Minimum tool_use blocks in a turn before the end-of-turn skill
     /// review fires. Autonomous skill creation is on by default; set to
     /// 0 to disable entirely. Default: 5.
@@ -1572,6 +1683,14 @@ pub struct Config {
 }
 
 impl Config {
+    /// Whether `chat_id` is a control chat. An empty `control_chat_ids` list
+    /// means NO chat has control privileges (default deny) — every privileged
+    /// surface (skill management, /learn, /log, ...) must route through this
+    /// so that rule stays in one place.
+    pub fn is_control_chat(&self, chat_id: i64) -> bool {
+        self.control_chat_ids.contains(&chat_id)
+    }
+
     fn ensure_mapping_mut(value: &mut serde_yaml::Value) -> &mut serde_yaml::Mapping {
         if !matches!(value, serde_yaml::Value::Mapping(_)) {
             *value = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
@@ -1956,6 +2075,7 @@ impl Config {
             max_tool_iterations: 100,
             compaction_timeout_secs: 180,
             aux_models: AuxModels::default(),
+            fallback_model: None,
             max_history_messages: 50,
             max_document_size_mb: 100,
             memory_token_budget: 1500,
@@ -2004,6 +2124,8 @@ impl Config {
             show_thinking: false,
             subagents: SubagentConfig::default(),
             idle_checkin: IdleCheckinConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
+            token_budget: TokenBudgetConfig::default(),
             sleep_time: SleepTimeConfig::default(),
             interjection: InterjectionConfig::default(),
             a2a: A2AConfig::default(),
@@ -2022,6 +2144,7 @@ impl Config {
             web_fetch_url_validation: WebFetchUrlValidationConfig::default(),
             web_search: SearchProviderConfig::default(),
             output_guardrail: OutputGuardrailConfig::default(),
+            tool_policy: crate::tool_guardrails::ToolPolicyConfig::default(),
             model_prices: vec![],
             embedding_provider: None,
             embedding_api_key: None,
@@ -2030,6 +2153,9 @@ impl Config {
             embedding_dim: None,
             reflector_enabled: true,
             reflector_interval_mins: 15,
+            dlq_replay_enabled: true,
+            dlq_replay_interval_secs: 300,
+            dlq_max_replay_attempts: 3,
             skill_review_min_tool_calls: 5,
             soul_path: None,
             souls_dir: None,
@@ -3014,6 +3140,132 @@ fn merge_provider_profile(
     }
 }
 
+/// Result of `microclaw config check` on one file. Errors mean the config
+/// won't load; warnings mean it loads but something is probably a typo.
+#[derive(Debug, Default)]
+pub struct ConfigCheckReport {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+    /// Present when the config parsed: (enabled channels, configured-but-
+    /// disabled channels, provider, model).
+    pub summary: Option<(Vec<&'static str>, Vec<&'static str>, String, String)>,
+}
+
+impl ConfigCheckReport {
+    pub fn ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+/// Validate config file content without starting anything: YAML syntax with
+/// line/column, unknown-key warnings with did-you-mean, full schema
+/// deserialization (typed enums reject typos), and post-deserialize
+/// normalization/validation. Pure function over the text for testability.
+pub fn check_config_content(path_str: &str, content: &str) -> ConfigCheckReport {
+    let mut report = ConfigCheckReport::default();
+
+    // 1) YAML syntax. serde_yaml errors carry line/column.
+    let raw: serde_yaml::Value = match serde_yaml::from_str(content) {
+        Ok(v) => v,
+        Err(e) => {
+            report.errors.push(format!("YAML syntax error: {e}"));
+            return report;
+        }
+    };
+
+    // 2) Unknown top-level keys (serde ignores them silently on load).
+    if let Some(map) = raw.as_mapping() {
+        report.warnings.extend(unknown_top_level_key_warnings(map));
+    } else {
+        report
+            .errors
+            .push("Config root must be a YAML mapping (key: value pairs).".to_string());
+        return report;
+    }
+
+    // 3) Full schema deserialization (typed enums catch value typos with a
+    //    did-you-mean suggestion) + post-deserialize validation.
+    match serde_yaml::from_str::<Config>(content) {
+        Err(e) => {
+            report.errors.push(friendly_yaml_error(path_str, &e));
+        }
+        Ok(mut config) => match config.post_deserialize() {
+            // Covers value validation including the "no channel enabled" case.
+            Err(e) => report.errors.push(e.to_string()),
+            Ok(()) => {
+                let (enabled, disabled) = config.channel_status();
+                report.summary = Some((
+                    enabled,
+                    disabled,
+                    config.llm_provider.clone(),
+                    config.model.clone(),
+                ));
+            }
+        },
+    }
+    report
+}
+
+/// CLI entry point for `microclaw config check`. Prints a human-readable
+/// report and returns the process exit code (0 = loadable, 1 = errors,
+/// 2 = file missing/unreadable).
+pub fn run_config_check() -> i32 {
+    let path = match Config::resolve_config_path() {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            eprintln!("✗ No microclaw.config.yaml found. Run `microclaw setup` to create one.");
+            return 2;
+        }
+        Err(e) => {
+            eprintln!("✗ {e}");
+            return 2;
+        }
+    };
+    let path_str = path.to_string_lossy().to_string();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("✗ Failed to read {path_str}: {e}");
+            return 2;
+        }
+    };
+
+    println!("Checking {path_str}");
+    let report = check_config_content(&path_str, &content);
+    for w in &report.warnings {
+        println!("  ⚠ {w}");
+    }
+    for e in &report.errors {
+        println!("  ✗ {e}");
+    }
+    if let Some((enabled, disabled, provider, model)) = &report.summary {
+        let enabled_str = if enabled.is_empty() {
+            "none".to_string()
+        } else {
+            enabled.join(", ")
+        };
+        println!("  provider: {provider} · model: {model}");
+        println!("  channels enabled: {enabled_str}");
+        if !disabled.is_empty() {
+            println!("  configured but disabled: {}", disabled.join(", "));
+        }
+    }
+    if report.ok() {
+        println!(
+            "✓ Config OK{}",
+            if report.warnings.is_empty() {
+                ""
+            } else {
+                " (with warnings)"
+            }
+        );
+        0
+    } else {
+        println!("✗ Config has errors — fix them and re-run, or run `microclaw setup`.");
+        1
+    }
+}
+
 /// Turn a raw `serde_yaml` parse error into an actionable message. When the
 /// error is an unknown field or variant (the common YAML typo), suggest the
 /// closest valid name, and always point the user at `setup` / the example
@@ -3155,6 +3407,102 @@ mod tests {
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::env_lock()
+    }
+
+    #[test]
+    fn config_check_reports_syntax_errors_with_location() {
+        let report = check_config_content("t.yaml", "telegram_bot_token: [unclosed");
+        assert!(!report.ok());
+        assert!(report.errors[0].contains("YAML syntax error"));
+        assert!(report.summary.is_none());
+    }
+
+    #[test]
+    fn config_check_warns_on_unknown_key_with_suggestion() {
+        let report = check_config_content(
+            "t.yaml",
+            "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nmax_tool_iterationz: 5\n",
+        );
+        assert!(report.ok(), "unknown keys warn but do not fail the check");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("max_tool_iterationz") && w.contains("max_tool_iterations")),
+            "expected did-you-mean warning, got: {:?}",
+            report.warnings
+        );
+        let (enabled, _, provider, _) = report.summary.as_ref().unwrap();
+        assert!(enabled.contains(&"telegram"));
+        assert_eq!(provider, "anthropic");
+    }
+
+    #[test]
+    fn config_check_rejects_bad_enum_value_with_suggestion() {
+        let report = check_config_content(
+            "t.yaml",
+            "api_key: key\ntool_policy:\n  mode: blok\n",
+        );
+        assert!(!report.ok());
+        assert!(
+            report.errors[0].contains("blok") && report.errors[0].contains("block"),
+            "expected did-you-mean on enum typo, got: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn config_check_flags_no_enabled_channel() {
+        // The web channel is on by default, so a bare config is loadable.
+        let report = check_config_content("t.yaml", "api_key: key\n");
+        assert!(report.ok(), "errors: {:?}", report.errors);
+        let (enabled, ..) = report.summary.as_ref().unwrap();
+        assert!(enabled.contains(&"web"));
+
+        // Explicitly disabling every channel fails post-deserialize
+        // validation — the check surfaces that as an error.
+        let report = check_config_content(
+            "t.yaml",
+            "api_key: key\nchannels:\n  web:\n    enabled: false\n",
+        );
+        assert!(
+            !report.ok(),
+            "disabling all channels should be an error, got warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn config_check_rejects_non_mapping_root() {
+        let report = check_config_content("t.yaml", "- just\n- a\n- list\n");
+        assert!(!report.ok());
+        assert!(report.errors[0].contains("mapping"));
+    }
+
+    #[test]
+    fn token_budget_disabled_never_blocks() {
+        let cfg = TokenBudgetConfig::default();
+        assert!(!cfg.blocks(false, i64::MAX));
+        assert!(!cfg.blocks(true, i64::MAX));
+    }
+
+    #[test]
+    fn token_budget_blocks_at_cap_but_exempts_control_chats() {
+        let cfg = TokenBudgetConfig {
+            daily_per_chat: 1000,
+            exempt_control_chats: true,
+        };
+        assert!(!cfg.blocks(false, 999));
+        assert!(cfg.blocks(false, 1000));
+        assert!(cfg.blocks(false, 5000));
+        // Control chat exempt by default
+        assert!(!cfg.blocks(true, 5000));
+        // ...unless exemption is turned off
+        let strict = TokenBudgetConfig {
+            daily_per_chat: 1000,
+            exempt_control_chats: false,
+        };
+        assert!(strict.blocks(true, 1000));
     }
 
     #[test]

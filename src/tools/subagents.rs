@@ -113,13 +113,42 @@ fn compute_child_token_budget(
     Ok(desired.clamp(2_000, configured_max))
 }
 
+/// Name of the synthetic tool a sub-agent calls to return its final structured
+/// result. Using a tool input schema is the provider-native way to constrain the
+/// shape of the output (validated function/tool arguments on both Anthropic and
+/// OpenAI), which is far more reliable than parsing free-text JSON.
+const SUBMIT_RESULT_TOOL: &str = "submit_result";
+
+/// The contract schema, expressed as a tool so the model emits it as validated
+/// tool input rather than free text.
+fn submit_result_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: SUBMIT_RESULT_TOOL.to_string(),
+        description:
+            "Submit your final structured result and end the run. Call this exactly once when the \
+             task is complete, instead of writing the result as plain text."
+                .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "One-line summary of what you did."},
+                "findings": {"type": "array", "items": {"type": "string"}, "description": "Key findings or results."},
+                "artifacts": {"type": "array", "items": {"type": "object"}, "description": "Files/artifacts produced, each {type, path, description}."},
+                "next_actions": {"type": "array", "items": {"type": "string"}, "description": "Suggested follow-up actions."},
+                "final_answer": {"type": "string", "description": "The full answer delivered to the user."}
+            },
+            "required": ["summary", "final_answer"]
+        }),
+    }
+}
+
 /// Whether the sub-agent's terminal text actually carries the structured
 /// output contract — a JSON object with a non-empty `summary` or `final_answer`
 /// — as opposed to raw prose or leaked reasoning. Drives the one-shot repair
 /// re-ask in the sub-agent loop before falling back to best-effort
 /// normalization.
 pub(crate) fn subagent_output_is_structured(raw_text: &str) -> bool {
-    let cleaned = crate::agent_engine::strip_thinking(raw_text);
+    let cleaned = crate::agent_engine::sanitize_user_visible_text(raw_text);
     let text = cleaned.trim();
     let parsed = serde_json::from_str::<serde_json::Value>(text)
         .ok()
@@ -150,7 +179,7 @@ pub(crate) fn normalize_subagent_artifact_payload(raw_text: &str) -> (String, St
     // Strip any chain-of-thought the model emitted so it never leaks into the
     // chat announcement, and so a JSON object that follows a <think> block can
     // still be parsed (a leading reasoning block makes a whole-string parse fail).
-    let cleaned = crate::agent_engine::strip_thinking(raw_text);
+    let cleaned = crate::agent_engine::sanitize_user_visible_text(raw_text);
     let text = cleaned.trim();
     // Prefer a clean whole-string parse; otherwise recover an embedded {...}
     // object (model wrapped the JSON in prose) so we don't fall back to dumping
@@ -327,7 +356,101 @@ struct RunSubAgentTaskParams {
     task: String,
     context: String,
     specialist: String,
+    exit_criteria: Vec<crate::completion_contract::ExitCriterion>,
     local_cancel: Arc<AtomicBool>,
+}
+
+
+/// Bash-backed runner for `Command` exit criteria: routes through the
+/// sub-agent's own tool registry, so the sandbox router, dangerous-pattern
+/// checks, and tool_policy apply exactly as for agent-issued commands.
+struct SubagentBashRunner<'a> {
+    tools: &'a ToolRegistry,
+    auth: &'a ToolAuthContext,
+}
+
+#[async_trait::async_trait]
+impl crate::completion_contract::CommandRunner for SubagentBashRunner<'_> {
+    async fn run(&self, command: &str) -> (bool, String) {
+        let result = self
+            .tools
+            .execute_with_auth("bash", json!({ "command": command }), self.auth)
+            .await;
+        (!result.is_error, result.content)
+    }
+}
+
+/// Result of verifying a finished sub-agent result against its contract.
+struct ContractVerdict {
+    /// Result text with the evidence report prepended.
+    annotated: String,
+    /// The report alone (used to prompt the bounded in-run retry).
+    report: String,
+    passed: bool,
+}
+
+/// Verify a finished result against its completion contract (if any) and
+/// build the evidence report, so the parent loop and the user see
+/// VERIFIED/FAILED with per-criterion evidence instead of trusting the
+/// sub-agent's self-report. Returns `None` when no contract was declared.
+#[allow(clippy::too_many_arguments)]
+async fn apply_completion_contract(
+    criteria: &[crate::completion_contract::ExitCriterion],
+    final_text: &str,
+    config: &Config,
+    tools: &ToolRegistry,
+    auth: &ToolAuthContext,
+    db: Arc<Database>,
+    run_id: &str,
+) -> Option<ContractVerdict> {
+    if criteria.is_empty() {
+        return None;
+    }
+    let base = std::path::Path::new(&config.working_dir);
+    let working_dir = match config.working_dir_isolation {
+        crate::config::WorkingDirIsolation::Shared => base.join("shared"),
+        crate::config::WorkingDirIsolation::Chat => microclaw_tools::runtime::chat_working_dir(
+            base,
+            &auth.caller_channel,
+            auth.caller_chat_id,
+        ),
+    };
+    let runner = SubagentBashRunner { tools, auth };
+    let outcomes = crate::completion_contract::verify_criteria(
+        criteria,
+        final_text,
+        &working_dir,
+        Some(&runner),
+    )
+    .await;
+    let passed = outcomes.iter().filter(|o| o.passed).count();
+    log_subagent_event(
+        db,
+        run_id,
+        "contract",
+        Some(format!(
+            "{} {passed}/{}",
+            if passed == outcomes.len() { "verified" } else { "failed" },
+            outcomes.len()
+        )),
+    )
+    .await;
+    let report = crate::completion_contract::render_report(&outcomes);
+    Some(ContractVerdict {
+        annotated: format!("{report}\n{final_text}"),
+        passed: passed == outcomes.len(),
+        report,
+    })
+}
+
+/// Prompt sent back into the sub-agent conversation for the single bounded
+/// contract retry.
+fn contract_retry_prompt(report: &str) -> String {
+    format!(
+        "Completion contract verification FAILED:\n{report}\nThe failed criteria are unmet \
+         work — complete them now (use tools), then submit your result again via `submit_result`. \
+         This is your final attempt."
+    )
 }
 
 async fn run_sub_agent_task(
@@ -346,25 +469,84 @@ async fn run_sub_agent_task(
         task,
         context,
         specialist,
+        exit_criteria,
         local_cancel,
     } = params;
     if matches!(runtime, SubagentExecutionRuntime::Acp) {
         let Some(acp_target) = acp_target else {
             return Err("ACP runtime target was not resolved".into());
         };
-        return crate::acp_subagent::run_acp_subagent_task(
+        // Contracts on the ACP runtime: the external agent's conversation is
+        // not ours to continue, so the bounded retry is a full re-run with
+        // the failure evidence appended to the context.
+        let mut context = context;
+        if !exit_criteria.is_empty() {
+            context.push_str(&crate::completion_contract::render_for_prompt(&exit_criteria));
+        }
+        let first = crate::acp_subagent::run_acp_subagent_task(
             crate::acp_subagent::AcpSubagentTaskParams {
-                config,
-                db,
-                auth_context,
-                run_id,
-                task,
-                context,
-                local_cancel,
-                target: acp_target,
+                config: config.clone(),
+                db: db.clone(),
+                auth_context: auth_context.clone(),
+                run_id: run_id.clone(),
+                task: task.clone(),
+                context: context.clone(),
+                local_cancel: local_cancel.clone(),
+                target: acp_target.clone(),
             },
         )
-        .await;
+        .await?;
+        if exit_criteria.is_empty() {
+            return Ok(first);
+        }
+        // Verification (and its command runner) go through our own sub-agent
+        // tool registry — same sandbox/policy guards as the native runtime.
+        let tools = ToolRegistry::new_sub_agent(&config, db.clone(), Some(channel_registry), false);
+        let (final_text, artifact_json, mut in_tok, mut out_tok) = first;
+        let verdict = apply_completion_contract(
+            &exit_criteria,
+            &final_text,
+            &config,
+            &tools,
+            &auth_context,
+            db.clone(),
+            &run_id,
+        )
+        .await
+        .expect("criteria checked non-empty");
+        if verdict.passed {
+            return Ok((verdict.annotated, artifact_json, in_tok, out_tok));
+        }
+        log_subagent_event(db.clone(), &run_id, "contract_retry", None).await;
+        let retry_context = format!("{context}\n\n{}", contract_retry_prompt(&verdict.report));
+        let (retry_text, retry_artifact, retry_in, retry_out) =
+            crate::acp_subagent::run_acp_subagent_task(
+                crate::acp_subagent::AcpSubagentTaskParams {
+                    config: config.clone(),
+                    db: db.clone(),
+                    auth_context: auth_context.clone(),
+                    run_id: run_id.clone(),
+                    task,
+                    context: retry_context,
+                    local_cancel,
+                    target: acp_target,
+                },
+            )
+            .await?;
+        in_tok += retry_in;
+        out_tok += retry_out;
+        let verdict = apply_completion_contract(
+            &exit_criteria,
+            &retry_text,
+            &config,
+            &tools,
+            &auth_context,
+            db.clone(),
+            &run_id,
+        )
+        .await
+        .expect("criteria checked non-empty");
+        return Ok((verdict.annotated, retry_artifact, in_tok, out_tok));
     }
 
     let llm = crate::llm::create_provider(&config);
@@ -375,19 +557,26 @@ async fn run_sub_agent_task(
         Some(channel_registry),
         allow_session_tools,
     );
-    let tool_defs = tools.definitions().to_vec();
+    // The sub-agent's normal tools plus a synthetic `submit_result` tool used to
+    // return the final structured result as validated tool input (native
+    // constrained decoding) rather than hand-written JSON text.
+    let mut tool_defs = tools.definitions().to_vec();
+    tool_defs.push(submit_result_tool_definition());
 
     let profile = crate::tools::specialists::resolve_specialist(Some(specialist.as_str()));
     let system_prompt = format!(
-        "{persona}\n\nComplete the task thoroughly with tool use when needed.\nYou are a background worker: you have NO tools to message the chat, write memory, or schedule tasks (no `send_message`, `write_memory`, or `schedule` — do not look for them or stall when they are missing). `read_memory` and `structured_memory_search` are read-only lookups. Any durable facts you surface in `findings`/`final_answer` are persisted by the orchestrator automatically — just report them, don't try to save them yourself.\nFor long tasks, call `report_progress` at meaningful milestones with a one-line status so the user gets colleague-style updates while you work.\nIf a sub-problem falls outside your expertise, get a quick second opinion from the right specialist with `consult_specialist` (e.g. as a researcher, hand a draft to the writer; as a coder, ask the mathematician to check a formula) and weave their answer into your work — don't fake expertise you don't have. If a sub-problem is large enough to need its own run and you're allowed to spawn, delegate it with `sessions_spawn`; otherwise name the right specialist in next_actions.\nOutput contract (required): return a JSON object with keys:\n- summary: string\n- findings: string[]\n- artifacts: {{type,path,description}}[]\n- next_actions: string[]\n- final_answer: string\nReturn only JSON in the final turn.",
+        "{persona}\n\nComplete the task thoroughly with tool use when needed.\nYou are a background worker: you have NO tools to message the chat, write memory, or schedule tasks (no `send_message`, `write_memory`, or `schedule` — do not look for them or stall when they are missing). `read_memory` and `structured_memory_search` are read-only lookups. Any durable facts you surface in `findings`/`final_answer` are persisted by the orchestrator automatically — just report them, don't try to save them yourself.\nFor long tasks, call `report_progress` at meaningful milestones with a one-line status so the user gets colleague-style updates while you work.\nIf a sub-problem falls outside your expertise, get a quick second opinion from the right specialist with `consult_specialist` (e.g. as a researcher, hand a draft to the writer; as a coder, ask the mathematician to check a formula) and weave their answer into your work — don't fake expertise you don't have. If a sub-problem is large enough to need its own run and you're allowed to spawn, delegate it with `sessions_spawn`; otherwise name the right specialist in next_actions.\nOutput contract (required): when the task is complete, call the `submit_result` tool exactly once with your structured result (summary, findings, artifacts, next_actions, final_answer). Prefer `submit_result` over writing the result as text. If you do answer in text instead, it MUST be a single JSON object with those same keys and nothing else.",
         persona = profile.persona
     );
 
-    let user_content = if context.is_empty() {
+    let mut user_content = if context.is_empty() {
         task.to_string()
     } else {
         format!("Context: {context}\n\nTask: {task}")
     };
+    if !exit_criteria.is_empty() {
+        user_content.push_str(&crate::completion_contract::render_for_prompt(&exit_criteria));
+    }
 
     let mut messages = vec![Message {
         role: "user".into(),
@@ -399,6 +588,10 @@ async fn run_sub_agent_task(
     // contract, we re-ask exactly once before falling back to best-effort
     // normalization. Prevents an unbounded re-ask loop.
     let mut repair_attempted = false;
+    // Bounded contract retry: when the completion contract fails, give the
+    // sub-agent exactly ONE chance to finish the unmet criteria before the
+    // failed result is returned as-is.
+    let mut contract_retry_attempted = false;
 
     for _ in 0..MAX_SUB_AGENT_ITERATIONS {
         if is_cancelled(db.clone(), &run_id, &local_cancel).await? {
@@ -484,15 +677,147 @@ async fn run_sub_agent_task(
                 text
             };
             let (final_text, artifact_json) = normalize_subagent_artifact_payload(&source);
-            return Ok((
-                final_text,
-                artifact_json,
-                input_tokens_sum,
-                output_tokens_sum,
-            ));
+            match apply_completion_contract(
+                &exit_criteria,
+                &final_text,
+                &config,
+                &tools,
+                &auth_context,
+                db.clone(),
+                &run_id,
+            )
+            .await
+            {
+                Some(verdict) if !verdict.passed && !contract_retry_attempted => {
+                    contract_retry_attempted = true;
+                    log_subagent_event(db.clone(), &run_id, "contract_retry", None).await;
+                    messages.push(Message {
+                        role: "assistant".into(),
+                        content: MessageContent::Text(verdict.annotated),
+                    });
+                    messages.push(Message {
+                        role: "user".into(),
+                        content: MessageContent::Text(contract_retry_prompt(&verdict.report)),
+                    });
+                    continue;
+                }
+                Some(verdict) => {
+                    return Ok((
+                        verdict.annotated,
+                        artifact_json,
+                        input_tokens_sum,
+                        output_tokens_sum,
+                    ));
+                }
+                None => {
+                    return Ok((
+                        final_text,
+                        artifact_json,
+                        input_tokens_sum,
+                        output_tokens_sum,
+                    ));
+                }
+            }
         }
 
         if stop_reason == "tool_use" {
+            // If the model called `submit_result`, its (schema-validated) input
+            // IS the final structured result — short-circuit and return it.
+            if let Some(submit_input) = response.content.iter().find_map(|b| match b {
+                ResponseContentBlock::ToolUse { name, input, .. }
+                    if name == SUBMIT_RESULT_TOOL =>
+                {
+                    Some(input.clone())
+                }
+                _ => None,
+            }) {
+                log_subagent_event(db.clone(), &run_id, "submit_result", None).await;
+                let (final_text, artifact_json) =
+                    normalize_subagent_artifact_payload(&submit_input.to_string());
+                match apply_completion_contract(
+                    &exit_criteria,
+                    &final_text,
+                    &config,
+                    &tools,
+                    &auth_context,
+                    db.clone(),
+                    &run_id,
+                )
+                .await
+                {
+                    Some(verdict) if !verdict.passed && !contract_retry_attempted => {
+                        contract_retry_attempted = true;
+                        log_subagent_event(db.clone(), &run_id, "contract_retry", None).await;
+                        // Keep the tool_use/tool_result pairing the provider
+                        // requires: echo the assistant turn (including the
+                        // submit_result call), then answer that call with the
+                        // failure report.
+                        let submit_id = response
+                            .content
+                            .iter()
+                            .find_map(|b| match b {
+                                ResponseContentBlock::ToolUse { id, name, .. }
+                                    if name == SUBMIT_RESULT_TOOL =>
+                                {
+                                    Some(id.clone())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        let assistant_content: Vec<ContentBlock> = response
+                            .content
+                            .iter()
+                            .filter_map(|block| match block {
+                                ResponseContentBlock::Text { text } => {
+                                    Some(ContentBlock::Text { text: text.clone() })
+                                }
+                                ResponseContentBlock::ToolUse {
+                                    id,
+                                    name,
+                                    input,
+                                    thought_signature,
+                                } => Some(ContentBlock::ToolUse {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                    thought_signature: thought_signature.clone(),
+                                }),
+                                ResponseContentBlock::Other => None,
+                            })
+                            .collect();
+                        messages.push(Message {
+                            role: "assistant".into(),
+                            content: MessageContent::Blocks(assistant_content),
+                        });
+                        messages.push(Message {
+                            role: "user".into(),
+                            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                                tool_use_id: submit_id,
+                                content: contract_retry_prompt(&verdict.report),
+                                is_error: Some(true),
+                            }]),
+                        });
+                        continue;
+                    }
+                    Some(verdict) => {
+                        return Ok((
+                            verdict.annotated,
+                            artifact_json,
+                            input_tokens_sum,
+                            output_tokens_sum,
+                        ));
+                    }
+                    None => {
+                        return Ok((
+                            final_text,
+                            artifact_json,
+                            input_tokens_sum,
+                            output_tokens_sum,
+                        ));
+                    }
+                }
+            }
+
             let assistant_content: Vec<ContentBlock> = response
                 .content
                 .iter()
@@ -584,12 +909,47 @@ async fn run_sub_agent_task(
             text
         };
         let (final_text, artifact_json) = normalize_subagent_artifact_payload(&source);
-        return Ok((
-            final_text,
-            artifact_json,
-            input_tokens_sum,
-            output_tokens_sum,
-        ));
+        match apply_completion_contract(
+            &exit_criteria,
+            &final_text,
+            &config,
+            &tools,
+            &auth_context,
+            db.clone(),
+            &run_id,
+        )
+        .await
+        {
+            Some(verdict) if !verdict.passed && !contract_retry_attempted => {
+                contract_retry_attempted = true;
+                log_subagent_event(db.clone(), &run_id, "contract_retry", None).await;
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: MessageContent::Text(verdict.annotated),
+                });
+                messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(contract_retry_prompt(&verdict.report)),
+                });
+                continue;
+            }
+            Some(verdict) => {
+                return Ok((
+                    verdict.annotated,
+                    artifact_json,
+                    input_tokens_sum,
+                    output_tokens_sum,
+                ));
+            }
+            None => {
+                return Ok((
+                    final_text,
+                    artifact_json,
+                    input_tokens_sum,
+                    output_tokens_sum,
+                ));
+            }
+        }
     }
 
     Err("Sub-agent reached maximum iterations without completing the task.".into())
@@ -709,7 +1069,8 @@ async fn build_announce_payload(
         text.push_str(&format!("\nerror: {err}"));
     }
     if let Some(result) = &run.result_text {
-        let clipped: String = result.chars().take(2400).collect();
+        let visible = crate::agent_engine::sanitize_user_visible_text(result);
+        let clipped: String = visible.chars().take(1200).collect();
         text.push_str("\nresult:\n");
         text.push_str(&clipped);
     }
@@ -844,6 +1205,12 @@ impl Tool for SessionsSpawnTool {
                     "token_budget": {
                         "type": "integer",
                         "description": "Optional token budget cap for this run."
+                    },
+                    "exit_criteria": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "description": "Optional completion contract: machine-checkable exit criteria the runtime VERIFIES when the run finishes (the result is marked VERIFIED/FAILED with evidence). Entries: {type:'file_exists', path} | {type:'file_contains', path, needle} | {type:'file_min_bytes', path, min_bytes} | {type:'result_contains', needle} | {type:'command', run, expect_contains?}. Paths are relative to the chat working dir; commands run through the sandboxed bash tool. Declare criteria whenever the task has an objectively checkable outcome.",
+                        "items": {"type": "object"}
                     }
                 }),
                 &["task"],
@@ -885,6 +1252,11 @@ impl Tool for SessionsSpawnTool {
         )
         .name
         .to_string();
+        let exit_criteria =
+            match crate::completion_contract::parse_exit_criteria(input.get("exit_criteria")) {
+                Ok(v) => v,
+                Err(e) => return ToolResult::error(e),
+            };
         // Optional human-friendly label ("competitor research") for "what am I working on".
         let label = input
             .get("label")
@@ -1058,6 +1430,7 @@ impl Tool for SessionsSpawnTool {
         let task_async = task.clone();
         let context_async = context.clone();
         let specialist_async = specialist.clone();
+        let exit_criteria_async = exit_criteria.clone();
         let parent_run_id_async = parent_run_id.clone();
         let auth_async = ToolAuthContext {
             caller_channel: auth.caller_channel.clone(),
@@ -1118,6 +1491,7 @@ impl Tool for SessionsSpawnTool {
                 task: task_async,
                 context: context_async,
                 specialist: specialist_async,
+                exit_criteria: exit_criteria_async,
                 local_cancel,
             });
 
@@ -1207,7 +1581,10 @@ impl Tool for SessionsSpawnTool {
 
             runtime.remove_run(&run_id_async);
 
-            if cfg.subagents.announce_to_chat {
+            let user_chat_announces_enabled = cfg.subagents.announce_to_chat
+                && auth.caller_channel != "weixin"
+                && !auth.caller_channel.starts_with("weixin.");
+            if user_chat_announces_enabled {
                 match build_announce_payload(db.clone(), chat_id, &run_id_async).await {
                     Ok(payload) => {
                         let rid = run_id_async.clone();
@@ -1228,7 +1605,7 @@ impl Tool for SessionsSpawnTool {
 
             // Fan-in: when this was the last active child of a parent run, post one
             // consolidated summary of the whole batch (opt-in).
-            if cfg.subagents.fan_in_summary {
+            if user_chat_announces_enabled && cfg.subagents.fan_in_summary {
                 if let Some(parent_id) = parent_run_id_async.as_ref() {
                     maybe_post_fan_in_summary(
                         &cfg,
@@ -1878,6 +2255,16 @@ pub struct SubagentsLogTool {
     db: Arc<Database>,
 }
 
+/// One orchestrate work package: a task plus its optional completion contract.
+struct OrchestratePackage {
+    task: String,
+    exit_criteria: Vec<crate::completion_contract::ExitCriterion>,
+}
+
+/// Marker prefix a failed contract leaves at the head of result_text
+/// (produced by completion_contract::render_report).
+const CONTRACT_FAILED_MARKER: &str = "[completion contract] FAILED";
+
 pub struct SubagentsOrchestrateTool {
     config: Config,
     db: Arc<Database>,
@@ -1951,7 +2338,7 @@ impl Tool for SubagentsOrchestrateTool {
             input_schema: schema_object(
                 json!({
                     "goal": {"type":"string"},
-                    "work_packages": {"type":"array", "items":{"type":"string"}},
+                    "work_packages": {"type":"array", "items":{}, "description":"Work packages: plain strings, or objects {task, exit_criteria?} where exit_criteria is a completion contract (same shape as sessions_spawn) verified when the worker finishes. With wait=true, a worker whose contract FAILED is re-spawned once with the failure evidence (contract-aware fan-in retry)."},
                     "chat_id": {"type":"integer"},
                     "wait": {"type":"boolean"},
                     "wait_timeout_secs": {"type":"integer", "minimum":1, "maximum":1200},
@@ -1982,15 +2369,52 @@ impl Tool for SubagentsOrchestrateTool {
             Some(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => return ToolResult::error("Missing required parameter: goal".into()),
         };
-        let mut packages = input
+        let raw_packages = input
             .get("work_packages")
             .and_then(|v| v.as_array())
             .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
+            .unwrap_or_default();
+        let mut packages: Vec<OrchestratePackage> = Vec::new();
+        for (i, v) in raw_packages.iter().enumerate() {
+            if let Some(task) = v.as_str() {
+                if !task.trim().is_empty() {
+                    packages.push(OrchestratePackage {
+                        task: task.trim().to_string(),
+                        exit_criteria: Vec::new(),
+                    });
+                }
+                continue;
+            }
+            if v.is_object() {
+                let task = v
+                    .get("task")
+                    .and_then(|t| t.as_str())
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string();
+                if task.is_empty() {
+                    return ToolResult::error(format!(
+                        "work_packages[{i}] object is missing a non-empty `task`"
+                    ));
+                }
+                let exit_criteria = match crate::completion_contract::parse_exit_criteria(
+                    v.get("exit_criteria"),
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return ToolResult::error(format!("work_packages[{i}]: {e}"));
+                    }
+                };
+                packages.push(OrchestratePackage {
+                    task,
+                    exit_criteria,
+                });
+                continue;
+            }
+            return ToolResult::error(format!(
+                "work_packages[{i}] must be a string or an object {{task, exit_criteria?}}"
+            ));
+        }
         if packages.is_empty() {
             return ToolResult::error("work_packages must include at least one item".into());
         }
@@ -2039,8 +2463,8 @@ impl Tool for SubagentsOrchestrateTool {
             SessionsSpawnTool::new(&self.config, self.db.clone(), self.channel_registry.clone());
         let mut spawned = Vec::new();
         for (idx, pkg) in packages.iter().enumerate() {
-            let spawn_input = json!({
-                "task": format!("Work package {}: {}", idx + 1, pkg),
+            let mut spawn_input = json!({
+                "task": format!("Work package {}: {}", idx + 1, pkg.task),
                 "context": format!(
                     "Orchestration goal: {goal}\nOutput strictly in protocol subagent_artifact_v1 with keys summary/findings/artifacts/next_actions/final_answer."
                 ),
@@ -2053,6 +2477,14 @@ impl Tool for SubagentsOrchestrateTool {
                     "env_files": auth.env_files.clone(),
                 }
             });
+            if !pkg.exit_criteria.is_empty() {
+                if let Some(obj) = spawn_input.as_object_mut() {
+                    obj.insert(
+                        "exit_criteria".to_string(),
+                        serde_json::to_value(&pkg.exit_criteria).unwrap_or_default(),
+                    );
+                }
+            }
             let spawn_input = if let (Some(meta), Some(parent_run_id)) =
                 (parent_meta.as_ref(), parent_run_id.as_deref())
             {
@@ -2139,6 +2571,128 @@ impl Tool for SubagentsOrchestrateTool {
         {
             wait_timed_out = true;
         }
+
+        // Contract-aware fan-in retry: a completed worker whose result carries
+        // the FAILED contract marker gets exactly ONE replacement run, spawned
+        // with the failure evidence as extra context. (The in-run bounded
+        // retry has already happened inside the worker, so this catches the
+        // cases where the worker gave up.)
+        let mut retried: Vec<serde_json::Value> = Vec::new();
+        if !wait_timed_out {
+            let mut replacements: Vec<(usize, String)> = Vec::new(); // (runs idx, new run_id)
+            for (idx, run) in runs.iter().enumerate() {
+                if run.status != "completed" {
+                    continue;
+                }
+                let Some(result_text) = run.result_text.as_deref() else {
+                    continue;
+                };
+                if !result_text.trim_start().starts_with(CONTRACT_FAILED_MARKER) {
+                    continue;
+                }
+                // Recover the package (spawn order matches `packages`).
+                let Some(pkg_idx) = spawned.iter().position(|id| *id == run.run_id) else {
+                    continue;
+                };
+                let Some(pkg) = packages.get(pkg_idx) else {
+                    continue;
+                };
+                let evidence_end = microclaw_core::text::floor_char_boundary(result_text, 600);
+                let mut spawn_input = json!({
+                    "task": format!("Work package {} (retry): {}", pkg_idx + 1, pkg.task),
+                    "context": format!(
+                        "Orchestration goal: {goal}\nA previous attempt FAILED its completion contract. Evidence:\n{}\nComplete the unmet criteria.\nOutput strictly in protocol subagent_artifact_v1 with keys summary/findings/artifacts/next_actions/final_answer.",
+                        &result_text[..evidence_end]
+                    ),
+                    "chat_id": chat_id,
+                    "token_budget": each_budget,
+                    "exit_criteria": serde_json::to_value(&pkg.exit_criteria).unwrap_or_default(),
+                    "__microclaw_auth": {
+                        "caller_channel": auth.caller_channel.clone(),
+                        "caller_chat_id": chat_id,
+                        "control_chat_ids": auth.control_chat_ids.clone(),
+                        "env_files": auth.env_files.clone(),
+                    }
+                });
+                if let (Some(meta), Some(parent_run_id)) =
+                    (parent_meta.as_ref(), parent_run_id.as_deref())
+                {
+                    if let Some(obj) = spawn_input.as_object_mut() {
+                        obj.insert(
+                            "__subagent_runtime".to_string(),
+                            json!({
+                                "run_id": parent_run_id,
+                                "depth": meta.depth,
+                                "runtime": meta.runtime.as_deref().unwrap_or("native"),
+                                "runtime_target": meta.runtime_target.clone(),
+                                "token_budget_remaining": each_budget,
+                            }),
+                        );
+                    }
+                }
+                let res = spawn_tool.execute(spawn_input).await;
+                if res.is_error {
+                    // Budget/depth exhausted: keep the failed result as-is.
+                    continue;
+                }
+                let new_run_id = serde_json::from_str::<serde_json::Value>(&res.content)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("run_id")
+                            .and_then(|r| r.as_str())
+                            .map(str::to_string)
+                    });
+                if let Some(new_run_id) = new_run_id {
+                    retried.push(json!({
+                        "package": pkg_idx + 1,
+                        "failed_run_id": run.run_id.clone(),
+                        "retry_run_id": new_run_id.clone(),
+                    }));
+                    replacements.push((idx, new_run_id));
+                }
+            }
+
+            if !replacements.is_empty() {
+                // Wait for the replacement runs within the remaining deadline.
+                let retry_ids: Vec<String> =
+                    replacements.iter().map(|(_, id)| id.clone()).collect();
+                loop {
+                    let ids = retry_ids.clone();
+                    let rows = match call_blocking(self.db.clone(), move |db| {
+                        let mut out = Vec::new();
+                        for run_id in ids {
+                            if let Some(row) = db.get_subagent_run(&run_id, chat_id)? {
+                                out.push(row);
+                            }
+                        }
+                        Ok::<_, microclaw_core::error::MicroClawError>(out)
+                    })
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return ToolResult::error(format!("Failed loading runs: {e}")),
+                    };
+                    let done = rows
+                        .iter()
+                        .all(|r| !matches!(r.status.as_str(), "accepted" | "queued" | "running"));
+                    if done {
+                        // Swap the finished replacements into the merge set.
+                        for (idx, retry_id) in &replacements {
+                            if let Some(row) = rows.iter().find(|r| r.run_id == *retry_id) {
+                                runs[*idx] = row.clone();
+                            }
+                        }
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        wait_timed_out = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+
         let merged = Self::merge_run_artifacts(&runs);
         ToolResult::success(
             json!({
@@ -2147,6 +2701,7 @@ impl Tool for SubagentsOrchestrateTool {
                 "goal": goal,
                 "workers": spawned.len(),
                 "run_ids": spawned,
+                "retried": retried,
                 "runs": runs.into_iter().map(|r| json!({
                     "run_id": r.run_id,
                     "status": r.status,
@@ -2447,6 +3002,45 @@ mod tests {
         assert!(!answer.contains("<think>"));
         assert!(!answer.contains("write_memory"));
         assert!(!envelope.contains("<think>"));
+    }
+
+    #[test]
+    fn contract_failed_marker_matches_report_rendering() {
+        // The fan-in retry detects failed contracts by this marker; it must
+        // stay in sync with completion_contract::render_report.
+        let report = crate::completion_contract::render_report(&[
+            crate::completion_contract::CriterionOutcome {
+                description: "file `x` exists".into(),
+                passed: false,
+                evidence: "missing".into(),
+            },
+        ]);
+        assert!(report.starts_with(CONTRACT_FAILED_MARKER));
+        // And the VERIFIED path must NOT match the failure marker.
+        let ok_report = crate::completion_contract::render_report(&[
+            crate::completion_contract::CriterionOutcome {
+                description: "file `x` exists".into(),
+                passed: true,
+                evidence: "ok".into(),
+            },
+        ]);
+        assert!(!ok_report.starts_with(CONTRACT_FAILED_MARKER));
+    }
+
+    #[test]
+    fn test_submit_result_tool_definition_shape() {
+        let def = submit_result_tool_definition();
+        assert_eq!(def.name, SUBMIT_RESULT_TOOL);
+        let props = def.input_schema.get("properties").unwrap();
+        for key in ["summary", "findings", "artifacts", "next_actions", "final_answer"] {
+            assert!(props.get(key).is_some(), "missing schema property {key}");
+        }
+        let required = def.input_schema.get("required").unwrap().as_array().unwrap();
+        assert!(required.iter().any(|v| v == "final_answer"));
+        // A submit_result payload normalizes into the announced answer.
+        let payload = json!({"summary": "s", "final_answer": "the answer"}).to_string();
+        let (answer, _envelope) = normalize_subagent_artifact_payload(&payload);
+        assert_eq!(answer, "the answer");
     }
 
     #[test]

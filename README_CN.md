@@ -2,6 +2,10 @@
 
 [English](README.md) | [中文](README_CN.md)
 
+> [!IMPORTANT]
+> **需要稳定版？请使用 [`stable`](https://github.com/microclaw/microclaw/tree/stable) 分支。**
+> `main` 分支目前正在进行非常积极和激进的开发，变化会很快。
+
 [![Website](https://img.shields.io/badge/Website-microclaw.org-blue)](https://microclaw.org)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/pvmezwkAk5)
 [![Reddit](https://img.shields.io/badge/Reddit-r%2Fmicroclaw-FF4500?logo=reddit&logoColor=white)](https://www.reddit.com/r/microclaw/)
@@ -53,6 +57,24 @@ MicroClaw 是一个面向聊天渠道的智能体运行时。它提供统一的�
 - **默认持久化**：会话可恢复、记忆可跨重启保留、定时任务可长期后台运行。
 - **Provider 无锁定**：可接 Anthropic 或 OpenAI-compatible API，不需要重写运行时。
 - **关键扩展点完整**：技能、MCP、插件、Hook、新平台适配器都能在不替换核心的情况下接入。
+- **一台低配 VPS 就能运行**：单个 Rust 二进制配合内嵌 SQLite，不依赖 Python、独立向量数据库或服务网格。
+
+### 可以验证的可靠性
+
+MicroClaw 的差异不在于堆出最长的功能清单，而在于让聊天消息的交付可预期、可恢复、易诊断。
+
+| 故障场景 | 运行时保证 | 如何验证 |
+|---|---|---|
+| 长回复超过渠道限制 | 先持久化接收完整回复，再按顺序分片，并保留分片边界上的每个字节 | 发送多行长回复，逐字节比较收到的文本 |
+| 发送过程中进程退出 | 重启后续传未完成分片，并复用稳定的幂等键 | 在长消息发送中重启，再运行 `microclaw doctor delivery` |
+| 定时任务完成时渠道不可用 | 任务执行与消息投递分开记录，结果会保留在队列中重试 | 查看任务运行记录和 `microclaw doctor delivery` |
+| 模型输出思考过程或工具轨迹包装 | 所有渠道发送前统一清理内部执行轨迹 | 在不同渠道使用同一提示词验证 |
+
+交互回复、定时任务和重启恢复共用同一套投递账本。运维时只需一个健康检查命令，不必逐个渠道猜测：
+
+```sh
+microclaw doctor delivery
+```
 
 ## 快速开始
 
@@ -160,6 +182,14 @@ microclaw doctor --json
 ```sh
 microclaw doctor sandbox
 ```
+
+仅检查消息投递状态（只读，不会实际发送消息）：
+
+```sh
+microclaw doctor delivery
+```
+
+该命令会显示持久化投递账本中的待发送、发送中、重试中及最终失败分片，并标出最早尚未完成的投递时间。
 
 ### 卸载（脚本）
 
@@ -421,6 +451,7 @@ MicroClaw 支持 [Anthropic Agent Skills](https://github.com/anthropics/skills) 
 - `/reset` -- 清除当前聊天上下文（会话 + 聊天历史）并清空定时任务状态
 - `/skills` -- 列出所有可用技能
 - `/reload-skills` -- 从磁盘重新加载技能
+- `/learn` -- 把当前会话蒸馏为可复用技能（仅限控制聊天）
 - `/archive` -- 将当前内存会话归档为 markdown
 - `/usage` -- 查看 token 用量统计（当前聊天 + 全局汇总）
 - `/status` -- 查看 provider/model 和当前聊天会话/任务状态
@@ -756,7 +787,15 @@ curl -sS http://127.0.0.1:10961/hooks/wake \
 
 ## 发布
 
-一条命令同时发布安装脚本模式（GitHub Release 资产）和 Homebrew 模式：
+在 Windows 上，可以按 `Cargo.toml` 中声明的版本触发 GitHub Actions，由 Windows、macOS 和 Linux runner 分别原生构建：
+
+```powershell
+.\scripts\trigger_release.ps1 -Wait
+```
+
+脚本要求已安装 `git`、GitHub CLI (`gh`) 并完成登录，同时要求工作区干净、提交已进入 `origin/main` 且 CI 成功。它会通过可审计的标签工作流创建对应的 `v<版本>` 标签，再构建并上传各平台压缩包、校验文件和容器镜像。不加 `-Wait` 时，触发资产工作流后立即返回。
+
+在 Unix 环境中，可用一条命令同时发布安装脚本模式（GitHub Release 资产）和 Homebrew 模式：
 
 ```sh
 ./deploy.sh

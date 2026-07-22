@@ -3,6 +3,10 @@
 
 [English](README.md) | [中文](README_CN.md)
 
+> [!IMPORTANT]
+> **Looking for a stable version? Use the [`stable`](https://github.com/microclaw/microclaw/tree/stable) branch.**
+> The `main` branch is under very active and aggressive development — expect rapid changes.
+
 [![Website](https://img.shields.io/badge/Website-microclaw.org-blue)](https://microclaw.org)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/pvmezwkAk5)
 [![Reddit](https://img.shields.io/badge/Reddit-r%2Fmicroclaw-FF4500?logo=reddit&logoColor=white)](https://www.reddit.com/r/microclaw/)
@@ -31,6 +35,7 @@
   <a href="docs/generated/tools.md">Tools</a> ·
   <a href="docs/generated/config-defaults.md">Config Defaults</a> ·
   <a href="docs/generated/provider-matrix.md">Provider Matrix</a> ·
+  <a href="docs/cookbook.md">Cookbook</a> ·
   <a href="docs/operations/runbook.md">Runbook</a> ·
   <a href="docs/operations/http-hook-trigger.md">Web Hooks</a> ·
   <a href="docs/clawhub/overview.md">ClawHub</a>
@@ -54,6 +59,23 @@ It works with Anthropic and OpenAI-compatible providers, supports multi-step too
 - **Provider-agnostic**: use Anthropic or OpenAI-compatible APIs without rewriting the runtime.
 - **Extensible where it matters**: add skills, MCP servers, plugins, hooks, and new channel adapters without replacing the core.
 - **Runs on a $5 VPS**: a single static Rust binary with embedded SQLite — no Python interpreter, no separate vector DB, no service mesh. RAM/CPU footprint is small enough for the cheapest cloud tier (1 vCPU / 1 GB).
+
+### Reliability you can verify
+
+MicroClaw's differentiator is not the longest feature checklist. It is making chat delivery predictable, recoverable, and easy to diagnose.
+
+| Failure scenario | Runtime guarantee | How to verify |
+|---|---|---|
+| A long reply exceeds a channel limit | The full reply is durably accepted first, then split into ordered chunks without dropping boundary bytes | Send a multiline reply and compare the received text byte-for-byte |
+| The process stops during delivery | Unfinished chunks resume after restart with stable idempotency keys | Restart MicroClaw during a long delivery, then run `microclaw doctor delivery` |
+| A scheduled task finishes while its channel is unavailable | Task execution and message delivery are tracked separately; the result remains queued for retry | Inspect task runs and `microclaw doctor delivery` |
+| The model emits reasoning or tool trace wrappers | Shared outbound sanitization removes private execution traces before any channel adapter sends text | Test the same prompt through different channels |
+
+This delivery ledger is shared by interactive replies, scheduled work, and recovery. Operators get one health command instead of channel-specific guesswork:
+
+```sh
+microclaw doctor delivery
+```
 
 ## Quick Start
 
@@ -173,6 +195,15 @@ Sandbox-only diagnostics:
 ```sh
 microclaw doctor sandbox
 ```
+
+Delivery-only diagnostics (read-only; sends no message):
+
+```sh
+microclaw doctor delivery
+```
+
+This reports pending, sending, retrying, and terminally failed chunks from the durable delivery
+ledger, including the age of the oldest unfinished delivery.
 
 ### Uninstall (script)
 
@@ -357,7 +388,7 @@ For a deeper dive into the architecture and design decisions, read: **[Building 
 | `cancel_scheduled_task` | Cancel a task permanently |
 | `get_task_history` | View execution history for a scheduled task |
 | `export_chat` | Export chat history to markdown |
-| `sessions_spawn` | Spawn an asynchronous sub-agent run and return immediately |
+| `sessions_spawn` | Spawn an asynchronous sub-agent run and return immediately; optional `exit_criteria` completion contract is verified with real checks when the run finishes ([docs](docs/completion-contracts.md)) |
 | `subagents_list` | List sub-agent runs for the current chat |
 | `subagents_info` | Inspect one sub-agent run in detail |
 | `subagents_kill` | Cancel one run or all active runs in the current chat |
@@ -531,6 +562,7 @@ See full manifest schema and examples: `docs/plugins/overview.md`.
 - `/reset memory` -- clear current chat memory (chat AGENTS.md + structured memories), keep conversation and tasks
 - `/skills` -- list all available skills
 - `/reload-skills` -- reload skills from disk
+- `/learn` -- distill the current session into a reusable skill (control chats only)
 - `/archive` -- archive current in-memory session as markdown
 - `/usage` -- show token usage summary (current chat + global totals)
 - `/status` -- show provider/model plus current chat session/task status
@@ -940,7 +972,15 @@ curl -sS http://127.0.0.1:10961/hooks/wake \
 
 ## Release
 
-Publish both installer mode (GitHub Release asset used by `install.sh`) and Homebrew mode with one command:
+From Windows, trigger the native Windows, macOS, and Linux GitHub Actions builders for the version declared in `Cargo.toml`:
+
+```powershell
+.\scripts\trigger_release.ps1 -Wait
+```
+
+The script requires `git`, an authenticated GitHub CLI (`gh`), a clean worktree, a commit on `origin/main`, and successful CI. It creates the matching `v<version>` tag through the audited tag workflow, then builds and uploads release archives, checksums, and container images. Omit `-Wait` to return after triggering the asset workflow.
+
+On Unix, publish both installer mode (GitHub Release asset used by `install.sh`) and Homebrew mode with one command:
 
 ```sh
 ./deploy.sh

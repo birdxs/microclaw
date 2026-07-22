@@ -95,6 +95,18 @@ timezone: "UTC"
 # output_guardrail:
 #   mode: redact
 
+# Pre-tool-call policy — a hard gate evaluated before every tool call.
+# Off by default (no behavior change). `warn` executes the call but seals a
+# violation entry into the tamper-evident audit log; `block` short-circuits
+# the call with an error tool_result and audits it. `allow_tools` wins over
+# `deny_tools`/`max_risk`. `max_risk` denies tools above the given built-in
+# risk tier (low < medium < high); an invalid value fails closed.
+# tool_policy:
+#   mode: block
+#   deny_tools: [bash]
+#   max_risk: medium
+#   allow_tools: []
+
 # RTK (Rust Token Killer) integration — opt-in, off by default.
 # When enabled, bash tool commands are passed through `rtk rewrite` before
 # execution: commands RTK recognizes (git, cargo, npm, ls, grep, docker, ...)
@@ -200,15 +212,28 @@ channels:
     #     bot_token: "123456:ABC-DEF..."
     #     bot_username: "my_bot"
     #     allowed_user_ids: [123456789]
+    # Live progress heartbeat during long agent turns (off by default).
+    # First trigger sends a "⏳ Working…" message, later updates edit it in
+    # place, and it flips to "✅ Done" when the turn finishes. Supported on
+    # telegram / discord / slack (same block shape under each channel).
+    # progress_updates:
+    #   enabled: true
+    #   groups: false                # also emit in group chats (default: private only)
+    #   min_turn_seconds: 30         # stay silent for turns shorter than this
+    #   update_interval_seconds: 20  # edit throttle (≤3/min, under Telegram's edit cap)
   discord:
     enabled: false
     bot_token: ""
     # allowed_channels: []
+    # progress_updates:            # same shape as channels.telegram.progress_updates
+    #   enabled: true
   # slack:
   #   enabled: false
   #   bot_token: "xoxb-..."
   #   app_token: "xapp-..."
   #   allowed_channels: []
+  #   progress_updates:            # same shape as channels.telegram.progress_updates
+  #     enabled: true
   # feishu:
   #   enabled: false
   #   app_id: "cli_xxx"
@@ -308,9 +333,9 @@ web_session_idle_ttl_seconds: 300
 #   max_concurrent: 4              # global cap on simultaneously running sub-agents
 #   max_active_per_chat: 5         # cap on active runs per chat
 #   run_timeout_secs: 900          # per-run timeout
-#   announce_to_chat: true         # post a message when a run completes
+#   announce_to_chat: false        # keep internal run details out of user chats; opt in for debugging
 #   fan_in_summary: false          # when a batch of child tasks all finish, post one combined summary
-#   progress_reports: true         # whether sub-agents may post mid-run "📊 progress" updates to chat
+#   progress_reports: false        # keep progress internal; opt in to post mid-run updates to chat
 #   # How often a long-running sub-agent may post a "📊 progress" update (seconds).
 #   progress_min_interval_secs: 45
 #   # Proactive task standup: periodically post a one-line status for tasks that
@@ -326,6 +351,28 @@ web_session_idle_ttl_seconds: 300
 #   enabled: false
 #   idle_hours: 24                 # only consider a chat idle after this many hours of silence
 #   min_interval_hours: 24         # at most one check-in per chat per this many hours
+
+# Proactive heartbeat (OpenClaw-style): every interval, read each chat's
+# runtime/groups/<chat_id>/HEARTBEAT.md checklist and run an agent turn over it;
+# the bot messages the chat only when something on the list needs attention.
+# OFF by default — chats without a HEARTBEAT.md file are never touched, so
+# enabling the loop changes nothing until a checklist exists.
+# heartbeat:
+#   enabled: false
+#   interval_mins: 30              # minutes between heartbeat sweeps
+#   max_chars: 8000                # max HEARTBEAT.md chars injected into the prompt
+
+# Per-chat token budget: once a chat's rolling-24h token total (input+output,
+# across agent turns, sub-agent runs, compaction — everything logged for the
+# chat) reaches daily_per_chat, new agent turns are refused until usage rolls
+# out of the window. Proactive turns (heartbeat, idle check-in, scheduled
+# tasks) are refused silently, so a capped chat stops consuming instead of
+# being spammed. Enforced at turn start: a turn or background sub-agent
+# already in flight finishes and may overshoot. 0 = unlimited (default).
+# Control chats are exempt by default so operators can always reach the bot.
+# token_budget:
+#   daily_per_chat: 0
+#   exempt_control_chats: true
 
 # "Sleep-time" memory consolidation: when a chat is idle, run a deterministic
 # (no-LLM) background pass that archives near-duplicate memories so the store stops
