@@ -146,9 +146,9 @@ impl Tool for TranscribeAudioTool {
         )
         .await
         {
-                Ok(v) => v,
-                Err(e) => return ToolResult::error(format!("audio fetch failed: {e}")),
-            };
+            Ok(v) => v,
+            Err(e) => return ToolResult::error(format!("audio fetch failed: {e}")),
+        };
         let (file_name, mime_str) = filename_for_mime(mime.as_deref());
 
         let part = match multipart::Part::bytes(bytes)

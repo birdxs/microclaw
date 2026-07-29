@@ -341,9 +341,8 @@ impl Tool for WriteMemoryTool {
                                     let expires_at = (chrono::Utc::now()
                                         + chrono::Duration::seconds(secs))
                                     .to_rfc3339();
-                                    let _ = self
-                                        .db
-                                        .set_memory_expires_at(memory_id, Some(&expires_at));
+                                    let _ =
+                                        self.db.set_memory_expires_at(memory_id, Some(&expires_at));
                                 }
                             }
                         }

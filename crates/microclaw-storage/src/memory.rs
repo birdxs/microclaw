@@ -235,7 +235,8 @@ mod tests {
         // Absent → false, no error.
         assert!(matches!(mm.clear_chat_user_model("telegram", 5), Ok(false)));
         // Write then clear → true, file is gone.
-        mm.write_chat_user_model("telegram", 5, "narrative").unwrap();
+        mm.write_chat_user_model("telegram", 5, "narrative")
+            .unwrap();
         assert!(mm.read_chat_user_model("telegram", 5).is_some());
         assert!(matches!(mm.clear_chat_user_model("telegram", 5), Ok(true)));
         assert!(mm.read_chat_user_model("telegram", 5).is_none());

@@ -143,11 +143,7 @@ pub struct LockEntry {
     /// Verifiable against disk at any time, unlike contentHash which covers
     /// the downloaded archive bytes. Absent on entries installed before this
     /// field existed.
-    #[serde(
-        rename = "treeHash",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "treeHash", default, skip_serializing_if = "Option::is_none")]
     pub tree_hash: Option<String>,
     #[serde(rename = "localPath")]
     pub local_path: String,

@@ -22,8 +22,7 @@ fn media_client_rejects_private_host_base_url() {
 
 #[test]
 fn media_client_rejects_cloud_metadata_base_url() {
-    let err =
-        MediaClient::new("http://169.254.169.254/".into(), "k".into(), 5).unwrap_err();
+    let err = MediaClient::new("http://169.254.169.254/".into(), "k".into(), 5).unwrap_err();
     assert!(err.contains("blocked") || err.contains("metadata"));
 }
 

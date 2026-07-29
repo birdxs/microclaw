@@ -167,8 +167,13 @@ fn test_scheduled_task_lifecycle() {
     assert_eq!(tasks_100.len(), 1); // cancelled ones filtered out
 
     // After run - cron task gets new next_run
-    db.update_task_after_run(id1, "2024-01-01T00:05:00Z", Some("2024-01-01T00:10:00Z"), true)
-        .unwrap();
+    db.update_task_after_run(
+        id1,
+        "2024-01-01T00:05:00Z",
+        Some("2024-01-01T00:10:00Z"),
+        true,
+    )
+    .unwrap();
     let task = db.get_task_by_id(id1).unwrap().unwrap();
     assert_eq!(task.last_run.as_deref(), Some("2024-01-01T00:05:00Z"));
     assert_eq!(task.next_run, "2024-01-01T00:10:00Z");
@@ -222,9 +227,20 @@ fn test_lifecycle_run_count_max_runs_and_deadline_fields() {
     assert_eq!(task.not_after.as_deref(), Some("2026-09-01T00:00:00Z"));
 
     // Run 1: rescheduled -> run_count increments, stays active.
-    db.update_task_after_run_lifecycle(id, "2026-07-12T00:00:01Z", Some("2026-07-13T00:00:00Z"), true, false)
+    db.update_task_after_run_lifecycle(
+        id,
+        "2026-07-12T00:00:01Z",
+        Some("2026-07-13T00:00:00Z"),
+        true,
+        false,
+    )
+    .unwrap();
+    let task = db
+        .get_tasks_for_chat(7)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == id)
         .unwrap();
-    let task = db.get_tasks_for_chat(7).unwrap().into_iter().find(|t| t.id == id).unwrap();
     assert_eq!(task.run_count, 1);
     assert_eq!(task.status, "active");
 
@@ -238,7 +254,13 @@ fn test_lifecycle_run_count_max_runs_and_deadline_fields() {
 
     // One-shot failure semantics unchanged: failed stays failed.
     let once = db
-        .create_scheduled_task(7, "one shot", "once", "2026-07-12T00:00:00Z", "2026-07-12T00:00:00Z")
+        .create_scheduled_task(
+            7,
+            "one shot",
+            "once",
+            "2026-07-12T00:00:00Z",
+            "2026-07-12T00:00:00Z",
+        )
         .unwrap();
     db.update_task_after_run(once, "2026-07-12T00:00:01Z", None, false)
         .unwrap();

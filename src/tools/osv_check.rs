@@ -164,9 +164,10 @@ impl Tool for OsvCheckTool {
         if let Some(db) = &self.db {
             let now = chrono::Utc::now().to_rfc3339();
             let lookup_key = key.clone();
-            if let Ok(Some(cached)) =
-                call_blocking(db.clone(), move |d| d.get_cached_tool_result(&lookup_key, &now))
-                    .await
+            if let Ok(Some(cached)) = call_blocking(db.clone(), move |d| {
+                d.get_cached_tool_result(&lookup_key, &now)
+            })
+            .await
             {
                 if !cached.is_error {
                     return ToolResult::success(cached.content)
@@ -177,9 +178,9 @@ impl Tool for OsvCheckTool {
         let result = self.execute_uncached(input).await;
         if let Some(db) = &self.db {
             if !result.is_error {
-                let expires =
-                    (chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default())
-                        .to_rfc3339();
+                let expires = (chrono::Utc::now()
+                    + chrono::Duration::from_std(ttl).unwrap_or_default())
+                .to_rfc3339();
                 let content = result.content.clone();
                 let tool_name = self.name().to_string();
                 let _ = call_blocking(db.clone(), move |d| {

@@ -122,7 +122,8 @@ pub fn evaluate(fixture: &str, messages: &[Message], t: &EvalThresholds) -> Eval
     let mut orphan_results: Vec<String> = Vec::new();
     let mut tool_errors = 0usize;
     // (tool name + serialized args) -> occurrences, for stuck-loop detection.
-    let mut call_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut call_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     // Longest run of consecutive tool errors, in block order.
     let mut error_streak = 0usize;
     let mut cur_error_streak = 0usize;
@@ -131,7 +132,9 @@ pub fn evaluate(fixture: &str, messages: &[Message], t: &EvalThresholds) -> Eval
         let Some(bs) = blocks(msg) else { continue };
         for b in bs {
             match b {
-                ContentBlock::ToolUse { id, name, input, .. } => {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     tool_use_ids.push(id.clone());
                     let key = format!("{name}\u{1f}{input}");
                     *call_counts.entry(key).or_insert(0) += 1;
@@ -180,7 +183,11 @@ pub fn evaluate(fixture: &str, messages: &[Message], t: &EvalThresholds) -> Eval
         detail: if dangling.is_empty() {
             "all tool_use blocks have a matching tool_result".into()
         } else {
-            format!("{} tool_use without a tool_result: {:?}", dangling.len(), dangling)
+            format!(
+                "{} tool_use without a tool_result: {:?}",
+                dangling.len(),
+                dangling
+            )
         },
     });
 
@@ -202,7 +209,9 @@ pub fn evaluate(fixture: &str, messages: &[Message], t: &EvalThresholds) -> Eval
     // 3. Ends on a real assistant answer, not a raw tool_result.
     let ends_cleanly = match messages.last() {
         None => false,
-        Some(last) => !is_pure_tool_result(last) && (has_answer_text(last) || last.role == "assistant"),
+        Some(last) => {
+            !is_pure_tool_result(last) && (has_answer_text(last) || last.role == "assistant")
+        }
     };
     checks.push(CheckResult {
         name: "ends_with_answer".into(),
@@ -213,7 +222,10 @@ pub fn evaluate(fixture: &str, messages: &[Message], t: &EvalThresholds) -> Eval
                 "session ends on a tool_result (no final answer)".into()
             }
             Some(_) if ends_cleanly => "session ends with a final answer".into(),
-            Some(last) => format!("session ends on a '{}' message without answer text", last.role),
+            Some(last) => format!(
+                "session ends on a '{}' message without answer text",
+                last.role
+            ),
         },
     });
 
@@ -231,7 +243,11 @@ pub fn evaluate(fixture: &str, messages: &[Message], t: &EvalThresholds) -> Eval
         passed: !t.strict_tool_errors || tool_errors == 0,
         detail: format!(
             "{tool_errors} tool error(s){}",
-            if t.strict_tool_errors { " (strict)" } else { " (informational)" }
+            if t.strict_tool_errors {
+                " (strict)"
+            } else {
+                " (informational)"
+            }
         ),
     });
 
@@ -246,7 +262,10 @@ pub fn evaluate(fixture: &str, messages: &[Message], t: &EvalThresholds) -> Eval
         name: "no_tool_call_loop".into(),
         passed: no_loop,
         detail: if no_loop {
-            format!("max identical tool call repeated {top_call_count}x (limit {})", t.max_repeats)
+            format!(
+                "max identical tool call repeated {top_call_count}x (limit {})",
+                t.max_repeats
+            )
         } else {
             format!(
                 "tool '{top_tool}' called with identical arguments {top_call_count}x (limit {})",
@@ -306,8 +325,8 @@ pub fn run_eval(path: &str, thresholds: &EvalThresholds, json: bool) -> Result<i
     for f in &fixtures {
         let raw = std::fs::read_to_string(f)
             .with_context(|| format!("reading fixture {}", f.display()))?;
-        let messages = load_messages(&raw)
-            .with_context(|| format!("parsing fixture {}", f.display()))?;
+        let messages =
+            load_messages(&raw).with_context(|| format!("parsing fixture {}", f.display()))?;
         reports.push(evaluate(&f.display().to_string(), &messages, thresholds));
     }
 
@@ -336,7 +355,11 @@ pub fn run_eval(path: &str, thresholds: &EvalThresholds, json: bool) -> Result<i
             "\n{}/{} fixtures passed{}",
             reports.len() - failed,
             reports.len(),
-            if all_passed { "" } else { " — eval gate FAILED" }
+            if all_passed {
+                ""
+            } else {
+                " — eval gate FAILED"
+            }
         );
     }
 
@@ -402,7 +425,10 @@ mod tests {
     #[test]
     fn clean_trajectory_passes() {
         let msgs = vec![
-            Message { role: "user".into(), content: MessageContent::Text("hi".into()) },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("hi".into()),
+            },
             assistant_tool_use("t1"),
             tool_result("t1", false),
             assistant_text("here is the answer"),
@@ -415,12 +441,18 @@ mod tests {
     #[test]
     fn dangling_tool_use_fails() {
         let msgs = vec![
-            Message { role: "user".into(), content: MessageContent::Text("hi".into()) },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("hi".into()),
+            },
             assistant_tool_use("t1"), // no result
         ];
         let r = evaluate("dangling", &msgs, &th(100, false));
         assert!(!r.passed);
-        assert!(r.checks.iter().any(|c| c.name == "no_dangling_tool_use" && !c.passed));
+        assert!(r
+            .checks
+            .iter()
+            .any(|c| c.name == "no_dangling_tool_use" && !c.passed));
     }
 
     #[test]
@@ -431,7 +463,10 @@ mod tests {
         ];
         let r = evaluate("ends_tr", &msgs, &th(100, false));
         assert!(!r.passed);
-        assert!(r.checks.iter().any(|c| c.name == "ends_with_answer" && !c.passed));
+        assert!(r
+            .checks
+            .iter()
+            .any(|c| c.name == "ends_with_answer" && !c.passed));
     }
 
     #[test]
@@ -446,7 +481,10 @@ mod tests {
         ];
         let r = evaluate("budget", &msgs, &th(1, false));
         assert!(!r.passed);
-        assert!(r.checks.iter().any(|c| c.name == "within_tool_budget" && !c.passed));
+        assert!(r
+            .checks
+            .iter()
+            .any(|c| c.name == "within_tool_budget" && !c.passed));
     }
 
     #[test]
@@ -454,7 +492,10 @@ mod tests {
         let msgs = vec![tool_result("ghost", false), assistant_text("done")];
         let r = evaluate("orphan", &msgs, &th(100, false));
         assert!(!r.passed);
-        assert!(r.checks.iter().any(|c| c.name == "no_orphan_tool_result" && !c.passed));
+        assert!(r
+            .checks
+            .iter()
+            .any(|c| c.name == "no_orphan_tool_result" && !c.passed));
     }
 
     #[test]
@@ -465,7 +506,11 @@ mod tests {
             assistant_text("recovered"),
         ];
         let lenient = evaluate("err", &msgs, &th(100, false));
-        assert!(lenient.passed, "errors should be informational: {:?}", lenient.checks);
+        assert!(
+            lenient.passed,
+            "errors should be informational: {:?}",
+            lenient.checks
+        );
         assert_eq!(lenient.tool_errors, 1);
         let strict = evaluate("err", &msgs, &th(100, true));
         assert!(!strict.passed);
@@ -485,7 +530,10 @@ mod tests {
         ];
         let r = evaluate("loop", &msgs, &th(100, false));
         assert!(!r.passed);
-        assert!(r.checks.iter().any(|c| c.name == "no_tool_call_loop" && !c.passed));
+        assert!(r
+            .checks
+            .iter()
+            .any(|c| c.name == "no_tool_call_loop" && !c.passed));
     }
 
     #[test]
@@ -516,7 +564,10 @@ mod tests {
         ];
         let r = evaluate("streak", &msgs, &th(100, false));
         assert!(!r.passed);
-        assert!(r.checks.iter().any(|c| c.name == "no_error_streak" && !c.passed));
+        assert!(r
+            .checks
+            .iter()
+            .any(|c| c.name == "no_error_streak" && !c.passed));
     }
 
     #[test]
@@ -552,15 +603,16 @@ mod tests {
             );
             let raw =
                 std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
-            let messages =
-                load_messages(&raw).unwrap_or_else(|e| panic!("parsing {path}: {e}"));
+            let messages = load_messages(&raw).unwrap_or_else(|e| panic!("parsing {path}: {e}"));
             let r = evaluate(file, &messages, &EvalThresholds::default());
             assert!(
                 !r.passed,
                 "{file} unexpectedly passed; it must demonstrate a failing trajectory"
             );
             assert!(
-                r.checks.iter().any(|c| c.name == expected_check && !c.passed),
+                r.checks
+                    .iter()
+                    .any(|c| c.name == expected_check && !c.passed),
                 "{file} did not fail its expected check {expected_check}; checks: {:?}",
                 r.checks
             );

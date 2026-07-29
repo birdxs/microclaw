@@ -17,12 +17,12 @@ use crate::agent_engine::process_with_agent_with_events_guarded;
 use crate::agent_engine::should_suppress_user_error;
 use crate::agent_engine::AgentEvent;
 use crate::agent_engine::AgentRequestContext;
-use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::{
     mark_channel_started, should_drop_pre_start_message, should_drop_recent_duplicate_message,
 };
 use crate::chat_commands::maybe_handle_plugin_command;
 use crate::chat_commands::{handle_chat_command, is_slash_command, unknown_command_response};
+use crate::chat_turn_queue::PendingMessage;
 use crate::runtime::AppState;
 use crate::tools::ToolAuthContext;
 use microclaw_channels::channel::ConversationKind;
@@ -388,8 +388,7 @@ impl EventHandler for Handler {
                         .unwrap_or(false)
                 })
                 .collect();
-            if !audio_attachments.is_empty()
-                && crate::voice::can_transcribe(&self.app_state.config)
+            if !audio_attachments.is_empty() && crate::voice::can_transcribe(&self.app_state.config)
             {
                 let max_bytes: u32 = 25 * 1024 * 1024;
                 let client = reqwest::Client::new();
@@ -420,8 +419,9 @@ impl EventHandler for Handler {
                         }
                     };
                     match crate::voice::transcribe_audio(&self.app_state.config, &bytes).await {
-                        Ok(t) => transcripts
-                            .push(crate::voice::format_voice_inbound(&sender_name, &t)),
+                        Ok(t) => {
+                            transcripts.push(crate::voice::format_voice_inbound(&sender_name, &t))
+                        }
                         Err(e) => {
                             warn!("Discord: voice transcription failed: {e}");
                             transcripts
@@ -576,6 +576,7 @@ impl EventHandler for Handler {
                 let auth = ToolAuthContext {
                     caller_channel: self.runtime.channel_name.clone(),
                     caller_chat_id: channel_id,
+                    principal: "channel:discord".to_string(),
                     control_chat_ids: self.app_state.config.control_chat_ids.clone(),
                     env_files: Vec::new(),
                 };
@@ -702,10 +703,8 @@ impl EventHandler for Handler {
                         let mut slot = progress_msg.lock().await;
                         match *slot {
                             Some(message_id) => {
-                                let edit =
-                                    serenity::builder::EditMessage::new().content(text);
-                                if let Err(e) =
-                                    channel.edit_message(&http, message_id, edit).await
+                                let edit = serenity::builder::EditMessage::new().content(text);
+                                if let Err(e) = channel.edit_message(&http, message_id, edit).await
                                 {
                                     warn!("Discord: progress edit failed: {e}");
                                 }
@@ -820,14 +819,12 @@ impl EventHandler for Handler {
                     .await
                     {
                         Ok(audio_path) => {
-                            let attachments = [serenity::builder::CreateAttachment::path(
-                                &audio_path,
-                            )
-                            .await];
+                            let attachments =
+                                [serenity::builder::CreateAttachment::path(&audio_path).await];
                             match attachments {
                                 [Ok(att)] => {
-                                    let builder = serenity::builder::CreateMessage::new()
-                                        .add_file(att);
+                                    let builder =
+                                        serenity::builder::CreateMessage::new().add_file(att);
                                     if let Err(e) =
                                         msg.channel_id.send_message(&ctx.http, builder).await
                                     {

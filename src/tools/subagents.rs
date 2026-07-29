@@ -360,7 +360,6 @@ struct RunSubAgentTaskParams {
     local_cancel: Arc<AtomicBool>,
 }
 
-
 /// Bash-backed runner for `Command` exit criteria: routes through the
 /// sub-agent's own tool registry, so the sandbox router, dangerous-pattern
 /// checks, and tool_policy apply exactly as for agent-issued commands.
@@ -430,7 +429,11 @@ async fn apply_completion_contract(
         "contract",
         Some(format!(
             "{} {passed}/{}",
-            if passed == outcomes.len() { "verified" } else { "failed" },
+            if passed == outcomes.len() {
+                "verified"
+            } else {
+                "failed"
+            },
             outcomes.len()
         )),
     )
@@ -481,7 +484,9 @@ async fn run_sub_agent_task(
         // the failure evidence appended to the context.
         let mut context = context;
         if !exit_criteria.is_empty() {
-            context.push_str(&crate::completion_contract::render_for_prompt(&exit_criteria));
+            context.push_str(&crate::completion_contract::render_for_prompt(
+                &exit_criteria,
+            ));
         }
         let first = crate::acp_subagent::run_acp_subagent_task(
             crate::acp_subagent::AcpSubagentTaskParams {
@@ -575,7 +580,9 @@ async fn run_sub_agent_task(
         format!("Context: {context}\n\nTask: {task}")
     };
     if !exit_criteria.is_empty() {
-        user_content.push_str(&crate::completion_contract::render_for_prompt(&exit_criteria));
+        user_content.push_str(&crate::completion_contract::render_for_prompt(
+            &exit_criteria,
+        ));
     }
 
     let mut messages = vec![Message {
@@ -724,9 +731,7 @@ async fn run_sub_agent_task(
             // If the model called `submit_result`, its (schema-validated) input
             // IS the final structured result — short-circuit and return it.
             if let Some(submit_input) = response.content.iter().find_map(|b| match b {
-                ResponseContentBlock::ToolUse { name, input, .. }
-                    if name == SUBMIT_RESULT_TOOL =>
-                {
+                ResponseContentBlock::ToolUse { name, input, .. } if name == SUBMIT_RESULT_TOOL => {
                     Some(input.clone())
                 }
                 _ => None,
@@ -1435,6 +1440,7 @@ impl Tool for SessionsSpawnTool {
         let auth_async = ToolAuthContext {
             caller_channel: auth.caller_channel.clone(),
             caller_chat_id: chat_id,
+            principal: format!("subagent:{run_id}"),
             control_chat_ids: auth.control_chat_ids.clone(),
             env_files: auth.env_files.clone(),
         };
@@ -1760,7 +1766,8 @@ impl Tool for SubagentsInfoTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "subagents_info".into(),
-            description: "Get detailed information for one subagent run, by run id or task label.".into(),
+            description: "Get detailed information for one subagent run, by run id or task label."
+                .into(),
             input_schema: schema_object(
                 json!({
                     "run_id": {"type": "string", "description": "Run id or the task label given at spawn."},
@@ -1793,9 +1800,7 @@ impl Tool for SubagentsInfoTool {
         };
         let run_id = match resolve_subagent_ref(&self.db, chat_id, &run_ref).await {
             Ok(Some(v)) => v,
-            Ok(None) => {
-                return ToolResult::error(format!("No subagent run matching '{run_ref}'"))
-            }
+            Ok(None) => return ToolResult::error(format!("No subagent run matching '{run_ref}'")),
             Err(e) => return ToolResult::error(e),
         };
 
@@ -1936,9 +1941,7 @@ impl Tool for SubagentsKillTool {
 
         let run_id = match resolve_subagent_ref(&self.db, chat_id, &run_ref).await {
             Ok(Some(v)) => v,
-            Ok(None) => {
-                return ToolResult::error(format!("No subagent run matching '{run_ref}'"))
-            }
+            Ok(None) => return ToolResult::error(format!("No subagent run matching '{run_ref}'")),
             Err(e) => return ToolResult::error(e),
         };
 
@@ -2397,14 +2400,13 @@ impl Tool for SubagentsOrchestrateTool {
                         "work_packages[{i}] object is missing a non-empty `task`"
                     ));
                 }
-                let exit_criteria = match crate::completion_contract::parse_exit_criteria(
-                    v.get("exit_criteria"),
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return ToolResult::error(format!("work_packages[{i}]: {e}"));
-                    }
-                };
+                let exit_criteria =
+                    match crate::completion_contract::parse_exit_criteria(v.get("exit_criteria")) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return ToolResult::error(format!("work_packages[{i}]: {e}"));
+                        }
+                    };
                 packages.push(OrchestratePackage {
                     task,
                     exit_criteria,
@@ -2637,11 +2639,7 @@ impl Tool for SubagentsOrchestrateTool {
                 }
                 let new_run_id = serde_json::from_str::<serde_json::Value>(&res.content)
                     .ok()
-                    .and_then(|v| {
-                        v.get("run_id")
-                            .and_then(|r| r.as_str())
-                            .map(str::to_string)
-                    });
+                    .and_then(|v| v.get("run_id").and_then(|r| r.as_str()).map(str::to_string));
                 if let Some(new_run_id) = new_run_id {
                     retried.push(json!({
                         "package": pkg_idx + 1,
@@ -3032,10 +3030,21 @@ mod tests {
         let def = submit_result_tool_definition();
         assert_eq!(def.name, SUBMIT_RESULT_TOOL);
         let props = def.input_schema.get("properties").unwrap();
-        for key in ["summary", "findings", "artifacts", "next_actions", "final_answer"] {
+        for key in [
+            "summary",
+            "findings",
+            "artifacts",
+            "next_actions",
+            "final_answer",
+        ] {
             assert!(props.get(key).is_some(), "missing schema property {key}");
         }
-        let required = def.input_schema.get("required").unwrap().as_array().unwrap();
+        let required = def
+            .input_schema
+            .get("required")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert!(required.iter().any(|v| v == "final_answer"));
         // A submit_result payload normalizes into the announced answer.
         let payload = json!({"summary": "s", "final_answer": "the answer"}).to_string();
@@ -3049,7 +3058,9 @@ mod tests {
         assert!(!subagent_output_is_structured(
             "<think>no write_memory tool</think> I can't save this."
         ));
-        assert!(!subagent_output_is_structured("Done, everything looks good."));
+        assert!(!subagent_output_is_structured(
+            "Done, everything looks good."
+        ));
         // A contract object (even after a thinking block) IS structured.
         assert!(subagent_output_is_structured(
             "<think>ok</think>{\"summary\":\"s\",\"final_answer\":\"done\"}"

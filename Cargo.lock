@@ -3567,7 +3567,7 @@ dependencies = [
 
 [[package]]
 name = "microclaw"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aes",
  "agent-client-protocol",
@@ -3719,6 +3719,7 @@ dependencies = [
  "chrono",
  "microclaw-core",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "sqlite-vec",
@@ -3739,6 +3740,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tracing",
  "urlencoding",

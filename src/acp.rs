@@ -93,8 +93,7 @@ pub async fn serve(
     {
         let review_state = app_state.clone();
         tokio::spawn(async move {
-            crate::skill_review::spawn_skill_review_worker(review_state, skill_review_worker)
-                .await;
+            crate::skill_review::spawn_skill_review_worker(review_state, skill_review_worker).await;
         });
     }
 

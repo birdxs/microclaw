@@ -55,7 +55,7 @@ It works with Anthropic and OpenAI-compatible providers, supports multi-step too
 
 - **One runtime, many channels**: keep the same agent loop, tools, memory, and policies across chat platforms.
 - **Built for agentic execution**: tool calls, tool-result reflection, sub-agents, planning, and mid-run updates are first-class.
-- **Persistent by default**: sessions resume, memory survives restarts, and scheduled tasks keep running in the background.
+- **Persistent by default**: safe agent-loop checkpoints resume after restart, memory survives, and scheduled tasks keep running in the background.
 - **Provider-agnostic**: use Anthropic or OpenAI-compatible APIs without rewriting the runtime.
 - **Extensible where it matters**: add skills, MCP servers, plugins, hooks, and new channel adapters without replacing the core.
 - **Runs on a $5 VPS**: a single static Rust binary with embedded SQLite — no Python interpreter, no separate vector DB, no service mesh. RAM/CPU footprint is small enough for the cheapest cloud tier (1 vCPU / 1 GB).
@@ -68,6 +68,8 @@ MicroClaw's differentiator is not the longest feature checklist. It is making ch
 |---|---|---|
 | A long reply exceeds a channel limit | The full reply is durably accepted first, then split into ordered chunks without dropping boundary bytes | Send a multiline reply and compare the received text byte-for-byte |
 | The process stops during delivery | Unfinished chunks resume after restart with stable idempotency keys | Restart MicroClaw during a long delivery, then run `microclaw doctor delivery` |
+| The process stops between model/tool steps | A provider-neutral checkpoint resumes automatically without repeating completed tool results | Stop the process after a tool result, restart it, then inspect `/status` or Governance |
+| The process stops while a tool may be changing external state | Recovery stops with the tool/progress evidence and asks for verification; it never blindly replays the call | Interrupt a write-capable tool and confirm the recovery audit action is `stop_uncertain` |
 | A scheduled task finishes while its channel is unavailable | Task execution and message delivery are tracked separately; the result remains queued for retry | Inspect task runs and `microclaw doctor delivery` |
 | The model emits reasoning or tool trace wrappers | Shared outbound sanitization removes private execution traces before any channel adapter sends text | Test the same prompt through different channels |
 
@@ -76,6 +78,10 @@ This delivery ledger is shared by interactive replies, scheduled work, and recov
 ```sh
 microclaw doctor delivery
 ```
+
+Operational details: `docs/operations/durable-coworker.md`. Capability grants,
+egress controls, sandbox credentials, and rollout guidance:
+`docs/security/secure-runtime.md`.
 
 ## Quick Start
 
@@ -496,6 +502,47 @@ LIMIT 50;
 
 MicroClaw supports the [Anthropic Agent Skills](https://github.com/anthropics/skills) standard. Skills are modular packages that give the bot specialized capabilities for specific tasks.
 
+Agent-created skills are governed as evaluated behavior rather than trusted
+immediately. Each version starts as a candidate, advances through verified
+trial outcomes, becomes trusted only after sufficient passing evidence, and
+degrades after verified regressions. `skill_manage` can roll back to a recorded
+version. Repeated failures in the same runtime environment become a learned
+contraindication that blocks activation until a corrected version is published.
+
+Every agent turn also creates an experience run linked to its goal, activated
+skills, completion evidence, token/tool/error/cost metrics, and optional human
+feedback. Strongly verified experiences from the same chat are recalled for
+similar future tasks as historical evidence; they are injection-scanned and
+explicitly treated as data, never instructions. A versioned outcome envelope
+normalizes runtime completion, tool results, scheduler failures, completion
+contracts, and human corrections. Retrieval audit records preserve exactly
+which prior experiences were injected and why.
+Task Signature v1 classifies each run by task type, task family, and capability
+tags. Skill quality is aggregated at the same task grain and includes a Wilson
+confidence lower bound; trial promotion requires both the configured raw pass
+rate and the risk-adjusted utility threshold. Retrieval ranks verified history
+using task compatibility and utility in addition to lexical and environment
+matching.
+Failure-aware retrieval excludes verified failed runs and active task-scoped
+skill contraindications from prompt injection. The Learning Journal records
+why candidates were rejected and supports cooldown-based recovery trials whose
+verified successes can resolve the contraindication.
+Comparative reflection pairs successful and failed runs at the same task and
+environment grain, distills versioned claims with counterexamples, and creates
+isolated candidate skill versions. Candidates remain inactive until paired
+shadow evidence passes configurable utility, cost, and regression gates.
+Promoted candidates retain their prior trusted version for automatic or
+operator rollback, with every decision recorded in the Learning Journal.
+The `/usage` report and `GET /api/learning_observability` expose this history;
+the Web settings **Learning** panel provides a per-run evidence browser;
+`/learning [run_id]` shows a single run's used experiences and outcome evidence;
+`POST /api/learning/feedback` attaches a `passed` or `failed` human verdict to a
+specific run. `GET /api/learning/experiences` searches verified experience,
+`GET /api/learning/experiences/:run_id` returns its complete evidence detail,
+while `GET/PUT /api/learning/policy` reads or admin-updates lifecycle
+thresholds. See [Long-horizon learning](docs/long-horizon-learning.md) for the
+data model and promotion policy.
+
 ```
 <data_dir>/skills/
     pdf/
@@ -555,11 +602,18 @@ Plugin admin commands (control chats):
 
 See full manifest schema and examples: `docs/plugins/overview.md`.
 
+TypeScript-authored plugins are planned as an out-of-process, capability-scoped
+plugin host rather than an embedded JavaScript engine. The researched protocol,
+security model, packaging rules, and phased implementation plan are in
+`docs/rfcs/0006-typescript-plugin-host.md`.
+
 **Commands:**
 - `/stop` -- abort the current active run in this chat (keeps history/session data)
 - `/clear` -- clear current chat context (session + chat history), keep scheduled tasks
 - `/reset` -- clear current chat context (session + chat history) and scheduled task state
-- `/reset memory` -- clear current chat memory (chat AGENTS.md + structured memories), keep conversation and tasks
+- `/reset memory` -- clear current chat memory (chat AGENTS.md, structured
+  memories, goals, and verified experience), recompute skill trust from
+  remaining evidence, and keep conversation/tasks
 - `/skills` -- list all available skills
 - `/reload-skills` -- reload skills from disk
 - `/learn` -- distill the current session into a reusable skill (control chats only)
@@ -1292,9 +1346,15 @@ All configuration is via `microclaw.config.yaml`:
 | `working_dir` | No | `~/.microclaw/working_dir` | Default working directory for tool operations; relative paths in `bash/read_file/write_file/edit_file/glob/grep` resolve from here |
 | `working_dir_isolation` | No | `chat` | Working directory isolation mode for `bash/read_file/write_file/edit_file/glob/grep`: `shared` uses `working_dir/shared`, `chat` isolates each chat under `working_dir/chat/<channel>/<chat_id>` |
 | `high_risk_tool_user_confirmation_required` | No | `true` | Require explicit user confirmation before high-risk tool execution (for example `bash`) |
+| `tool_policy.grants_mode` | No | `off` | Enforce matching per-chat/channel/principal tool grants in `warn` or `block` mode |
+| `tool_policy.grants` | No | `[]` | Least-privilege capability rules with `chat_id`, `channel`, `principal`, allow/deny tool lists, and optional max risk |
+| `egress_policy.mode` | No | `off` | Central HTTP(S) destination policy: `warn` audits violations; `block` rejects them |
+| `egress_policy.allow_hosts` | No | `[]` | Optional exact/wildcard host allowlist; an empty list permits public hosts not explicitly denied |
+| `egress_policy.block_private_ips` | No | `true` | Reject loopback, private, link-local, metadata, multicast, and unresolved destinations while egress policy is active |
 | `sandbox.mode` | No | `off` | Container sandbox mode for bash tool execution: `off` runs on host; `all` routes bash commands into docker containers |
 | `sandbox.security_profile` | No | `hardened` | Sandbox privilege profile: `hardened` (`--cap-drop ALL --security-opt no-new-privileges`), `standard` (Docker default caps), `privileged` (`--privileged`) |
 | `sandbox.cap_add` | No | `[]` | Optional extra Linux capabilities to add (`--cap-add`); applies to `hardened` and `standard` profiles |
+| `sandbox.credential_env_allowlist` | No | `[]` | Exact credential-like environment variable names allowed into containers; dotenv files are parsed on the host and never forwarded wholesale |
 | `sandbox.mount_allowlist_path` | No | unset | Optional external mount allowlist file (one allowed root path per line) |
 | `max_tokens` | No | `8192` | Max tokens per model response |
 | `max_tool_iterations` | No | `100` | Max tool-use loop iterations per message |
@@ -1416,6 +1476,7 @@ sandbox:
   container_prefix: "microclaw-sandbox"
   no_network: true
   require_runtime: true
+  credential_env_allowlist: [] # exact secret variable names; empty is safest
   # optional external allowlist file
   # mount_allowlist_path: "~/.microclaw/sandbox-mount-allowlist.txt"
 ```
@@ -1440,6 +1501,10 @@ Notes:
   - `standard`: Docker default capabilities (useful for `apt/chown/su` in sandbox)
   - `privileged`: full container privilege (`--privileged`), debugging only
 - `sandbox.cap_add` appends `--cap-add` entries for `hardened` and `standard`.
+- Dotenv files are never passed wholesale to a container. Non-credential
+  variables may pass through; names containing token/key/secret/password/auth
+  markers are withheld unless explicitly listed in
+  `sandbox.credential_env_allowlist`.
 - If `mode: "all"` and Docker is unavailable:
   - `require_runtime: false` -> fallback to host with warning.
   - `require_runtime: true` -> command fails fast.

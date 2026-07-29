@@ -521,7 +521,8 @@ impl LlmProvider for ResilientProvider {
         tools: Option<Vec<ToolDefinition>>,
         text_tx: Option<&UnboundedSender<String>>,
     ) -> Result<MessagesResponse, MicroClawError> {
-        self.call_stream(system, messages, tools, text_tx, None).await
+        self.call_stream(system, messages, tools, text_tx, None)
+            .await
     }
 
     async fn send_message_stream_with_model(
@@ -3003,12 +3004,21 @@ mod tests {
     fn test_retry_backoff_grows_and_is_bounded() {
         // Equal-jitter range is [2^a/2, 2^a], capped at 32s.
         let d1 = retry_backoff(1, None).as_secs();
-        assert!((1..=2).contains(&d1), "attempt 1 backoff {d1}s out of range");
+        assert!(
+            (1..=2).contains(&d1),
+            "attempt 1 backoff {d1}s out of range"
+        );
         let d3 = retry_backoff(3, None).as_secs();
-        assert!((4..=8).contains(&d3), "attempt 3 backoff {d3}s out of range");
+        assert!(
+            (4..=8).contains(&d3),
+            "attempt 3 backoff {d3}s out of range"
+        );
         // Cap holds for large attempts.
         let dbig = retry_backoff(20, None).as_secs();
-        assert!((16..=32).contains(&dbig), "large backoff {dbig}s exceeds cap");
+        assert!(
+            (16..=32).contains(&dbig),
+            "large backoff {dbig}s exceeds cap"
+        );
     }
 
     #[test]
@@ -3020,7 +3030,10 @@ mod tests {
         assert!(!cb.is_open(t0), "one failure below threshold must not open");
         cb.record_failure(t0);
         assert!(cb.is_open(t0), "threshold failures must open the breaker");
-        assert!(cb.is_open(t0 + Duration::from_secs(59)), "open during cooldown");
+        assert!(
+            cb.is_open(t0 + Duration::from_secs(59)),
+            "open during cooldown"
+        );
         assert!(
             !cb.is_open(t0 + Duration::from_secs(61)),
             "closed (half-open probe) after cooldown"

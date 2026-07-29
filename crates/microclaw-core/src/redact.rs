@@ -114,7 +114,10 @@ fn apply_rules(input: &str, rules: &[RedactRule]) -> String {
     let mut out = input.to_string();
     for rule in rules {
         if rule.pattern.is_match(&out) {
-            out = rule.pattern.replace_all(&out, rule.replacement).into_owned();
+            out = rule
+                .pattern
+                .replace_all(&out, rule.replacement)
+                .into_owned();
         }
     }
     out

@@ -14,10 +14,10 @@ use crate::agent_engine::process_with_agent_with_events_guarded;
 use crate::agent_engine::should_suppress_user_error;
 use crate::agent_engine::AgentEvent;
 use crate::agent_engine::AgentRequestContext;
-use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::should_drop_recent_duplicate_message;
 use crate::chat_commands::maybe_handle_plugin_command;
 use crate::chat_commands::{handle_chat_command, is_slash_command, unknown_command_response};
+use crate::chat_turn_queue::PendingMessage;
 use crate::runtime::AppState;
 use crate::setup_def::{ChannelFieldDef, DynamicChannelDef};
 use microclaw_channels::channel::ConversationKind;
@@ -1326,14 +1326,14 @@ pub(crate) fn system_prompt_extension(caller_channel: &str) -> Option<&'static s
 // ACK Reaction (已读标记)
 // ---------------------------------------------------------------------------
 
-const FEISHU_ACK_REACTIONS: &[&str] = &[
-    "OK", "THUMBSUP", "DONE", "SMILE", "APPLAUSE", "MUSCLE",
-];
+const FEISHU_ACK_REACTIONS: &[&str] = &["OK", "THUMBSUP", "DONE", "SMILE", "APPLAUSE", "MUSCLE"];
 
 fn pick_uniform_index(len: usize, seed: &str) -> usize {
     debug_assert!(len > 0);
     // Simple hash-based selection using message text as seed
-    let hash: u64 = seed.bytes().fold(0u64, |acc, b| acc.wrapping_mul(33).wrapping_add(b as u64));
+    let hash: u64 = seed
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(33).wrapping_add(b as u64));
     (hash as usize) % len
 }
 
@@ -2463,38 +2463,38 @@ async fn handle_feishu_event(
 
     // Send ACK reaction (已读标记) — only when enabled in config
     if feishu_cfg.ack_reaction {
-    let ack_http_client = http_client.clone();
-    let ack_base_url = base_url.to_string();
-    let ack_app_id = feishu_cfg.app_id.clone();
-    let ack_app_secret = feishu_cfg.app_secret.clone();
-    let ack_message_id = message_id.to_string();
-    let ack_text = text.clone();
-    tokio::spawn(async move {
-        // Send ACK reaction with locale-aware emoji
-        let emoji = random_feishu_ack_reaction(&ack_text);
-        let token = match get_token(
-            &ack_http_client,
-            &ack_base_url,
-            &ack_app_id,
-            &ack_app_secret,
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        if let Err(e) = send_feishu_reaction(
-            &ack_http_client,
-            &ack_base_url,
-            &token,
-            &ack_message_id,
-            emoji,
-        )
-        .await
-        {
-            warn!("Feishu: ACK reaction failed for {}: {}", ack_message_id, e);
-        }
-    });
+        let ack_http_client = http_client.clone();
+        let ack_base_url = base_url.to_string();
+        let ack_app_id = feishu_cfg.app_id.clone();
+        let ack_app_secret = feishu_cfg.app_secret.clone();
+        let ack_message_id = message_id.to_string();
+        let ack_text = text.clone();
+        tokio::spawn(async move {
+            // Send ACK reaction with locale-aware emoji
+            let emoji = random_feishu_ack_reaction(&ack_text);
+            let token = match get_token(
+                &ack_http_client,
+                &ack_base_url,
+                &ack_app_id,
+                &ack_app_secret,
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            if let Err(e) = send_feishu_reaction(
+                &ack_http_client,
+                &ack_base_url,
+                &token,
+                &ack_message_id,
+                emoji,
+            )
+            .await
+            {
+                warn!("Feishu: ACK reaction failed for {}: {}", ack_message_id, e);
+            }
+        });
     }
 
     // Group mentions: direct @bot and @all are treated as mention signals.
@@ -2960,9 +2960,9 @@ async fn handle_feishu_message(
                         }
                     }
                     Ok(Some(AgentEvent::MidTurnInjection { count })) => {
-                        lines.push(
-                            crate::channels::event_tap::mid_turn_injection_ack_text(count),
-                        );
+                        lines.push(crate::channels::event_tap::mid_turn_injection_ack_text(
+                            count,
+                        ));
                         dirty = true;
                     }
                     Ok(Some(_)) => {}
@@ -3244,8 +3244,7 @@ async fn handle_feishu_message(
                     let chat = chat_for_tap.clone();
                     let reply_to = reply_to_for_tap.clone();
                     Box::pin(async move {
-                        let text =
-                            crate::channels::event_tap::mid_turn_injection_ack_text(count);
+                        let text = crate::channels::event_tap::mid_turn_injection_ack_text(count);
                         if let Err(e) = send_feishu_response(
                             &http,
                             &base,

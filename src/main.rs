@@ -602,7 +602,11 @@ fn handle_audit_cli(cmd: AuditCommand) -> anyhow::Result<i32> {
                 println!(
                     "Audit chain intact: {} sealed entr{} verified.",
                     status.sealed_entries,
-                    if status.sealed_entries == 1 { "y" } else { "ies" }
+                    if status.sealed_entries == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
                 );
                 Ok(0)
             } else {
@@ -611,9 +615,15 @@ fn handle_audit_cli(cmd: AuditCommand) -> anyhow::Result<i32> {
                     status.broken_at.unwrap_or(-1),
                     status.reason.as_deref().unwrap_or("unknown"),
                 );
-                eprintln!("({} entr{} verified before the break)",
+                eprintln!(
+                    "({} entr{} verified before the break)",
                     status.sealed_entries.saturating_sub(1),
-                    if status.sealed_entries.saturating_sub(1) == 1 { "y" } else { "ies" });
+                    if status.sealed_entries.saturating_sub(1) == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                );
                 Ok(1)
             }
         }
@@ -736,7 +746,9 @@ async fn main() -> anyhow::Result<()> {
                     println!("Next steps:");
                     println!("  1) microclaw doctor          # verify your setup");
                     println!("     microclaw doctor --online # …and test the API key/model with a live request");
-                    println!("  2) microclaw start           # start the bot on the enabled channels");
+                    println!(
+                        "  2) microclaw start           # start the bot on the enabled channels"
+                    );
                 } else {
                     println!("Setup canceled");
                 }

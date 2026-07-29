@@ -145,10 +145,7 @@ pub fn decide_next_run(
         "cron" => {
             use std::str::FromStr;
             match cron::Schedule::from_str(schedule_value) {
-                Ok(schedule) => schedule
-                    .upcoming(tz)
-                    .next()
-                    .map(|t| t.with_timezone(&Utc)),
+                Ok(schedule) => schedule.upcoming(tz).next().map(|t| t.with_timezone(&Utc)),
                 Err(_) => None,
             }
         }

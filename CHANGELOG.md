@@ -6,8 +6,65 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+## 0.3.2 - 2026-07-28
+
 ### Added
 
+- **Comparative reflection and governed skill evolution.** Comparable
+  success/failure runs now produce versioned, counterexample-bearing learning
+  claims and immutable candidate skill patches. Paired shadow observations
+  gate promotion using risk-adjusted utility, cost, and regression thresholds;
+  promoted candidates automatically roll back to the previous trusted version
+  on verified regression. Web and CLI Learning Journals expose evidence,
+  impact scope, evaluation state, and undo actions.
+- **Failure-aware retrieval and skill recovery.** Verified failures and active
+  task-scoped skill contraindications are excluded from prompt injection while
+  their rejection reasons remain visible in the Learning Journal. Structured
+  failure patterns track environment, tool, error category, cooldown, recovery
+  trials, and automatic resolution from verified successes.
+- **Task-signature and risk-adjusted skill evaluation.** Experience runs now
+  carry a deterministic v1 task type, task family, capability tags, and stable
+  signature hash, with schema-v38 backfill for existing history. Skill quality
+  is aggregated overall and per task family with a configurable Wilson lower
+  bound. Trial promotion requires both raw success and conservative utility;
+  applicability and verified-experience retrieval now incorporate task
+  compatibility, capability overlap, and utility rather than relying only on
+  text and environment matches.
+- **Verified long-horizon learning substrate.** Agent turns now produce durable
+  goal, experience-run, verifier-evidence, skill-version, and attributed
+  skill-outcome records. Governed skills progress through
+  `candidate -> trial -> trusted`, degrade on verified regressions, can be rolled
+  back to a recorded version, and are blocked when repeated failures establish
+  an environment-specific contraindication. `/usage` and Web learning APIs
+  expose the evidence and lifecycle; users can attach human feedback to a run.
+  Experience records also capture token, model-request, tool, error, duration,
+  and estimated-cost metrics. Strongly verified prior runs are recalled for
+  similar tasks as untrusted historical evidence. Multiple human reviews are
+  confidence-aggregated, expiring evidence is excluded, ambiguous multi-skill
+  credit cannot govern skills, and an admin-scoped policy controls promotion
+  and degradation thresholds. All evidence producers now enter through a
+  versioned outcome envelope, human corrections have a normalized
+  `experience_feedback` projection, and retrieval audit logs identify every
+  prior experience injected into a run. `/learning [run_id]` and the
+  run-detail Web API expose the experiences used, activated skills, and
+  supporting evidence for an individual run.
+- **Durable coworker checkpoints.** Interactive agent turns now persist
+  provider-neutral message snapshots at safe model/tool-result boundaries. Fresh safe
+  checkpoints resume automatically after restart; interruptions during tool execution
+  stop with progress/tool evidence and never blindly replay an uncertain side effect.
+  `/status`, Web Governance, and `turn_recovery` audit events expose the lifecycle.
+- **Scoped secure-runtime policy.** Tool authorization can now apply least-privilege
+  grants by chat, channel, and principal (main, scheduler, channel, or subagent), with
+  global policy blocks remaining authoritative. A central egress policy validates
+  configured endpoints and tool-input HTTP(S) destinations, including private/metadata
+  address blocking and host allow/deny lists.
+- **Sandbox credential isolation.** Dotenv files are no longer forwarded wholesale to
+  containers. Credential-like variables are withheld by default and require an exact
+  `sandbox.credential_env_allowlist` entry. Doctor/config self-check and Web Governance
+  expose the new capability, egress, and credential posture.
+- Added RFC 0006 for TypeScript-authored plugins: deterministic locked builds,
+  supervised stdio JSON-RPC host, per-plugin principals, mediated filesystem/network/
+  secret APIs, container isolation, and a phased SDK/runtime/distribution plan.
 - Added `scripts/trigger_release.ps1` so Windows operators can validate and trigger the audited
   tag plus native Windows, macOS, Linux, checksum, and container release workflows with one command.
 - Added the equivalent `scripts/trigger_release.sh` entry point for macOS and Linux release operators.
@@ -53,6 +110,13 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
   rejected, Telegram/Discord/Slack/Feishu now log an actionable message ("authentication
   failed … check the token / run `microclaw setup`") instead of a generic or silent error,
   so a bad token isn't mistaken for the bot just going quiet. Part of the usability push.
+
+### Fixed
+
+- Built-in skill frontmatter now parses consistently from LF and CRLF checkouts, so
+  platform and dependency gates no longer install incompatible skills on Windows.
+- Release verification tests now use platform-native commands, paths, and symlink
+  capabilities across Windows and Unix hosts.
 
 ### Added
 

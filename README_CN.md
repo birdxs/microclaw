@@ -422,6 +422,33 @@ LIMIT 50;
 
 MicroClaw 支持 [Anthropic Agent Skills](https://github.com/anthropics/skills) 标准。技能是为特定任务提供专业能力的模块化包。
 
+智能体创建的技能不会立即被默认信任，而是作为可评估行为接受治理。每个版本先进入
+`candidate`，在经过有验证证据的试用后进入 `trial`，只有积累足够的成功结果才会成为
+`trusted`；验证到回归时会降级。`skill_manage` 可回滚到已记录版本。同一运行环境中的
+重复失败会形成学习到的禁用条件，在发布修正版之前阻止该技能再次激活。
+
+每次智能体执行还会生成 experience run，并关联目标、激活技能、完成证据、运行上下文和
+token、工具调用、错误、费用指标及可选人工反馈。同一聊天中经过强验证的相似经验会作为
+历史证据被召回；这些内容会经过注入扫描，并始终被视为数据而非指令。版本化 outcome
+envelope 统一承接运行完成、工具结果、调度失败、completion contract 和人工纠正；
+召回审计记录会保留本次具体注入了哪些历史经验及选择原因。
+Task Signature v1 会为每次运行确定任务类型、任务族和能力标签。技能质量按相同任务粒度
+分层统计，并计算 Wilson 置信下界；试用技能只有同时达到原始通过率和风险调整效用阈值
+才能晋级。经验检索也会综合任务兼容性和效用下界，而不再只依赖文本及环境匹配。
+失败感知检索会排除已验证失败和命中当前任务禁忌的历史经验，记录拒绝原因，并支持冷却后的
+恢复试用；匹配范围内的验证成功可将禁忌自动标记为已解决。
+对比反思会在相同任务及环境粒度下配对成功与失败运行，蒸馏带反例的版本化结论，并生成隔离
+的候选技能版本。候选版本只有在成对 shadow 证据通过效用、成本和回归门槛后才可晋级；
+晋级时保留旧 trusted 版本，用于自动或人工回滚，全部决策均写入学习日志。
+`/usage` 与 `GET /api/learning_observability` 可查看这些记录；
+Web 设置中的 **Learning** 面板提供按运行查看的证据浏览器；
+`/learning [run_id]` 可查看单次运行使用的经验、技能和结果证据；
+`POST /api/learning/feedback` 可给指定 run 添加 `passed` 或 `failed` 人工判定，
+`GET /api/learning/experiences` 可检索验证经验，
+`GET /api/learning/experiences/:run_id` 可查看完整证据详情，`GET/PUT /api/learning/policy`
+用于读取或由管理员修改生命周期阈值。
+数据模型和晋级规则见[长周期学习](docs/long-horizon-learning.md)。
+
 ```
 <data_dir>/skills/
     pdf/
@@ -466,6 +493,13 @@ MicroClaw 支持 [Anthropic Agent Skills](https://github.com/anthropics/skills) 
 - slash 命令不会写入 agent 会话上下文。
 - 未知 slash 命令返回 `Unknown command.`。
 - 需要中断正在执行的请求时用 `/stop`；仅清空上下文用 `/clear`；清空上下文并重置定时任务用 `/reset`。
+
+## 插件与 TypeScript 方向
+
+当前插件以 YAML/JSON manifest 提供 slash command、动态工具和上下文
+provider。TypeScript 插件计划采用进程外、能力受限的 plugin host，而不是把
+JavaScript 引擎嵌入 Rust 主进程。协议、安全模型、依赖锁定、打包规则与分阶段
+落地计划见 `docs/rfcs/0006-typescript-plugin-host.md`。
 
 ## MCP
 
@@ -1037,6 +1071,29 @@ microclaw gateway uninstall
 
 `*` 需要至少启用一个渠道配置；`web_enabled` 默认是开启的。
 
+## Durable Coworker 与 Secure Runtime
+
+交互式 agent turn 会在 provider 无关的安全边界持久化检查点。进程在模型调用前
+或工具结果落库后退出时，重启后可自动继续；如果退出发生在工具执行中，运行时会
+停止并保留工具与进度证据，请用户核对外部状态，绝不会盲目重放可能已生效的副作用。
+`/status` 与 Web Governance 面板可查看活动检查点和最近的恢复结果。
+
+安全运行时由三层策略组成：
+
+- `tool_policy.grants_mode` 与 `tool_policy.grants`：按 chat、channel 和
+  principal（包括 `subagent:*`）分配最小工具能力，且不能放宽全局拒绝规则。
+- `egress_policy`：在共享工具边界检查 HTTP(S) 目标，并在启动时校验已配置
+  endpoint；生产环境可使用 `allow_hosts` 收紧到明确域名。
+- `sandbox.credential_env_allowlist`：dotenv 文件不会整份传入容器；疑似 token、
+  key、secret、password 或 auth 的变量默认隔离，只有精确列名才会放行。
+
+命令可能动态构造网络目标，因此需要强保证时仍应保持
+`sandbox.mode: all`、`sandbox.no_network: true`、`require_runtime: true` 和
+`security_profile: hardened`。运行 `microclaw doctor` 可检查上述策略是否启用。
+
+运维与故障注入说明见 `docs/operations/durable-coworker.md`，完整安全配置与渐进
+启用步骤见 `docs/security/secure-runtime.md`。
+
 ## Docker 沙箱
 
 用于让 `bash` 工具在 Docker 容器执行，而不是在宿主执行。
@@ -1057,7 +1114,8 @@ sandbox:
   image: "ubuntu:25.10"
   container_prefix: "microclaw-sandbox"
   no_network: true
-  require_runtime: false
+  require_runtime: true
+  credential_env_allowlist: [] # 默认不向容器传入疑似凭据变量
   # 可选外部白名单文件
   # mount_allowlist_path: "~/.microclaw/sandbox-mount-allowlist.txt"
 ```
@@ -1076,6 +1134,8 @@ microclaw start
 
 说明：
 - `sandbox.mode: "off"`（默认）时，`bash` 在宿主执行。
+- dotenv 文件不会整份传给容器；疑似凭据变量仅在
+  `sandbox.credential_env_allowlist` 精确列出时放行。
 - `mode: "all"` 但 Docker 不可用时：
   - `require_runtime: false`：降级宿主执行并告警。
   - `require_runtime: true`：直接报错，不降级。

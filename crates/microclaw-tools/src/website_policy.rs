@@ -115,7 +115,9 @@ fn parse_robots_txt(text: &str, our_agent: &str) -> RobotsRules {
     }
 
     // Our-agent rules take precedence; fall back to '*'.
-    if our_rules.disallow.is_empty() && our_rules.allow.is_empty() && our_rules.crawl_delay.is_none()
+    if our_rules.disallow.is_empty()
+        && our_rules.allow.is_empty()
+        && our_rules.crawl_delay.is_none()
     {
         our_rules = star_rules;
     }
@@ -141,7 +143,9 @@ fn evaluate_path(rules: &RobotsRules, path: &str) -> CrawlHint {
     if best_disallow > best_allow {
         CrawlHint {
             allowed: false,
-            reason: Some(format!("disallowed by robots.txt (rule len {best_disallow})")),
+            reason: Some(format!(
+                "disallowed by robots.txt (rule len {best_disallow})"
+            )),
             crawl_delay_secs: rules.crawl_delay,
         }
     } else {
@@ -156,11 +160,7 @@ fn evaluate_path(rules: &RobotsRules, path: &str) -> CrawlHint {
 /// Fetch (or reuse) robots.txt for the host of `url` and return a hint
 /// about whether the agent should proceed. Fail-open: network / 4xx /
 /// 5xx → allowed.
-pub async fn consult_robots(
-    client: &reqwest::Client,
-    url: &Url,
-    user_agent: &str,
-) -> CrawlHint {
+pub async fn consult_robots(client: &reqwest::Client, url: &Url, user_agent: &str) -> CrawlHint {
     let Some(host) = url.host_str() else {
         return CrawlHint {
             allowed: true,

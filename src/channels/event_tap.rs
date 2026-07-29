@@ -36,9 +36,8 @@ pub struct EventTap {
 }
 
 /// Async callback invoked when a `MidTurnInjection` event is observed.
-pub type InjectionAck = Box<
-    dyn Fn(usize) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
->;
+pub type InjectionAck =
+    Box<dyn Fn(usize) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 
 /// Throttle settings for the Phase-3 progress heartbeat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,9 +53,8 @@ pub struct ProgressConfig {
 /// progress message, later calls edit it in place, and the terminal call
 /// (fired once when the turn ends, only if progress was ever shown)
 /// finalizes it.
-pub type ProgressEmit = Box<
-    dyn Fn(String, bool) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
->;
+pub type ProgressEmit =
+    Box<dyn Fn(String, bool) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 
 /// One-line progress text from the tap's view of the turn.
 pub fn progress_text(iteration: usize, last_tool: Option<&str>) -> String {
@@ -116,14 +114,12 @@ impl EventTap {
                     _ => {}
                 }
                 if let Some((cfg, emit)) = progress.as_ref() {
-                    let long_enough =
-                        turn_start.elapsed().as_secs() >= cfg.min_turn_secs;
+                    let long_enough = turn_start.elapsed().as_secs() >= cfg.min_turn_secs;
                     let spaced = last_emit
                         .map(|t| t.elapsed().as_secs() >= cfg.interval_secs.max(5))
                         .unwrap_or(true);
                     if long_enough && spaced {
-                        emit(progress_text(iteration.max(1), last_tool.as_deref()), false)
-                            .await;
+                        emit(progress_text(iteration.max(1), last_tool.as_deref()), false).await;
                         emitted = true;
                         last_emit = Some(tokio::time::Instant::now());
                     }
@@ -219,9 +215,7 @@ pub fn mid_turn_injection_ack_text(count: usize) -> String {
     if count == 1 {
         "📥 Got 1 follow-up message — folding it into the current turn.".to_string()
     } else {
-        format!(
-            "📥 Got {count} follow-up messages — folding them into the current turn."
-        )
+        format!("📥 Got {count} follow-up messages — folding them into the current turn.")
     }
 }
 
@@ -249,10 +243,8 @@ mod tests {
             input: serde_json::json!({}),
         })
         .unwrap();
-        tx.send(AgentEvent::FinalResponse {
-            text: "ok".into(),
-        })
-        .unwrap();
+        tx.send(AgentEvent::FinalResponse { text: "ok".into() })
+            .unwrap();
         drop(tx);
 
         let mut received = Vec::new();

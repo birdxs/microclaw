@@ -89,7 +89,8 @@ impl ChatTurnQueue {
             slots.retain(|_, slot_arc| {
                 // Only remove if we can try-lock it (not actively held)
                 if let Ok(slot) = slot_arc.try_lock() {
-                    if slot.pending_messages.is_empty() && now.duration_since(slot.last_active) > ttl
+                    if slot.pending_messages.is_empty()
+                        && now.duration_since(slot.last_active) > ttl
                     {
                         return false; // remove
                     }
@@ -105,11 +106,7 @@ impl ChatTurnQueue {
 
     /// Acquire the turn for a chat. Blocks until the previous run completes.
     /// Returns a [`TurnGuard`] that releases the turn when dropped.
-    pub async fn acquire(
-        self: &Arc<Self>,
-        channel: &str,
-        chat_id: i64,
-    ) -> Option<TurnGuard> {
+    pub async fn acquire(self: &Arc<Self>, channel: &str, chat_id: i64) -> Option<TurnGuard> {
         let key: ChatKey = (channel.to_string(), chat_id);
         let slot_arc = self.get_slot(&key).await;
 
@@ -119,7 +116,8 @@ impl ChatTurnQueue {
         };
 
         // Acquire with timeout to prevent deadlock (e.g., recursive same-chat calls).
-        let guard = match tokio::time::timeout(Duration::from_secs(60), turn_lock.lock_owned()).await
+        let guard = match tokio::time::timeout(Duration::from_secs(60), turn_lock.lock_owned())
+            .await
         {
             Ok(guard) => guard,
             Err(_) => {
@@ -137,28 +135,16 @@ impl ChatTurnQueue {
             slot.last_active = Instant::now();
         }
 
-        debug!(
-            channel,
-            chat_id,
-            "Chat turn acquired"
-        );
+        debug!(channel, chat_id, "Chat turn acquired");
 
-        Some(TurnGuard {
-            _guard: guard,
-            key,
-        })
+        Some(TurnGuard { _guard: guard, key })
     }
 
     /// Enqueue a message for a chat that currently has an active run.
     ///
     /// Returns `true` if the chat has an active run (message was queued).
     /// Returns `false` if no run is active (caller should start a new run).
-    pub async fn enqueue_if_busy(
-        &self,
-        channel: &str,
-        chat_id: i64,
-        msg: PendingMessage,
-    ) -> bool {
+    pub async fn enqueue_if_busy(&self, channel: &str, chat_id: i64, msg: PendingMessage) -> bool {
         let key: ChatKey = (channel.to_string(), chat_id);
         let slot_arc = {
             let slots = self.slots.lock().await;

@@ -186,7 +186,12 @@ fn load_skills(skills_dir: &Path) -> Vec<ParsedSkill> {
 }
 
 /// Run the audit against a parsed corpus at a fixed `now` (injected for tests).
-fn audit_at(skills_dir: &str, skills: &[ParsedSkill], cfg: &AuditConfig, now: DateTime<Utc>) -> AuditReport {
+fn audit_at(
+    skills_dir: &str,
+    skills: &[ParsedSkill],
+    cfg: &AuditConfig,
+    now: DateTime<Utc>,
+) -> AuditReport {
     // Near-duplicates: every unordered pair at or above the threshold.
     let mut near_duplicates = Vec::new();
     for i in 0..skills.len() {
@@ -226,11 +231,17 @@ fn audit_at(skills_dir: &str, skills: &[ParsedSkill], cfg: &AuditConfig, now: Da
             None => true, // missing/unparseable timestamp: can't prove fresh
         };
         if is_stale {
-            stale.push(StaleSkill { name: s.name.clone(), age_days: age });
+            stale.push(StaleSkill {
+                name: s.name.clone(),
+                age_days: age,
+            });
         }
 
         if s.body_chars < cfg.min_body_chars {
-            thin.push(ThinSkill { name: s.name.clone(), body_chars: s.body_chars });
+            thin.push(ThinSkill {
+                name: s.name.clone(),
+                body_chars: s.body_chars,
+            });
         }
     }
 
@@ -295,7 +306,10 @@ fn print_text(r: &AuditReport) {
             } else {
                 format!("retire candidate(s): {}", d.retire_candidates.join(", "))
             };
-            println!("  - {} ~ {}  (similarity {:.3}; {})", d.a, d.b, d.similarity, retire);
+            println!(
+                "  - {} ~ {}  (similarity {:.3}; {})",
+                d.a, d.b, d.similarity, retire
+            );
         }
     }
 
@@ -339,7 +353,13 @@ fn print_text(r: &AuditReport) {
 mod tests {
     use super::*;
 
-    fn skill(name: &str, source: &str, desc: &str, updated_at: Option<&str>, body_chars: usize) -> ParsedSkill {
+    fn skill(
+        name: &str,
+        source: &str,
+        desc: &str,
+        updated_at: Option<&str>,
+        body_chars: usize,
+    ) -> ParsedSkill {
         let mut tokens = tokenize(name);
         tokens.extend(tokenize(desc));
         ParsedSkill {
@@ -369,21 +389,48 @@ mod tests {
     #[test]
     fn flags_near_duplicate_and_marks_agent_side() {
         let skills = vec![
-            skill("deploy-web", "builtin", "deploy the web server to production", None, 500),
-            skill("ship-web", "agent-created", "deploy the web server to production", Some("2026-06-01T00:00:00Z"), 500),
+            skill(
+                "deploy-web",
+                "builtin",
+                "deploy the web server to production",
+                None,
+                500,
+            ),
+            skill(
+                "ship-web",
+                "agent-created",
+                "deploy the web server to production",
+                Some("2026-06-01T00:00:00Z"),
+                500,
+            ),
         ];
         let r = audit_at("d", &skills, &AuditConfig::default(), now());
         assert_eq!(r.near_duplicates.len(), 1);
         // Only the agent-created side is a retire candidate.
-        assert_eq!(r.near_duplicates[0].retire_candidates, vec!["ship-web".to_string()]);
+        assert_eq!(
+            r.near_duplicates[0].retire_candidates,
+            vec!["ship-web".to_string()]
+        );
         assert!(r.has_findings());
     }
 
     #[test]
     fn distinct_skills_are_clean() {
         let skills = vec![
-            skill("bake-cake", "builtin", "bake a chocolate cake in the oven", None, 500),
-            skill("file-taxes", "builtin", "compute and submit annual income taxes", None, 500),
+            skill(
+                "bake-cake",
+                "builtin",
+                "bake a chocolate cake in the oven",
+                None,
+                500,
+            ),
+            skill(
+                "file-taxes",
+                "builtin",
+                "compute and submit annual income taxes",
+                None,
+                500,
+            ),
         ];
         let r = audit_at("d", &skills, &AuditConfig::default(), now());
         assert!(r.near_duplicates.is_empty());
@@ -394,11 +441,29 @@ mod tests {
     fn stale_only_applies_to_agent_created() {
         let skills = vec![
             // Old built-in: immutable, never flagged stale.
-            skill("old-builtin", "builtin", "alpha beta gamma", Some("2000-01-01T00:00:00Z"), 500),
+            skill(
+                "old-builtin",
+                "builtin",
+                "alpha beta gamma",
+                Some("2000-01-01T00:00:00Z"),
+                500,
+            ),
             // Old agent skill: stale.
-            skill("old-agent", "agent-created", "delta epsilon zeta", Some("2026-01-01T00:00:00Z"), 500),
+            skill(
+                "old-agent",
+                "agent-created",
+                "delta epsilon zeta",
+                Some("2026-01-01T00:00:00Z"),
+                500,
+            ),
             // Fresh agent skill: not stale.
-            skill("fresh-agent", "agent-created", "eta theta iota", Some("2026-06-03T00:00:00Z"), 500),
+            skill(
+                "fresh-agent",
+                "agent-created",
+                "eta theta iota",
+                Some("2026-06-03T00:00:00Z"),
+                500,
+            ),
         ];
         let r = audit_at("d", &skills, &AuditConfig::default(), now());
         let names: Vec<&str> = r.stale.iter().map(|s| s.name.as_str()).collect();
@@ -407,7 +472,13 @@ mod tests {
 
     #[test]
     fn missing_timestamp_is_stale() {
-        let skills = vec![skill("no-date", "agent-created", "kappa lambda mu", None, 500)];
+        let skills = vec![skill(
+            "no-date",
+            "agent-created",
+            "kappa lambda mu",
+            None,
+            500,
+        )];
         let r = audit_at("d", &skills, &AuditConfig::default(), now());
         assert_eq!(r.stale.len(), 1);
         assert_eq!(r.stale[0].age_days, None);
@@ -416,8 +487,20 @@ mod tests {
     #[test]
     fn thin_body_flagged() {
         let skills = vec![
-            skill("thin", "agent-created", "nu xi omicron", Some("2026-06-03T00:00:00Z"), 10),
-            skill("rich", "agent-created", "pi rho sigma", Some("2026-06-03T00:00:00Z"), 500),
+            skill(
+                "thin",
+                "agent-created",
+                "nu xi omicron",
+                Some("2026-06-03T00:00:00Z"),
+                10,
+            ),
+            skill(
+                "rich",
+                "agent-created",
+                "pi rho sigma",
+                Some("2026-06-03T00:00:00Z"),
+                500,
+            ),
         ];
         let r = audit_at("d", &skills, &AuditConfig::default(), now());
         let names: Vec<&str> = r.thin.iter().map(|t| t.name.as_str()).collect();
@@ -426,10 +509,25 @@ mod tests {
 
     #[test]
     fn cap_at_capacity() {
-        let cfg = AuditConfig { max_agent_skills: 2, ..AuditConfig::default() };
+        let cfg = AuditConfig {
+            max_agent_skills: 2,
+            ..AuditConfig::default()
+        };
         let skills = vec![
-            skill("a", "agent-created", "aaa bbb ccc", Some("2026-06-03T00:00:00Z"), 500),
-            skill("b", "agent-created", "ddd eee fff", Some("2026-06-03T00:00:00Z"), 500),
+            skill(
+                "a",
+                "agent-created",
+                "aaa bbb ccc",
+                Some("2026-06-03T00:00:00Z"),
+                500,
+            ),
+            skill(
+                "b",
+                "agent-created",
+                "ddd eee fff",
+                Some("2026-06-03T00:00:00Z"),
+                500,
+            ),
         ];
         let r = audit_at("d", &skills, &cfg, now());
         assert!(r.cap.at_capacity);

@@ -22,7 +22,9 @@ const MAX_SEGMENTS: usize = 40;
 
 /// Trim and reject blank optional strings (e.g. an explicitly-empty config key).
 fn nonempty(s: Option<&str>) -> Option<String> {
-    s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Native "generate a podcast" tool.
@@ -195,9 +197,7 @@ impl Tool for GeneratePodcastTool {
             return ToolResult::error(format!("failed to create work dir: {e}"));
         }
 
-        let result = self
-            .build_episode(&client, &work, &segments)
-            .await;
+        let result = self.build_episode(&client, &work, &segments).await;
         // Best-effort cleanup of scratch files regardless of outcome.
         let _ = std::fs::remove_dir_all(&work);
 
@@ -294,7 +294,8 @@ impl GeneratePodcastTool {
         }
 
         let list_path = work.join("concat.txt");
-        std::fs::write(&list_path, &list).map_err(|e| format!("failed to write concat list: {e}"))?;
+        std::fs::write(&list_path, &list)
+            .map_err(|e| format!("failed to write concat list: {e}"))?;
         let out_path = work.join("episode.mp3");
 
         // Re-encode (rather than `-c copy`) so segments + silence with slightly
@@ -319,7 +320,14 @@ impl GeneratePodcastTool {
             .map_err(|e| format!("ffmpeg concat failed to start: {e}"))?;
         if !status.status.success() {
             let err = String::from_utf8_lossy(&status.stderr);
-            let tail: String = err.chars().rev().take(500).collect::<String>().chars().rev().collect();
+            let tail: String = err
+                .chars()
+                .rev()
+                .take(500)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
             return Err(format!("ffmpeg concat failed: {tail}"));
         }
 
@@ -427,7 +435,14 @@ async fn render_silence(ffmpeg_path: &str, out: &Path, pause_ms: u32) -> Result<
         .map_err(|e| format!("ffmpeg silence render failed to start: {e}"))?;
     if !res.status.success() {
         let err = String::from_utf8_lossy(&res.stderr);
-        let tail: String = err.chars().rev().take(300).collect::<String>().chars().rev().collect();
+        let tail: String = err
+            .chars()
+            .rev()
+            .take(300)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         return Err(format!("ffmpeg silence render failed: {tail}"));
     }
     Ok(())
@@ -440,12 +455,9 @@ async fn deliver_attachment(
     file: &Path,
     caption: &str,
 ) -> Result<String, String> {
-    let routing = microclaw_channels::channel::get_required_chat_routing(
-        channels,
-        db.clone(),
-        chat_id,
-    )
-    .await?;
+    let routing =
+        microclaw_channels::channel::get_required_chat_routing(channels, db.clone(), chat_id)
+            .await?;
     let Some(adapter) = channels.get(&routing.channel_name) else {
         return Err(format!("no adapter for channel '{}'", routing.channel_name));
     };
@@ -456,12 +468,11 @@ async fn deliver_attachment(
             file.display()
         ));
     }
-    let external_chat_id = microclaw_storage::db::call_blocking(db.clone(), move |d| {
-        d.get_chat_external_id(chat_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .unwrap_or_else(|| chat_id.to_string());
+    let external_chat_id =
+        microclaw_storage::db::call_blocking(db.clone(), move |d| d.get_chat_external_id(chat_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| chat_id.to_string());
     let caption_short = caption.chars().take(120).collect::<String>();
     match adapter
         .send_attachment(&external_chat_id, file, Some(&caption_short))
@@ -540,10 +551,8 @@ mod tests {
             .or_else(|_| std::env::var("MICROCLAW_OPENAI_API_KEY"))
             .expect("set OPENAI_API_KEY (or MICROCLAW_OPENAI_API_KEY) to run this live test");
 
-        let work = std::env::temp_dir().join(format!(
-            "microclaw_podcast_live_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let work =
+            std::env::temp_dir().join(format!("microclaw_podcast_live_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&work).unwrap();
 
         let mut cfg = crate::config::Config::test_defaults();
@@ -559,11 +568,7 @@ mod tests {
         let db_dir = work.join("db");
         std::fs::create_dir_all(&db_dir).unwrap();
         let db = Arc::new(Database::new(db_dir.to_str().unwrap()).unwrap());
-        let tool = GeneratePodcastTool::new(
-            &cfg,
-            Arc::new(ChannelRegistry::new()),
-            db,
-        );
+        let tool = GeneratePodcastTool::new(&cfg, Arc::new(ChannelRegistry::new()), db);
 
         let input = json!({
             "title": "MicroClaw Live Test",
@@ -583,9 +588,12 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("metadata.path missing");
         let bytes = std::fs::read(path).unwrap();
-        assert!(bytes.len() > 5000, "episode too small: {} bytes", bytes.len());
-        let is_mp3 =
-            bytes.starts_with(b"ID3") || (bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0);
+        assert!(
+            bytes.len() > 5000,
+            "episode too small: {} bytes",
+            bytes.len()
+        );
+        let is_mp3 = bytes.starts_with(b"ID3") || (bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0);
         assert!(
             is_mp3,
             "output is not mp3 (first bytes {:02X} {:02X})",

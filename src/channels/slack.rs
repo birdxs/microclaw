@@ -12,13 +12,13 @@ use crate::agent_engine::process_with_agent_with_events_guarded;
 use crate::agent_engine::should_suppress_user_error;
 use crate::agent_engine::AgentEvent;
 use crate::agent_engine::AgentRequestContext;
-use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::{
     mark_channel_started, parse_epoch_ms_from_seconds_fraction, should_drop_pre_start_message,
     should_drop_recent_duplicate_message,
 };
 use crate::chat_commands::maybe_handle_plugin_command;
 use crate::chat_commands::{handle_chat_command, is_slash_command, unknown_command_response};
+use crate::chat_turn_queue::PendingMessage;
 use crate::runtime::AppState;
 use crate::setup_def::{ChannelFieldDef, DynamicChannelDef};
 use crate::tools::ToolAuthContext;
@@ -561,7 +561,10 @@ async fn upload_slack_voice_reply(
     let client = reqwest::Client::new();
     let resp = client
         .post("https://slack.com/api/files.upload")
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {bot_token}"))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {bot_token}"),
+        )
         .multipart(form)
         .send()
         .await
@@ -1379,6 +1382,7 @@ async fn handle_slack_message(
             let auth = ToolAuthContext {
                 caller_channel: runtime.channel_name.clone(),
                 caller_chat_id: chat_id,
+                principal: "channel:slack".to_string(),
                 control_chat_ids: app_state.config.control_chat_ids.clone(),
                 env_files: Vec::new(),
             };
@@ -1552,8 +1556,7 @@ async fn handle_slack_message(
                     );
                 }
             } else if !response.is_empty() {
-                match send_slack_response(bot_token, channel, normalized_thread_ts, &response)
-                    .await
+                match send_slack_response(bot_token, channel, normalized_thread_ts, &response).await
                 {
                     Ok(()) => {
                         let bot_msg = StoredMessage {

@@ -48,7 +48,9 @@ mod tests {
 
     #[test]
     fn long_running_chats_get_a_familiar_nudge() {
-        assert!(familiarity_hint(200).unwrap().contains("go back a long way"));
+        assert!(familiarity_hint(200)
+            .unwrap()
+            .contains("go back a long way"));
         assert!(familiarity_hint(5000).is_some());
     }
 }

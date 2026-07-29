@@ -54,9 +54,11 @@ pub struct ToolMetrics {
     pub tool_errors: i64,
 }
 
-
 /// Resolve the effective concurrency class for a tool, respecting config overrides.
-fn resolve_concurrency_class(name: &str, overrides: &HashMap<String, String>) -> ToolConcurrencyClass {
+fn resolve_concurrency_class(
+    name: &str,
+    overrides: &HashMap<String, String>,
+) -> ToolConcurrencyClass {
     if let Some(override_str) = overrides.get(name) {
         if let Some(class) = parse_concurrency_class(override_str) {
             return class;
@@ -212,9 +214,7 @@ pub async fn execute_tool_batch(
         }
 
         if let Some(tx) = event_tx {
-            let _ = tx.send(AgentEvent::ToolWaveComplete {
-                wave: wave_idx + 1,
-            });
+            let _ = tx.send(AgentEvent::ToolWaveComplete { wave: wave_idx + 1 });
         }
     }
 
@@ -300,8 +300,7 @@ async fn execute_single_tool(
     } else if ctx.consecutive_send_message_calls >= 3 {
         warn!(
             chat_id,
-            iteration,
-            "Guardrail: blocking repeated send_message loop"
+            iteration, "Guardrail: blocking repeated send_message loop"
         );
         let content = "send_message blocked: too many consecutive send_message calls in one request. Use normal assistant reply for final output instead of repeatedly calling send_message.".to_string();
         ctx.failed_tools.insert(name.clone());
@@ -317,8 +316,7 @@ async fn execute_single_tool(
     }
 
     // Feishu send_message text restriction
-    let is_feishu_turn =
-        caller_channel.starts_with("feishu") || caller_channel.starts_with("lark");
+    let is_feishu_turn = caller_channel.starts_with("feishu") || caller_channel.starts_with("lark");
     let send_message_has_attachment = input
         .get("attachment_path")
         .and_then(|v| v.as_str())
@@ -633,10 +631,7 @@ async fn maybe_spill_to_artifact(
     }
 
     let head: String = content.chars().take(head_chars).collect();
-    let tail: String = content
-        .chars()
-        .skip(total_chars - tail_chars)
-        .collect();
+    let tail: String = content.chars().skip(total_chars - tail_chars).collect();
     let hidden = total_chars - head_chars - tail_chars;
     format!(
         "{head}\n\n[--- {hidden} of {total_chars} characters truncated. \
@@ -881,10 +876,7 @@ fn emit_tool_span(
     start_time: u64,
     span_name: &str,
 ) {
-    let mut attrs = vec![
-        kv("tool.name", name),
-        kv("input", &input.to_string()),
-    ];
+    let mut attrs = vec![kv("tool.name", name), kv("input", &input.to_string())];
     if result.is_error {
         attrs.push(kv(
             "error.type",
@@ -935,9 +927,21 @@ mod tests {
     #[test]
     fn test_partition_all_readonly_parallel() {
         let calls = vec![
-            PendingToolCall { id: "1".into(), name: "read_file".into(), input: Value::Null },
-            PendingToolCall { id: "2".into(), name: "glob".into(), input: Value::Null },
-            PendingToolCall { id: "3".into(), name: "web_search".into(), input: Value::Null },
+            PendingToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                input: Value::Null,
+            },
+            PendingToolCall {
+                id: "2".into(),
+                name: "glob".into(),
+                input: Value::Null,
+            },
+            PendingToolCall {
+                id: "3".into(),
+                name: "web_search".into(),
+                input: Value::Null,
+            },
         ];
         let waves = partition_into_waves(&calls, &HashMap::new());
         assert_eq!(waves, vec![vec![0, 1, 2]]);
@@ -946,9 +950,21 @@ mod tests {
     #[test]
     fn test_partition_mixed_readonly_sideeffect() {
         let calls = vec![
-            PendingToolCall { id: "1".into(), name: "read_file".into(), input: Value::Null },
-            PendingToolCall { id: "2".into(), name: "write_file".into(), input: Value::Null },
-            PendingToolCall { id: "3".into(), name: "glob".into(), input: Value::Null },
+            PendingToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                input: Value::Null,
+            },
+            PendingToolCall {
+                id: "2".into(),
+                name: "write_file".into(),
+                input: Value::Null,
+            },
+            PendingToolCall {
+                id: "3".into(),
+                name: "glob".into(),
+                input: Value::Null,
+            },
         ];
         let waves = partition_into_waves(&calls, &HashMap::new());
         // Wave 1: readonly [0, 2], Wave 2: sideeffect [1]
@@ -958,9 +974,21 @@ mod tests {
     #[test]
     fn test_partition_exclusive_alone() {
         let calls = vec![
-            PendingToolCall { id: "1".into(), name: "read_file".into(), input: Value::Null },
-            PendingToolCall { id: "2".into(), name: "bash".into(), input: Value::Null },
-            PendingToolCall { id: "3".into(), name: "glob".into(), input: Value::Null },
+            PendingToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                input: Value::Null,
+            },
+            PendingToolCall {
+                id: "2".into(),
+                name: "bash".into(),
+                input: Value::Null,
+            },
+            PendingToolCall {
+                id: "3".into(),
+                name: "glob".into(),
+                input: Value::Null,
+            },
         ];
         let waves = partition_into_waves(&calls, &HashMap::new());
         // Wave 1: readonly [0, 2], Wave 2: exclusive [1]
@@ -973,8 +1001,16 @@ mod tests {
         overrides.insert("mcp_custom_search".to_string(), "read_only".to_string());
 
         let calls = vec![
-            PendingToolCall { id: "1".into(), name: "read_file".into(), input: Value::Null },
-            PendingToolCall { id: "2".into(), name: "mcp_custom_search".into(), input: Value::Null },
+            PendingToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                input: Value::Null,
+            },
+            PendingToolCall {
+                id: "2".into(),
+                name: "mcp_custom_search".into(),
+                input: Value::Null,
+            },
         ];
         let waves = partition_into_waves(&calls, &overrides);
         // Both should be in single parallel wave (mcp_custom_search overridden to ReadOnly)

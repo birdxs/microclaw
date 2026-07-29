@@ -272,7 +272,11 @@ fn build_digest(queries: &[String], sources: &[Source], no_result_queries: &[usi
         let gaps: Vec<String> = no_result_queries.iter().map(|n| n.to_string()).collect();
         out.push_str(&format!(
             "- ⚠️ Coverage gap: sub-quer{} {} returned no results.\n",
-            if no_result_queries.len() == 1 { "y" } else { "ies" },
+            if no_result_queries.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
             gaps.join(", ")
         ));
     }
@@ -291,10 +295,7 @@ fn plural(n: usize) -> &'static str {
 }
 
 fn domain_of(url: &str) -> String {
-    let no_scheme = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url);
+    let no_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let host = no_scheme.split(['/', '?', '#']).next().unwrap_or(no_scheme);
     host.trim_start_matches("www.").to_ascii_lowercase()
 }
@@ -363,10 +364,7 @@ mod tests {
             normalize_url("https://Example.com/Path/"),
             "https://example.com/path"
         );
-        assert_eq!(
-            normalize_url("https://x.com/p#frag"),
-            "https://x.com/p"
-        );
+        assert_eq!(normalize_url("https://x.com/p#frag"), "https://x.com/p");
         assert_eq!(domain_of("https://www.Example.com/a/b"), "example.com");
         assert_eq!(domain_of("http://docs.rs/foo?x=1"), "docs.rs");
     }

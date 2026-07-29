@@ -127,24 +127,21 @@ impl Tool for DescribeImageTool {
         // data: URI; for remote URLs we pass the URL through (the provider
         // will fetch it). We still call SSRF check on remote URLs through
         // `load_bytes_from_location` to normalize behavior.
-        let image_url: String = if image.starts_with("http://")
-            || image.starts_with("https://")
-        {
+        let image_url: String = if image.starts_with("http://") || image.starts_with("https://") {
             // Remote URLs: run SSRF check via load_bytes then re-encode as
             // data: URI so provider always sees inline bytes (avoids cases
             // where the provider can't reach the URL).
-            let (bytes, mime) =
-                match load_bytes_from_location(
-                    client.client(),
-                    &image,
-                    &self.working_dir,
-                    &self.allowed_read_dirs,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => return ToolResult::error(format!("image fetch failed: {e}")),
-                };
+            let (bytes, mime) = match load_bytes_from_location(
+                client.client(),
+                &image,
+                &self.working_dir,
+                &self.allowed_read_dirs,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return ToolResult::error(format!("image fetch failed: {e}")),
+            };
             let mime = mime.unwrap_or_else(|| "image/png".to_string());
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -152,18 +149,17 @@ impl Tool for DescribeImageTool {
         } else if image.starts_with("data:") {
             image.clone()
         } else {
-            let (bytes, mime) =
-                match load_bytes_from_location(
-                    client.client(),
-                    &image,
-                    &self.working_dir,
-                    &self.allowed_read_dirs,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => return ToolResult::error(format!("image read failed: {e}")),
-                };
+            let (bytes, mime) = match load_bytes_from_location(
+                client.client(),
+                &image,
+                &self.working_dir,
+                &self.allowed_read_dirs,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return ToolResult::error(format!("image read failed: {e}")),
+            };
             let mime = mime.unwrap_or_else(|| "image/png".to_string());
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -184,7 +180,12 @@ impl Tool for DescribeImageTool {
             ]
         });
 
-        let resp = match client.post_json("chat/completions").json(&body).send().await {
+        let resp = match client
+            .post_json("chat/completions")
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => return ToolResult::error(format!("vision API request failed: {e}")),
         };

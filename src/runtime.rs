@@ -9,7 +9,6 @@ use futures_util::FutureExt;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::chat_turn_queue::ChatTurnQueue;
 use crate::channels::dingtalk::{build_dingtalk_runtime_contexts, DingTalkRuntimeContext};
 use crate::channels::discord::{build_discord_runtime_contexts, DiscordRuntimeContext};
 use crate::channels::email::{build_email_runtime_contexts, EmailRuntimeContext};
@@ -33,6 +32,7 @@ use crate::channels::{
     DingTalkAdapter, EmailAdapter, FeishuAdapter, IMessageAdapter, IrcAdapter, NostrAdapter,
     QQAdapter, SignalAdapter, SlackAdapter, TelegramAdapter, WeixinAdapter, WhatsAppAdapter,
 };
+use crate::chat_turn_queue::ChatTurnQueue;
 use crate::config::normalize_model_name;
 use crate::config::Config;
 use crate::embedding::EmbeddingProvider;
@@ -483,9 +483,7 @@ pub async fn run(
     let trace_exporter = OtlpTraceExporter::from_observability(config.observability.as_ref());
     let log_exporter = OtlpLogExporter::from_observability(config.observability.as_ref());
 
-    let chat_turn_queue = Arc::new(ChatTurnQueue::new(
-        config.chat_turn_queue_max_pending,
-    ));
+    let chat_turn_queue = Arc::new(ChatTurnQueue::new(config.chat_turn_queue_max_pending));
 
     let (skill_review_queue, skill_review_worker) =
         crate::skill_review::build_skill_review_channel();
@@ -535,8 +533,7 @@ pub async fn run(
     {
         let review_state = state.clone();
         spawn_guarded("skill_review_worker".to_string(), async move {
-            crate::skill_review::spawn_skill_review_worker(review_state, skill_review_worker)
-                .await;
+            crate::skill_review::spawn_skill_review_worker(review_state, skill_review_worker).await;
         });
     }
     if state.config.subagents.announce_to_chat {

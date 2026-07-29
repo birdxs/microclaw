@@ -26,11 +26,11 @@ use crate::agent_engine::process_with_agent_with_events_guarded;
 use crate::agent_engine::should_suppress_user_error;
 use crate::agent_engine::AgentEvent;
 use crate::agent_engine::AgentRequestContext;
-use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::{
     mark_channel_started, should_drop_pre_start_message, should_drop_recent_duplicate_message,
 };
 use crate::chat_commands::{handle_chat_command, is_slash_command, unknown_command_response};
+use crate::chat_turn_queue::PendingMessage;
 use crate::runtime::AppState;
 use crate::setup_def::{ChannelFieldDef, DynamicChannelDef};
 use microclaw_channels::channel::ConversationKind;
@@ -82,8 +82,6 @@ fn matrix_sdk_clients() -> &'static RwLock<HashMap<String, Arc<MatrixSdkClient>>
     static CLIENTS: OnceLock<RwLock<HashMap<String, Arc<MatrixSdkClient>>>> = OnceLock::new();
     CLIENTS.get_or_init(|| RwLock::new(HashMap::new()))
 }
-
-
 
 fn default_matrix_mention_required() -> bool {
     true
@@ -2189,26 +2187,26 @@ async fn handle_matrix_message(
 
     // Live event tap: echo MidTurnInjection acks and detect send_message
     // tool usage concurrently with the running agent loop.
-    let injection_ack: Option<crate::channels::event_tap::InjectionAck> =
-        if app_state.config.mid_turn_injection_echo {
-            let runtime_for_tap = runtime.clone();
-            let room_for_tap = msg.room_id.clone();
-            let prefer_sdk = msg.prefer_sdk_send;
-            Some(Box::new(move |count| {
-                let runtime = runtime_for_tap.clone();
-                let room = room_for_tap.clone();
-                Box::pin(async move {
-                    let text = crate::channels::event_tap::mid_turn_injection_ack_text(count);
-                    if let Err(e) =
-                        send_matrix_text_runtime(&runtime, &room, &text, prefer_sdk).await
-                    {
-                        warn!("Matrix: failed to send mid-turn injection ack: {e}");
-                    }
-                })
-            }))
-        } else {
-            None
-        };
+    let injection_ack: Option<crate::channels::event_tap::InjectionAck> = if app_state
+        .config
+        .mid_turn_injection_echo
+    {
+        let runtime_for_tap = runtime.clone();
+        let room_for_tap = msg.room_id.clone();
+        let prefer_sdk = msg.prefer_sdk_send;
+        Some(Box::new(move |count| {
+            let runtime = runtime_for_tap.clone();
+            let room = room_for_tap.clone();
+            Box::pin(async move {
+                let text = crate::channels::event_tap::mid_turn_injection_ack_text(count);
+                if let Err(e) = send_matrix_text_runtime(&runtime, &room, &text, prefer_sdk).await {
+                    warn!("Matrix: failed to send mid-turn injection ack: {e}");
+                }
+            })
+        }))
+    } else {
+        None
+    };
     let mut tap = crate::channels::event_tap::EventTap::spawn(event_rx, injection_ack);
 
     match process_with_agent_with_events_guarded(

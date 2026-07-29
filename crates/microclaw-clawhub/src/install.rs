@@ -239,10 +239,7 @@ pub fn check_update_available(
 /// are enforced while copying (`Read::take`), so a zip bomb stops at the cap
 /// instead of filling the disk. Entry names are sanitized via
 /// `enclosed_name()` (zip-slip guard). Fail closed: any violation aborts.
-fn extract_bounded<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    dest: &Path,
-) -> Result<(), String> {
+fn extract_bounded<R: Read + Seek>(archive: &mut ZipArchive<R>, dest: &Path) -> Result<(), String> {
     if archive.len() > MAX_ARCHIVE_ENTRIES {
         return Err(format!(
             "archive has {} entries (max {MAX_ARCHIVE_ENTRIES})",
@@ -263,15 +260,14 @@ fn extract_bounded<R: Read + Seek>(
         };
         let out_path = dest.join(rel);
         if entry.is_dir() {
-            std::fs::create_dir_all(&out_path)
-                .map_err(|e| format!("failed to create dir: {e}"))?;
+            std::fs::create_dir_all(&out_path).map_err(|e| format!("failed to create dir: {e}"))?;
             continue;
         }
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("failed to create dir: {e}"))?;
         }
-        let mut out = std::fs::File::create(&out_path)
-            .map_err(|e| format!("failed to create file: {e}"))?;
+        let mut out =
+            std::fs::File::create(&out_path).map_err(|e| format!("failed to create file: {e}"))?;
         // Copy at most one byte past the cap so we can tell "at cap" from
         // "over cap" without trusting the entry's declared size.
         let written = std::io::copy(&mut (&mut entry).take(MAX_FILE_BYTES + 1), &mut out)
@@ -369,7 +365,10 @@ pub fn compute_tree_hash(dir: &Path) -> std::io::Result<String> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum TreeVerification {
     Ok,
-    Modified { expected: String, actual: String },
+    Modified {
+        expected: String,
+        actual: String,
+    },
     Missing,
     /// Entry predates tree hashing (installed before the field existed).
     Unpinned,
@@ -419,7 +418,10 @@ mod tests {
         assert!(!check_update_available(&lock, "1.0.0", "1.0.0"));
     }
 
-    use super::{compute_tree_hash, extract_bounded, scan_extracted_skill, verify_tree, LockEntry, TreeVerification, MAX_FILE_BYTES};
+    use super::{
+        compute_tree_hash, extract_bounded, scan_extracted_skill, verify_tree, LockEntry,
+        TreeVerification, MAX_FILE_BYTES,
+    };
     use std::io::Write;
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;

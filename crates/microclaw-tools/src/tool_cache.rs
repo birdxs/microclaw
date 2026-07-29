@@ -53,8 +53,7 @@ pub fn normalize_input_for_key(input: &serde_json::Value) -> serde_json::Value {
 /// Compute the cache key for (`tool_name`, `input`). Uses SHA-256 hex
 /// over a canonical JSON encoding.
 pub fn cache_key(tool_name: &str, input: &serde_json::Value) -> String {
-    let canonical =
-        serde_json::to_string(&normalize_input_for_key(input)).unwrap_or_default();
+    let canonical = serde_json::to_string(&normalize_input_for_key(input)).unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(tool_name.as_bytes());
     hasher.update(b":");

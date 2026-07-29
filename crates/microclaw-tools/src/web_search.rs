@@ -223,8 +223,7 @@ async fn brave_hits(
     max: usize,
 ) -> Result<Vec<SearchItem>, String> {
     let encoded = urlencoding::encode(query);
-    let url =
-        format!("https://api.search.brave.com/res/v1/web/search?q={encoded}&count={max}");
+    let url = format!("https://api.search.brave.com/res/v1/web/search?q={encoded}&count={max}");
     let client = http_client(timeout_secs);
     let resp = client
         .get(&url)

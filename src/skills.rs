@@ -437,7 +437,9 @@ impl SkillManager {
             out.push('\n');
         }
         if !cold.is_empty() {
-            out.push_str("<!-- Other available skills (call activate_skill to load full body): -->\n");
+            out.push_str(
+                "<!-- Other available skills (call activate_skill to load full body): -->\n",
+            );
             cold.sort_by_key(|s| s.name.to_ascii_lowercase());
             let total_cold = cold.len();
             let omitted = total_cold.saturating_sub(MAX_SKILLS_CATALOG_ITEMS);
@@ -678,7 +680,10 @@ fn normalize_single_line_frontmatter(content: &str) -> Option<String> {
 
 /// Parse a SKILL.md file, extracting frontmatter via YAML and body.
 /// Returns None if the file lacks valid frontmatter with a name field.
-pub(crate) fn parse_skill_md(content: &str, dir_path: &std::path::Path) -> Option<(SkillMetadata, String)> {
+pub(crate) fn parse_skill_md(
+    content: &str,
+    dir_path: &std::path::Path,
+) -> Option<(SkillMetadata, String)> {
     let trimmed = content.trim_start_matches('\u{feff}');
 
     // Try normalizing single-line frontmatter if standard format not found
@@ -933,7 +938,10 @@ Body.
             meta.compatibility.as_deref(),
             Some("Requires git, docker, jq, and access to the internet")
         );
-        assert_eq!(meta.allowed_tools.as_deref(), Some("Bash(git:*) Bash(jq:*) Read"));
+        assert_eq!(
+            meta.allowed_tools.as_deref(),
+            Some("Bash(git:*) Bash(jq:*) Read")
+        );
     }
 
     #[test]
@@ -1013,10 +1021,8 @@ Instructions.
 
     #[test]
     fn test_list_skills_formatted_surfaces_agentskills_metadata() {
-        let dir = std::env::temp_dir().join(format!(
-            "microclaw_skills_meta_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("microclaw_skills_meta_{}", uuid::Uuid::new_v4()));
         // SkillManager joins `skills/` onto the data_dir; write the skill
         // there so it gets discovered.
         let pdf = dir.join("skills").join("pdf-processing");
@@ -1113,16 +1119,22 @@ ok
 
     #[test]
     fn build_skills_catalog_for_query_inlines_relevant_skill_body() {
-        let dir = std::env::temp_dir().join(format!(
-            "mc_skills_query_inline_{}",
-            uuid::Uuid::new_v4()
-        ));
-        write_skill(&dir, "deploy-helper", "kubernetes rolling deploy", "Step 1: kubectl apply\nStep 2: verify");
+        let dir =
+            std::env::temp_dir().join(format!("mc_skills_query_inline_{}", uuid::Uuid::new_v4()));
+        write_skill(
+            &dir,
+            "deploy-helper",
+            "kubernetes rolling deploy",
+            "Step 1: kubectl apply\nStep 2: verify",
+        );
         write_skill(&dir, "irrelevant", "make tea", "boil water");
         let sm = SkillManager::from_skills_dir(dir.to_str().unwrap());
         let out = sm.build_skills_catalog_for_query("how do i do a kubernetes deploy?", 3);
         assert!(out.contains("## deploy-helper"), "got: {out}");
-        assert!(out.contains("Step 1: kubectl apply"), "body not inlined: {out}");
+        assert!(
+            out.contains("Step 1: kubectl apply"),
+            "body not inlined: {out}"
+        );
         // Irrelevant skill ends up in the cold list with just name+desc.
         assert!(out.contains("- irrelevant: make tea"), "got: {out}");
         assert!(!out.contains("boil water"), "irrelevant body leaked: {out}");
@@ -1131,10 +1143,8 @@ ok
 
     #[test]
     fn build_skills_catalog_for_query_falls_back_when_no_match() {
-        let dir = std::env::temp_dir().join(format!(
-            "mc_skills_query_nomatch_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mc_skills_query_nomatch_{}", uuid::Uuid::new_v4()));
         write_skill(&dir, "alpha", "alpha skill", "ok");
         write_skill(&dir, "beta", "beta skill", "ok");
         let sm = SkillManager::from_skills_dir(dir.to_str().unwrap());
@@ -1151,10 +1161,8 @@ ok
 
     #[test]
     fn build_skills_catalog_for_query_caps_inlined_body() {
-        let dir = std::env::temp_dir().join(format!(
-            "mc_skills_query_cap_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mc_skills_query_cap_{}", uuid::Uuid::new_v4()));
         let big_body = "x".repeat(MAX_INLINED_SKILL_BODY_CHARS + 500);
         write_skill(&dir, "matchme", "matchme description", &big_body);
         let sm = SkillManager::from_skills_dir(dir.to_str().unwrap());
@@ -1167,10 +1175,8 @@ ok
 
     #[test]
     fn build_skills_catalog_for_query_respects_top_k_bucket() {
-        let dir = std::env::temp_dir().join(format!(
-            "mc_skills_query_top_k_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mc_skills_query_top_k_{}", uuid::Uuid::new_v4()));
         // Five skills all matching "deploy"; top_k=2 should inline 2 hot
         // bodies, others go to the cold list.
         for n in 0..5 {

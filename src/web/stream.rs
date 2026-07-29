@@ -56,8 +56,7 @@ async fn start_stream_run_internal(
     state.run_hub.create(&run_id, actor.clone()).await;
 
     // Register with chat_abort controller for abort support
-    let abort_entry =
-        chat_abort::register_chat_run(run_id.clone(), session_key.clone()).await;
+    let abort_entry = chat_abort::register_chat_run(run_id.clone(), session_key.clone()).await;
 
     let state_for_task = state.clone();
     let run_id_for_task = run_id.clone();
@@ -245,7 +244,11 @@ async fn start_stream_run_internal(
                         let partial = {
                             let buf = abort_entry.buffer.read().await;
                             let t = buf.trim();
-                            if t.is_empty() { None } else { Some(t.to_string()) }
+                            if t.is_empty() {
+                                None
+                            } else {
+                                Some(t.to_string())
+                            }
                         };
                         state_for_task
                             .run_hub

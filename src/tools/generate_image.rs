@@ -158,7 +158,12 @@ impl Tool for GenerateImageTool {
             "response_format": "b64_json",
         });
 
-        let resp = match client.post_json("images/generations").json(&body).send().await {
+        let resp = match client
+            .post_json("images/generations")
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => return ToolResult::error(format!("images API request failed: {e}")),
         };
@@ -203,9 +208,7 @@ impl Tool for GenerateImageTool {
                 .map_err(|e| e.to_string())
             {
                 Ok(r) => r,
-                Err(e) => {
-                    return ToolResult::error(format!("failed to download image URL: {e}"))
-                }
+                Err(e) => return ToolResult::error(format!("failed to download image URL: {e}")),
             };
             if !dl.status().is_success() {
                 return ToolResult::error(format!("image download HTTP {}", dl.status()));
@@ -264,16 +267,13 @@ async fn deliver_attachment(
     file: &std::path::Path,
     caption: &str,
 ) -> Result<String, String> {
-    let routing = match microclaw_channels::channel::get_required_chat_routing(
-        channels,
-        db.clone(),
-        chat_id,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return Err(e),
-    };
+    let routing =
+        match microclaw_channels::channel::get_required_chat_routing(channels, db.clone(), chat_id)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
     let Some(adapter) = channels.get(&routing.channel_name) else {
         return Err(format!("no adapter for channel '{}'", routing.channel_name));
     };
@@ -284,12 +284,11 @@ async fn deliver_attachment(
             file.display()
         ));
     }
-    let external_chat_id = microclaw_storage::db::call_blocking(db.clone(), move |d| {
-        d.get_chat_external_id(chat_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .unwrap_or_else(|| chat_id.to_string());
+    let external_chat_id =
+        microclaw_storage::db::call_blocking(db.clone(), move |d| d.get_chat_external_id(chat_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| chat_id.to_string());
     let caption_short = caption.chars().take(120).collect::<String>();
     match adapter
         .send_attachment(&external_chat_id, file, Some(&caption_short))
@@ -305,10 +304,7 @@ async fn deliver_attachment(
                 &format!("[image attached: {}]", file.display()),
             )
             .await;
-            Ok(format!(
-                "delivered via channel '{}'",
-                routing.channel_name
-            ))
+            Ok(format!("delivered via channel '{}'", routing.channel_name))
         }
         Err(e) => Err(e),
     }

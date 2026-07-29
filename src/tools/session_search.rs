@@ -5,7 +5,7 @@ use std::sync::Arc;
 use microclaw_core::llm_types::ToolDefinition;
 use microclaw_storage::db::Database;
 
-use super::{authorize_chat_access, auth_context_from_input, schema_object, Tool, ToolResult};
+use super::{auth_context_from_input, authorize_chat_access, schema_object, Tool, ToolResult};
 
 /// Session search tool — full-text search over the chatbot's stored messages.
 ///

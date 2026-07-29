@@ -124,7 +124,10 @@ mod tests {
 
     #[test]
     fn cleans_quotes_and_trailing_punctuation() {
-        assert_eq!(clean_title("\"Rust async deep dive.\""), "Rust async deep dive");
+        assert_eq!(
+            clean_title("\"Rust async deep dive.\""),
+            "Rust async deep dive"
+        );
         assert_eq!(clean_title("  Hello world!  "), "Hello world");
         assert_eq!(clean_title("“写 Rust 好处”"), "写 Rust 好处");
     }

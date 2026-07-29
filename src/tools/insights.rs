@@ -5,7 +5,7 @@ use std::sync::Arc;
 use microclaw_core::llm_types::ToolDefinition;
 use microclaw_storage::db::{call_blocking, Database};
 
-use super::{authorize_chat_access, auth_context_from_input, schema_object, Tool, ToolResult};
+use super::{auth_context_from_input, authorize_chat_access, schema_object, Tool, ToolResult};
 
 /// Insights tool — compact usage / activity summary over a trailing window.
 ///
@@ -62,9 +62,7 @@ impl Tool for InsightsTool {
 
     async fn execute(&self, input: Value) -> ToolResult {
         let Some(auth) = auth_context_from_input(&input) else {
-            return ToolResult::error(
-                "insights requires an auth context (caller_chat_id)".into(),
-            );
+            return ToolResult::error("insights requires an auth context (caller_chat_id)".into());
         };
         let days = input
             .get("days")
@@ -79,9 +77,7 @@ impl Tool for InsightsTool {
 
         let scope: Option<i64> = if all_chats {
             if !auth.is_control_chat() {
-                return ToolResult::error(
-                    "all_chats=true requires a control chat".into(),
-                );
+                return ToolResult::error("all_chats=true requires a control chat".into());
             }
             None
         } else {
@@ -112,9 +108,7 @@ impl Tool for InsightsTool {
             None => "all chats".to_string(),
         };
         let mut lines = Vec::new();
-        lines.push(format!(
-            "# Insights — last {days} day(s), {scope_label}"
-        ));
+        lines.push(format!("# Insights — last {days} day(s), {scope_label}"));
         lines.push(String::new());
         lines.push(format!("- requests: **{}**", summary.requests));
         lines.push(format!("- input tokens:  **{}**", summary.input_tokens));

@@ -70,9 +70,9 @@ impl BashTool {
             };
             match regex::Regex::new(&with_flag) {
                 Ok(re) => self.dangerous_patterns.push((raw.clone(), re)),
-                Err(e) => tracing::warn!(
-                    "ignoring invalid bash_dangerous_patterns entry {raw:?}: {e}"
-                ),
+                Err(e) => {
+                    tracing::warn!("ignoring invalid bash_dangerous_patterns entry {raw:?}: {e}")
+                }
             }
         }
         self

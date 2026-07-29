@@ -70,7 +70,9 @@ impl Tool for FetchArtifactTool {
     async fn execute(&self, input: serde_json::Value) -> ToolResult {
         let artifact_id = match input.get("artifact_id").and_then(|v| v.as_str()) {
             Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => return ToolResult::error("Missing or empty required parameter: artifact_id".into()),
+            _ => {
+                return ToolResult::error("Missing or empty required parameter: artifact_id".into())
+            }
         };
         let offset = input
             .get("offset")
@@ -121,10 +123,10 @@ impl Tool for FetchArtifactTool {
                 };
                 ToolResult::success(format!("{header}\n---\n{body}"))
             }
-            Ok(None) => ToolResult::error(format!(
-                "Artifact `{artifact_id}` not found or expired."
-            ))
-            .with_error_type("artifact_missing"),
+            Ok(None) => {
+                ToolResult::error(format!("Artifact `{artifact_id}` not found or expired."))
+                    .with_error_type("artifact_missing")
+            }
             Err(e) => ToolResult::error(format!("Failed to read artifact: {e}")),
         }
     }

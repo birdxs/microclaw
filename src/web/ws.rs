@@ -806,7 +806,8 @@ async fn handle_request_frame(
                 super::chat_abort::abort_chat_run_by_id(run_id, &session_key).await;
                 vec![run_id.clone()]
             } else {
-                let (_, ids, _) = super::chat_abort::abort_chat_runs_for_session_key(&session_key).await;
+                let (_, ids, _) =
+                    super::chat_abort::abort_chat_runs_for_session_key(&session_key).await;
                 ids
             };
 

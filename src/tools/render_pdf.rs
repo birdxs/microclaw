@@ -148,7 +148,10 @@ impl Tool for RenderPdfTool {
             .filter(|s| !s.is_empty());
         let want_cover = input.get("cover").and_then(|v| v.as_bool()).unwrap_or(true);
         let want_toc = input.get("toc").and_then(|v| v.as_bool()).unwrap_or(true);
-        let deliver = input.get("deliver").and_then(|v| v.as_bool()).unwrap_or(true);
+        let deliver = input
+            .get("deliver")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         let sections = match parse_sections(&input) {
             Ok(s) => s,
@@ -213,7 +216,10 @@ fn parse_sections(input: &Value) -> Result<Vec<Section>, String> {
         return Err("sections must contain at least one entry".into());
     }
     if arr.len() > MAX_SECTIONS {
-        return Err(format!("too many sections ({}); max is {MAX_SECTIONS}", arr.len()));
+        return Err(format!(
+            "too many sections ({}); max is {MAX_SECTIONS}",
+            arr.len()
+        ));
     }
     let mut out = Vec::with_capacity(arr.len());
     for (i, s) in arr.iter().enumerate() {
@@ -231,7 +237,11 @@ fn parse_sections(input: &Value) -> Result<Vec<Section>, String> {
             .and_then(|v| v.as_u64())
             .map(|v| v.clamp(1, 3) as u8)
             .unwrap_or(1);
-        out.push(Section { heading, level, body });
+        out.push(Section {
+            heading,
+            level,
+            body,
+        });
     }
     Ok(out)
 }
@@ -282,7 +292,10 @@ enum FaceKind {
 fn variant_path(regular: &Path, kind: FaceKind) -> Option<PathBuf> {
     let dir = regular.parent()?;
     let stem = regular.file_stem()?.to_str()?;
-    let ext = regular.extension().and_then(|e| e.to_str()).unwrap_or("ttf");
+    let ext = regular
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("ttf");
     let (spaced, hyphen, oblique) = match kind {
         FaceKind::Bold => (" Bold", "-Bold", "-Bold"),
         FaceKind::Italic => (" Italic", "-Italic", "-Oblique"),
@@ -365,7 +378,9 @@ fn render_document(
 ) -> Result<PathBuf, String> {
     let needs_cjk = contains_cjk(sections, title);
     let (fonts, family) = load_fonts(cfg, needs_cjk)?;
-    let markup = build_markup(title, subtitle, author, want_cover, want_toc, sections, &family);
+    let markup = build_markup(
+        title, subtitle, author, want_cover, want_toc, sections, &family,
+    );
 
     let world = TypstWorld::new(fonts, markup);
     let Warned { output, .. } = typst::compile::<PagedDocument>(&world);
@@ -456,7 +471,11 @@ fn build_markup(
 fn emit_block(block: &Block) -> String {
     match block {
         Block::Heading(level, text) => {
-            format!("\n{} {}\n\n", "=".repeat(*level as usize), escape_typst(text))
+            format!(
+                "\n{} {}\n\n",
+                "=".repeat(*level as usize),
+                escape_typst(text)
+            )
         }
         Block::Paragraph(spans) => format!("{}\n\n", emit_spans(spans)),
         // No blank line after a list item, so consecutive items form one list.
@@ -691,7 +710,9 @@ fn markdown_blocks(md: &str) -> Vec<Block> {
             Event::Start(Tag::Emphasis) => italic += 1,
             Event::End(TagEnd::Strong) => bold = bold.saturating_sub(1),
             Event::End(TagEnd::Emphasis) => italic = italic.saturating_sub(1),
-            Event::End(TagEnd::Paragraph | TagEnd::Item | TagEnd::CodeBlock | TagEnd::Heading(_)) => {
+            Event::End(
+                TagEnd::Paragraph | TagEnd::Item | TagEnd::CodeBlock | TagEnd::Heading(_),
+            ) => {
                 flush(&mut blocks, &mut spans, mode, heading_level);
                 mode = 0;
             }
@@ -738,12 +759,11 @@ async fn deliver_attachment(
             file.display()
         ));
     }
-    let external_chat_id = microclaw_storage::db::call_blocking(db.clone(), move |d| {
-        d.get_chat_external_id(chat_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .unwrap_or_else(|| chat_id.to_string());
+    let external_chat_id =
+        microclaw_storage::db::call_blocking(db.clone(), move |d| d.get_chat_external_id(chat_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| chat_id.to_string());
     let caption_short = caption.chars().take(120).collect::<String>();
     match adapter
         .send_attachment(&external_chat_id, file, Some(&caption_short))
@@ -776,7 +796,8 @@ mod tests {
 
     #[test]
     fn parses_sections_with_defaults() {
-        let input = json!({"title": "t", "sections": [{"heading": "Intro", "body_markdown": "hi"}]});
+        let input =
+            json!({"title": "t", "sections": [{"heading": "Intro", "body_markdown": "hi"}]});
         let s = parse_sections(&input).unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].level, 1);
@@ -832,7 +853,11 @@ mod tests {
         let bytes = std::fs::read(&out).unwrap();
         assert!(bytes.starts_with(b"%PDF"), "output is not a PDF");
         // Typst subsets the CJK font, so even a Chinese PDF should be small.
-        assert!(bytes.len() > 1500, "PDF suspiciously small: {}", bytes.len());
+        assert!(
+            bytes.len() > 1500,
+            "PDF suspiciously small: {}",
+            bytes.len()
+        );
         assert!(
             bytes.len() < 5_000_000,
             "CJK PDF should be subset-small, got {} bytes",
@@ -853,16 +878,25 @@ mod tests {
         let sections = vec![Section {
             heading: "Introduction".into(),
             level: 1,
-            body: "A short English-only document. It should render small.\n\n- one\n- two"
-                .into(),
+            body: "A short English-only document. It should render small.\n\n- one\n- two".into(),
         }];
         let out = render_document(
-            &cfg, &dir, "English Report", None, None, true, true, &sections,
+            &cfg,
+            &dir,
+            "English Report",
+            None,
+            None,
+            true,
+            true,
+            &sections,
         )
         .expect("render should succeed");
         let len = std::fs::read(&out).unwrap().len();
         eprintln!("english PDF: {} bytes -> {}", len, out.display());
-        assert!(len < 5_000_000, "English PDF unexpectedly large: {len} bytes");
+        assert!(
+            len < 5_000_000,
+            "English PDF unexpectedly large: {len} bytes"
+        );
     }
 
     // Live end-to-end "write a book" test: a real LLM drafts the chapters, then
@@ -903,7 +937,8 @@ mod tests {
         let n = book["sections"].as_array().map(|a| a.len()).unwrap_or(0);
         assert!(n > 0, "LLM returned no sections");
 
-        let work = std::env::temp_dir().join(format!("microclaw_book_live_{}", uuid::Uuid::new_v4()));
+        let work =
+            std::env::temp_dir().join(format!("microclaw_book_live_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&work).unwrap();
         let mut cfg = crate::config::Config::test_defaults();
         cfg.data_dir = work.to_string_lossy().into_owned();
@@ -925,7 +960,11 @@ mod tests {
             .expect("metadata.path missing");
         let bytes = std::fs::read(path).unwrap();
         assert!(bytes.starts_with(b"%PDF"), "output is not a PDF");
-        assert!(bytes.len() > 1500, "PDF suspiciously small: {} bytes", bytes.len());
+        assert!(
+            bytes.len() > 1500,
+            "PDF suspiciously small: {} bytes",
+            bytes.len()
+        );
         eprintln!(
             "OK: book \"{}\" ({} sections) -> {} ({} bytes)",
             book["title"].as_str().unwrap_or("?"),
@@ -955,9 +994,17 @@ mod tests {
                    - a **bold** bullet\n- an *italic* bullet"
                 .into(),
         }];
-        let out =
-            render_document(&cfg, &dir, "Emphasis Test", None, None, true, true, &sections)
-                .expect("render should succeed");
+        let out = render_document(
+            &cfg,
+            &dir,
+            "Emphasis Test",
+            None,
+            None,
+            true,
+            true,
+            &sections,
+        )
+        .expect("render should succeed");
         let bytes = std::fs::read(&out).unwrap();
         assert!(bytes.starts_with(b"%PDF"), "not a PDF");
         assert!(
@@ -975,9 +1022,15 @@ mod tests {
         let Block::Paragraph(spans) = &blocks[0] else {
             panic!("expected a paragraph");
         };
-        assert!(spans.iter().any(|s| s.bold && !s.italic && s.text.contains("bold")));
-        assert!(spans.iter().any(|s| s.italic && !s.bold && s.text.contains("italic")));
-        assert!(spans.iter().any(|s| !s.bold && !s.italic && s.text.contains("Plain")));
+        assert!(spans
+            .iter()
+            .any(|s| s.bold && !s.italic && s.text.contains("bold")));
+        assert!(spans
+            .iter()
+            .any(|s| s.italic && !s.bold && s.text.contains("italic")));
+        assert!(spans
+            .iter()
+            .any(|s| !s.bold && !s.italic && s.text.contains("Plain")));
     }
 
     #[test]

@@ -110,8 +110,7 @@ impl Tool for KnowledgeGraphQueryTool {
                         "No relationships found pointing to '{entity}'."
                     )),
                     Ok(rows) => {
-                        let mut out =
-                            format!("Entities related to '{entity}' (as object):\n");
+                        let mut out = format!("Entities related to '{entity}' (as object):\n");
                         for t in &rows {
                             out.push_str(&format!(
                                 "  {} -[{}]-> {} (since {})\n",
@@ -125,10 +124,9 @@ impl Tool for KnowledgeGraphQueryTool {
             }
             "timeline" => {
                 let entity_clone = entity.clone();
-                let triples =
-                    call_blocking(db, move |db| db.kg_timeline(&entity_clone, chat_id))
-                        .await
-                        .map_err(|e| e.to_string());
+                let triples = call_blocking(db, move |db| db.kg_timeline(&entity_clone, chat_id))
+                    .await
+                    .map_err(|e| e.to_string());
                 match triples {
                     Ok(rows) if rows.is_empty() => ToolResult::success(format!(
                         "No historical facts found for entity '{entity}'."
@@ -266,7 +264,9 @@ impl Tool for KnowledgeGraphAddTool {
                     "KG: added triple #{} ({} -> {} -> {})",
                     id, subject, predicate, object
                 );
-                let mut msg = format!("Added to knowledge graph: {subject} -[{predicate}]-> {object} (id={id})");
+                let mut msg = format!(
+                    "Added to knowledge graph: {subject} -[{predicate}]-> {object} (id={id})"
+                );
                 if let Some(old_id) = invalidates_id {
                     msg.push_str(&format!(", invalidated previous triple #{old_id}"));
                 }
@@ -353,18 +353,7 @@ mod tests {
 
         let _ = microclaw_storage::db::call_blocking(db.clone(), {
             let now = now.to_string();
-            move |db| {
-                db.kg_insert_triple(
-                    "db-port",
-                    "is",
-                    "5433",
-                    None,
-                    &now,
-                    0.80,
-                    "test",
-                    None,
-                )
-            }
+            move |db| db.kg_insert_triple("db-port", "is", "5433", None, &now, 0.80, "test", None)
         })
         .await
         .unwrap();

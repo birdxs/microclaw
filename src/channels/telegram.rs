@@ -15,12 +15,12 @@ use crate::agent_engine::{
     maybe_rerun_for_pending, process_with_agent_with_events_guarded, should_suppress_user_error,
     AgentEvent, AgentRequestContext,
 };
-use crate::chat_turn_queue::PendingMessage;
 use crate::channels::startup_guard::{
     mark_channel_started, should_drop_pre_start_message, should_drop_recent_duplicate_message,
 };
 use crate::chat_commands::maybe_handle_plugin_command;
 use crate::chat_commands::{handle_chat_command, is_slash_command, unknown_command_response};
+use crate::chat_turn_queue::PendingMessage;
 use crate::runtime::AppState;
 use crate::tools::ToolAuthContext;
 use microclaw_channels::channel::ConversationKind;
@@ -455,7 +455,10 @@ async fn maybe_plugin_slash_response(
 /// omitted). Kept in sync with `chat_commands::build_help_response`.
 fn microclaw_command_menu() -> Vec<BotCommand> {
     [
-        ("status", "Session info: provider, model, message & task counts"),
+        (
+            "status",
+            "Session info: provider, model, message & task counts",
+        ),
         ("clear", "Clear this chat's session and history"),
         ("reset", "Reset this chat's session and history"),
         ("stop", "Abort the run currently in progress"),
@@ -1059,6 +1062,7 @@ async fn handle_message(
             let auth = ToolAuthContext {
                 caller_channel: tg_channel_name.clone(),
                 caller_chat_id: chat_id,
+                principal: "channel:telegram".to_string(),
                 control_chat_ids: state.config.control_chat_ids.clone(),
                 env_files: Vec::new(),
             };
@@ -1322,10 +1326,9 @@ async fn handle_message(
                             is_from_bot: true,
                             timestamp: chrono::Utc::now().to_rfc3339(),
                         };
-                        let _ = call_blocking(state.db.clone(), move |db| {
-                            db.store_message(&bot_msg)
-                        })
-                        .await;
+                        let _ =
+                            call_blocking(state.db.clone(), move |db| db.store_message(&bot_msg))
+                                .await;
                     } else {
                         // Delivery outbox: don't drop a finished answer on a
                         // channel hiccup — queue it for background redelivery
@@ -1365,10 +1368,8 @@ async fn handle_message(
             {
                 match crate::voice::synth_speech_to_temp(&state.config, &response_for_voice).await {
                     Ok(audio_path) => {
-                        let mut req = bot.send_voice(
-                            msg.chat.id,
-                            teloxide::types::InputFile::file(&audio_path),
-                        );
+                        let mut req = bot
+                            .send_voice(msg.chat.id, teloxide::types::InputFile::file(&audio_path));
                         if let Some(tid) = msg.thread_id {
                             req = req.message_thread_id(tid);
                         }
@@ -1988,7 +1989,9 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_basic() {
-        let prompt = build_system_prompt("testbot", "telegram", "", 12345, "", "UTC", None, None, None);
+        let prompt = build_system_prompt(
+            "testbot", "telegram", "", 12345, "", "UTC", None, None, None,
+        );
         assert!(prompt.contains("testbot"));
         assert!(prompt.contains("12345"));
         assert!(prompt.contains("bash commands"));
@@ -1999,7 +2002,9 @@ mod tests {
     #[test]
     fn test_build_system_prompt_with_memory() {
         let memory = "<global_memory>\nUser likes Rust\n</global_memory>";
-        let prompt = build_system_prompt("testbot", "telegram", memory, 42, "", "UTC", None, None, None);
+        let prompt = build_system_prompt(
+            "testbot", "telegram", memory, 42, "", "UTC", None, None, None,
+        );
         assert!(prompt.contains("# Memories"));
         assert!(prompt.contains("User likes Rust"));
     }
@@ -2007,7 +2012,9 @@ mod tests {
     #[test]
     fn test_build_system_prompt_with_skills() {
         let catalog = "<available_skills>\n- pdf: Convert to PDF\n</available_skills>";
-        let prompt = build_system_prompt("testbot", "telegram", "", 42, catalog, "UTC", None, None, None);
+        let prompt = build_system_prompt(
+            "testbot", "telegram", "", 42, catalog, "UTC", None, None, None,
+        );
         assert!(prompt.contains("# Agent Skills"));
         assert!(prompt.contains("activate_skill"));
         assert!(prompt.contains("pdf: Convert to PDF"));
@@ -2015,7 +2022,8 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_without_skills() {
-        let prompt = build_system_prompt("testbot", "telegram", "", 42, "", "UTC", None, None, None);
+        let prompt =
+            build_system_prompt("testbot", "telegram", "", 42, "", "UTC", None, None, None);
         assert!(!prompt.contains("# Agent Skills"));
     }
 
@@ -2314,7 +2322,9 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_mentions_subagent_tools() {
-        let prompt = build_system_prompt("testbot", "telegram", "", 12345, "", "UTC", None, None, None);
+        let prompt = build_system_prompt(
+            "testbot", "telegram", "", 12345, "", "UTC", None, None, None,
+        );
         assert!(prompt.contains("sessions_spawn"));
         assert!(prompt.contains("subagents_list"));
     }
@@ -2350,7 +2360,9 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_mentions_xml_security() {
-        let prompt = build_system_prompt("testbot", "telegram", "", 12345, "", "UTC", None, None, None);
+        let prompt = build_system_prompt(
+            "testbot", "telegram", "", 12345, "", "UTC", None, None, None,
+        );
         assert!(prompt.contains("user_message"));
         assert!(prompt.contains("untrusted"));
     }
@@ -2544,7 +2556,9 @@ mod tests {
     fn test_build_system_prompt_with_memory_and_skills() {
         let memory = "<global_memory>\nTest\n</global_memory>";
         let skills = "- translate: Translate text";
-        let prompt = build_system_prompt("bot", "telegram", memory, 42, skills, "UTC", None, None, None);
+        let prompt = build_system_prompt(
+            "bot", "telegram", memory, 42, skills, "UTC", None, None, None,
+        );
         assert!(prompt.contains("# Memories"));
         assert!(prompt.contains("Test"));
         assert!(prompt.contains("# Agent Skills"));
@@ -2553,20 +2567,26 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_mentions_todo() {
-        let prompt = build_system_prompt("testbot", "telegram", "", 12345, "", "UTC", None, None, None);
+        let prompt = build_system_prompt(
+            "testbot", "telegram", "", 12345, "", "UTC", None, None, None,
+        );
         assert!(prompt.contains("todo_read"));
         assert!(prompt.contains("todo_write"));
     }
 
     #[test]
     fn test_build_system_prompt_mentions_export() {
-        let prompt = build_system_prompt("testbot", "telegram", "", 12345, "", "UTC", None, None, None);
+        let prompt = build_system_prompt(
+            "testbot", "telegram", "", 12345, "", "UTC", None, None, None,
+        );
         assert!(prompt.contains("export_chat"));
     }
 
     #[test]
     fn test_build_system_prompt_mentions_schedule() {
-        let prompt = build_system_prompt("testbot", "telegram", "", 12345, "", "UTC", None, None, None);
+        let prompt = build_system_prompt(
+            "testbot", "telegram", "", 12345, "", "UTC", None, None, None,
+        );
         assert!(prompt.contains("schedule_task"));
         assert!(prompt.contains("6-field cron"));
     }

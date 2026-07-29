@@ -141,28 +141,54 @@ pub enum ToolConcurrencyClass {
 pub fn tool_concurrency_class(name: &str) -> ToolConcurrencyClass {
     match name {
         // Read-only tools: safe to parallelize
-        "read_file" | "glob" | "grep" | "web_fetch" | "web_search" | "deep_research"
+        "read_file"
+        | "glob"
+        | "grep"
+        | "web_fetch"
+        | "web_search"
+        | "deep_research"
         | "get_current_time"
-        | "compare_time" | "calculate" | "read_memory" | "structured_memory_search"
-        | "todo_read" | "export_chat" | "a2a_list_peers" | "list_scheduled_tasks"
-        | "get_scheduled_task_history" | "list_scheduled_task_dlq" | "subagents_list"
-        | "subagents_info" | "subagents_focused" | "subagents_log" | "browser"
-        | "fetch_artifact" => {
-            ToolConcurrencyClass::ReadOnly
-        }
+        | "compare_time"
+        | "calculate"
+        | "read_memory"
+        | "structured_memory_search"
+        | "todo_read"
+        | "export_chat"
+        | "a2a_list_peers"
+        | "list_scheduled_tasks"
+        | "get_scheduled_task_history"
+        | "list_scheduled_task_dlq"
+        | "subagents_list"
+        | "subagents_info"
+        | "subagents_focused"
+        | "subagents_log"
+        | "browser"
+        | "fetch_artifact" => ToolConcurrencyClass::ReadOnly,
         // Exclusive tools: must run alone
         "bash" | "activate_skill" | "sessions_spawn" => ToolConcurrencyClass::Exclusive,
         // MCP tools: default to SideEffect (unknown external effects)
         _ if name.starts_with("mcp_") => ToolConcurrencyClass::SideEffect,
         // All other tools with side effects
-        "write_file" | "edit_file" | "write_memory" | "send_message" | "a2a_send"
-        | "schedule_task" | "pause_scheduled_task" | "resume_scheduled_task"
-        | "cancel_scheduled_task" | "replay_scheduled_task_dlq" | "structured_memory_update"
-        | "structured_memory_delete" | "todo_write" | "sync_skills" | "subagents_send"
-        | "subagents_focus" | "subagents_unfocus" | "subagents_kill"
-        | "subagents_retry_announces" | "subagents_orchestrate" => {
-            ToolConcurrencyClass::SideEffect
-        }
+        "write_file"
+        | "edit_file"
+        | "write_memory"
+        | "send_message"
+        | "a2a_send"
+        | "schedule_task"
+        | "pause_scheduled_task"
+        | "resume_scheduled_task"
+        | "cancel_scheduled_task"
+        | "replay_scheduled_task_dlq"
+        | "structured_memory_update"
+        | "structured_memory_delete"
+        | "todo_write"
+        | "sync_skills"
+        | "subagents_send"
+        | "subagents_focus"
+        | "subagents_unfocus"
+        | "subagents_kill"
+        | "subagents_retry_announces"
+        | "subagents_orchestrate" => ToolConcurrencyClass::SideEffect,
         // Unknown tools: conservative default
         _ => ToolConcurrencyClass::SideEffect,
     }
@@ -222,6 +248,10 @@ pub fn validate_execution_policy(
 pub struct ToolAuthContext {
     pub caller_channel: String,
     pub caller_chat_id: i64,
+    /// Stable authorization principal (`main`, `scheduler`, or
+    /// `subagent:<run-id>`). Tool grants can match this value or a trailing
+    /// wildcard such as `subagent:*`.
+    pub principal: String,
     pub control_chat_ids: Vec<i64>,
     pub env_files: Vec<String>,
 }
@@ -251,6 +281,11 @@ pub fn auth_context_from_input(input: &serde_json::Value) -> Option<ToolAuthCont
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect())
         .unwrap_or_default();
+    let principal = ctx
+        .get("principal")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main")
+        .to_string();
     let env_files = ctx
         .get("env_files")
         .and_then(|v| v.as_array())
@@ -263,6 +298,7 @@ pub fn auth_context_from_input(input: &serde_json::Value) -> Option<ToolAuthCont
     Some(ToolAuthContext {
         caller_channel,
         caller_chat_id,
+        principal,
         control_chat_ids,
         env_files,
     })
@@ -288,6 +324,7 @@ pub fn inject_auth_context(input: serde_json::Value, auth: &ToolAuthContext) -> 
     let mut auth_val = json!({
         "caller_channel": auth.caller_channel,
         "caller_chat_id": auth.caller_chat_id,
+        "principal": auth.principal,
         "control_chat_ids": auth.control_chat_ids,
     });
     if !auth.env_files.is_empty() {

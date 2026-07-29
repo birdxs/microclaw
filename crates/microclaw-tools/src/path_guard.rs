@@ -324,12 +324,23 @@ mod tests {
     #[test]
     fn test_blocks_traversal_via_parent_dir() {
         // Paths using .. to reach blocked locations should still be caught
-        assert!(is_blocked(Path::new("/tmp/../etc/shadow")));
-        assert!(is_blocked(Path::new(
-            "/home/user/project/../../.ssh/id_rsa"
-        )));
-        assert!(is_blocked(Path::new("/foo/bar/../../../etc/sudoers")));
-        assert!(is_blocked(Path::new("/tmp/../home/user/.aws/credentials")));
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(is_blocked(Path::new("/tmp/../etc/shadow")));
+            assert!(is_blocked(Path::new(
+                "/home/user/project/../../.ssh/id_rsa"
+            )));
+            assert!(is_blocked(Path::new("/foo/bar/../../../etc/sudoers")));
+            assert!(is_blocked(Path::new("/tmp/../home/user/.aws/credentials")));
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(is_blocked(Path::new(r"C:\temp\..\Users\user\.ssh\id_rsa")));
+            assert!(is_blocked(Path::new(
+                r"C:\project\src\..\..\.aws\credentials"
+            )));
+        }
     }
 
     #[test]
@@ -373,7 +384,16 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
         #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+            // Creating symlinks on Windows requires Developer Mode or the
+            // SeCreateSymbolicLink privilege. The behavior is covered when
+            // the host permits constructing the fixture.
+            if error.raw_os_error() == Some(1314) {
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            panic!("failed to create test symlink: {error}");
+        }
         let err = check_path(link.to_string_lossy().as_ref()).unwrap_err();
         assert!(err.contains("symlink"));
         let _ = std::fs::remove_dir_all(&dir);

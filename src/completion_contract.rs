@@ -91,7 +91,9 @@ pub trait CommandRunner: Send + Sync {
 /// Parse the `exit_criteria` tool-input value. `None` when absent/null;
 /// errors on malformed entries so bad contracts fail loudly at spawn time
 /// instead of silently verifying nothing.
-pub fn parse_exit_criteria(value: Option<&serde_json::Value>) -> Result<Vec<ExitCriterion>, String> {
+pub fn parse_exit_criteria(
+    value: Option<&serde_json::Value>,
+) -> Result<Vec<ExitCriterion>, String> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };

@@ -107,7 +107,8 @@ struct SkillCompatibility {
 }
 
 fn parse_frontmatter(content: &str) -> Option<SkillFrontmatter> {
-    let trimmed = content.trim_start_matches('\u{feff}');
+    let normalized = content.replace("\r\n", "\n");
+    let trimmed = normalized.trim_start_matches('\u{feff}');
     let rest = trimmed.strip_prefix("---\n")?;
     let end_idx = rest.find("\n---\n").or_else(|| rest.find("\n...\n"))?;
     let yaml = &rest[..end_idx];
@@ -258,6 +259,14 @@ mod tests {
         let pdf_dir = BUILTIN_SKILLS_DIR.get_dir("pdf").unwrap();
         assert!(pdf_dir.get_file("SKILL.md").is_none());
         assert!(get_file_with_relative_dir(pdf_dir, "SKILL.md").is_some());
+    }
+
+    #[test]
+    fn test_parse_frontmatter_accepts_crlf() {
+        let frontmatter =
+            "---\r\nname: mac-only\r\nplatforms:\r\n  - darwin\r\ndeps: []\r\n---\r\n";
+        let parsed = parse_frontmatter(frontmatter).unwrap();
+        assert_eq!(parsed.platforms, vec!["darwin"]);
     }
 
     #[test]

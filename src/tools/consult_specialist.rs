@@ -95,12 +95,12 @@ need, say what's missing.",
             .join("");
         let answer = answer.trim();
         if answer.is_empty() {
-            return ToolResult::error("consult_specialist: the specialist returned no answer".into());
+            return ToolResult::error(
+                "consult_specialist: the specialist returned no answer".into(),
+            );
         }
 
-        ToolResult::success(
-            json!({ "specialist": profile.name, "answer": answer }).to_string(),
-        )
+        ToolResult::success(json!({ "specialist": profile.name, "answer": answer }).to_string())
     }
 }
 
@@ -112,9 +112,7 @@ mod tests {
     async fn missing_question_errors_before_any_llm_call() {
         let tool = ConsultSpecialistTool::new(&Config::test_defaults());
         // No `question` → returns early, never reaches the provider.
-        let res = tool
-            .execute(json!({ "specialist": "writer" }))
-            .await;
+        let res = tool.execute(json!({ "specialist": "writer" })).await;
         assert!(res.is_error);
         assert!(res.content.contains("question"));
     }

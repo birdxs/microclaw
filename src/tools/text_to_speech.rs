@@ -15,7 +15,9 @@ use crate::config::{Config, MediaConfig, TtsConfig};
 
 /// Trim and reject blank optional strings (e.g. an explicitly-empty config key).
 fn nonempty(s: Option<&str>) -> Option<String> {
-    s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 const ALLOWED_FORMATS: &[&str] = &["mp3", "opus", "aac", "flac", "wav", "pcm"];
@@ -233,16 +235,13 @@ async fn deliver_attachment(
     file: &std::path::Path,
     caption: &str,
 ) -> Result<String, String> {
-    let routing = match microclaw_channels::channel::get_required_chat_routing(
-        channels,
-        db.clone(),
-        chat_id,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return Err(e),
-    };
+    let routing =
+        match microclaw_channels::channel::get_required_chat_routing(channels, db.clone(), chat_id)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
     let Some(adapter) = channels.get(&routing.channel_name) else {
         return Err(format!("no adapter for channel '{}'", routing.channel_name));
     };
@@ -253,12 +252,11 @@ async fn deliver_attachment(
             file.display()
         ));
     }
-    let external_chat_id = microclaw_storage::db::call_blocking(db.clone(), move |d| {
-        d.get_chat_external_id(chat_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .unwrap_or_else(|| chat_id.to_string());
+    let external_chat_id =
+        microclaw_storage::db::call_blocking(db.clone(), move |d| d.get_chat_external_id(chat_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| chat_id.to_string());
     let caption_short = caption.chars().take(120).collect::<String>();
     match adapter
         .send_attachment(&external_chat_id, file, Some(&caption_short))
@@ -273,10 +271,7 @@ async fn deliver_attachment(
                 &format!("[audio attached: {}]", file.display()),
             )
             .await;
-            Ok(format!(
-                "delivered via channel '{}'",
-                routing.channel_name
-            ))
+            Ok(format!("delivered via channel '{}'", routing.channel_name))
         }
         Err(e) => Err(e),
     }

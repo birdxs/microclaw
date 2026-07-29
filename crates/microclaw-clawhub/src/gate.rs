@@ -131,8 +131,11 @@ mod tests {
 
     #[test]
     fn test_command_exists() {
-        // Should find system commands
-        assert!(command_exists("ls") || command_exists("dir"));
+        #[cfg(target_os = "windows")]
+        assert!(command_exists("cmd"));
+
+        #[cfg(not(target_os = "windows"))]
+        assert!(command_exists("sh"));
     }
 
     #[test]

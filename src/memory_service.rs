@@ -356,8 +356,7 @@ fn effective_memory_score(
         Ok(t) => t.with_timezone(&chrono::Utc),
         Err(_) => return m.confidence,
     };
-    let age_days =
-        (now - last_seen).num_seconds().max(0) as f64 / 86_400.0;
+    let age_days = (now - last_seen).num_seconds().max(0) as f64 / 86_400.0;
     let decay = 0.5_f64.powf(age_days / half_life_days);
     m.confidence * decay
 }
@@ -459,10 +458,7 @@ fn render_graph_section(triples: &[KgTriple], already_injected: &str) -> String 
         if injected_lc.contains(&subj_lc) && injected_lc.contains(&obj_lc) {
             continue;
         }
-        lines.push_str(&format!(
-            "{} —[{}]→ {}\n",
-            t.subject, t.predicate, t.object
-        ));
+        lines.push_str(&format!("{} —[{}]→ {}\n", t.subject, t.predicate, t.object));
     }
     lines
 }
@@ -537,7 +533,11 @@ pub(crate) async fn build_db_memory_context(
             }
             used_tokens += est;
             injected_ids.insert(m.id);
-            let scope = if m.chat_id.is_none() { "global" } else { "chat" };
+            let scope = if m.chat_id.is_none() {
+                "global"
+            } else {
+                "chat"
+            };
             out.push_str(&format!("[PROFILE] [{}] {}\n", scope, m.content));
         }
     }
@@ -569,7 +569,11 @@ pub(crate) async fn build_db_memory_context(
             used_tokens += est;
             injected_ids.insert(m.id);
             l1_count += 1;
-            let scope = if m.chat_id.is_none() { "global" } else { "chat" };
+            let scope = if m.chat_id.is_none() {
+                "global"
+            } else {
+                "chat"
+            };
             out.push_str(&format!("[{}] [{}] {}\n", m.category, scope, m.content));
         }
     }
@@ -659,7 +663,11 @@ pub(crate) async fn build_db_memory_context(
             used_tokens += est;
             injected_ids.insert(m.id);
             l2_count += 1;
-            let scope = if m.chat_id.is_none() { "global" } else { "chat" };
+            let scope = if m.chat_id.is_none() {
+                "global"
+            } else {
+                "chat"
+            };
             out.push_str(&format!("[{}] [{}] {}\n", m.category, scope, m.content));
         }
 
@@ -1013,12 +1021,24 @@ mod consolidation_tests {
     #[test]
     fn archives_near_duplicate_keeping_first() {
         let items = vec![
-            item(1, "user prefers concise replies and bullet points", "KNOWLEDGE"),
-            item(2, "user prefers concise replies and bullet points please", "KNOWLEDGE"),
+            item(
+                1,
+                "user prefers concise replies and bullet points",
+                "KNOWLEDGE",
+            ),
+            item(
+                2,
+                "user prefers concise replies and bullet points please",
+                "KNOWLEDGE",
+            ),
             item(3, "user lives in Berlin", "KNOWLEDGE"),
         ];
         let archived = select_duplicate_memories_to_archive(&items, 0.7, 20);
-        assert_eq!(archived, vec![2], "only the later near-duplicate is archived");
+        assert_eq!(
+            archived,
+            vec![2],
+            "only the later near-duplicate is archived"
+        );
     }
 
     #[test]

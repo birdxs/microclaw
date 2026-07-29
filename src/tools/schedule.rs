@@ -258,19 +258,21 @@ impl Tool for ScheduleTaskTool {
                 }
                 dt_utc.to_rfc3339()
             }
-            "random" => {
-                match crate::schedule_lifecycle::parse_duration_range(schedule_value) {
-                    Ok((min, max)) => crate::schedule_lifecycle::sample_random_next(
-                        Utc::now(),
-                        min,
-                        max,
-                        crate::schedule_lifecycle::random_unit(),
-                    )
-                    .to_rfc3339(),
-                    Err(e) => return ToolResult::error(e),
-                }
+            "random" => match crate::schedule_lifecycle::parse_duration_range(schedule_value) {
+                Ok((min, max)) => crate::schedule_lifecycle::sample_random_next(
+                    Utc::now(),
+                    min,
+                    max,
+                    crate::schedule_lifecycle::random_unit(),
+                )
+                .to_rfc3339(),
+                Err(e) => return ToolResult::error(e),
+            },
+            _ => {
+                return ToolResult::error(
+                    "schedule_type must be 'cron', 'once', or 'random'".into(),
+                )
             }
-            _ => return ToolResult::error("schedule_type must be 'cron', 'once', or 'random'".into()),
         };
 
         let max_runs = match input.get("max_runs") {
@@ -286,9 +288,7 @@ impl Tool for ScheduleTaskTool {
                 Ok(dt) => {
                     let dt_utc = dt.with_timezone(&Utc);
                     if dt_utc <= Utc::now() {
-                        return ToolResult::error(
-                            "not_after must be in the future".into(),
-                        );
+                        return ToolResult::error("not_after must be in the future".into());
                     }
                     Some(dt_utc.to_rfc3339())
                 }
@@ -444,9 +444,7 @@ impl Tool for ListTasksTool {
                     };
                     let mut lifecycle = String::new();
                     match t.max_runs {
-                        Some(max) => {
-                            lifecycle.push_str(&format!(" | runs: {}/{max}", t.run_count))
-                        }
+                        Some(max) => lifecycle.push_str(&format!(" | runs: {}/{max}", t.run_count)),
                         None if t.run_count > 0 => {
                             lifecycle.push_str(&format!(" | runs: {}", t.run_count))
                         }
@@ -1194,7 +1192,9 @@ mod tests {
             }))
             .await;
         assert!(result.is_error);
-        assert!(result.content.contains("must be 'cron', 'once', or 'random'"));
+        assert!(result
+            .content
+            .contains("must be 'cron', 'once', or 'random'"));
         cleanup(&dir);
     }
 

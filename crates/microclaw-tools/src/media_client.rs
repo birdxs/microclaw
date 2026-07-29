@@ -246,8 +246,8 @@ mod tests {
 
     #[test]
     fn debug_redacts_api_key() {
-        let mc = MediaClient::new("https://api.openai.com/v1".into(), "sk-secret".into(), 30)
-            .unwrap();
+        let mc =
+            MediaClient::new("https://api.openai.com/v1".into(), "sk-secret".into(), 30).unwrap();
         let dbg = format!("{mc:?}");
         assert!(dbg.contains("<redacted>"));
         assert!(!dbg.contains("sk-secret"));

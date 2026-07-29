@@ -32,10 +32,7 @@ impl ChatAbortControllerEntry {
 }
 
 /// Register a new chat abort controller for a run.
-pub async fn register_chat_run(
-    run_id: String,
-    session_key: String,
-) -> ChatAbortControllerEntry {
+pub async fn register_chat_run(run_id: String, session_key: String) -> ChatAbortControllerEntry {
     let entry = ChatAbortControllerEntry::new(session_key);
     let mut guard = CHAT_ABORT_CONTROLLERS.write().await;
     guard.insert(run_id, entry.clone());
@@ -56,10 +53,7 @@ pub async fn get_chat_run(run_id: &str) -> Option<ChatAbortControllerEntry> {
 }
 
 /// Signal abort for a specific run. Returns (aborted, partial_text).
-pub async fn abort_chat_run_by_id(
-    run_id: &str,
-    session_key: &str,
-) -> (bool, Option<String>) {
+pub async fn abort_chat_run_by_id(run_id: &str, session_key: &str) -> (bool, Option<String>) {
     let entry = {
         let guard = CHAT_ABORT_CONTROLLERS.read().await;
         guard.get(run_id).cloned()
