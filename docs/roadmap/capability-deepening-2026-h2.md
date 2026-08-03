@@ -60,10 +60,13 @@ autonomous/"smarter" features drift.
   a deterministic **`deep_research`** tool — fan-out sub-queries → dedup → SSRF-guarded concurrent
   fetch → citation-numbered digest with source-agreement signals. Tool does the mechanical gather;
   the agent does semantic cross-verification + synthesis with citations.
-- **Next:** promote `researcher` into a true deep-research **workflow** (this is the best first use
-  case for v0.4.0 contract-governed orchestration: planner splits sub-questions → research
-  sub-agents fan out → adversarial verifier flags conflicts → cited synthesis); structured
-  source/citation store; optional SearXNG bundled in the setup wizard (no key, $5-VPS-friendly).
+- **Shipped in v0.3.3:** the built-in `deep-research-workflow` operationalizes
+  contract-governed orchestration: distinct sub-question packages fan out through
+  `subagents_orchestrate`, investigators return source ledgers, and an adversarial
+  verifier gates synthesis on citation coverage, source independence, conflict
+  disposition, unsupported claims, and a PASS/FAIL completion contract.
+- **Next:** structured source/citation persistence and optional SearXNG bundled
+  in the setup wizard (no key, $5-VPS-friendly).
 - **Eval:** fixture question scores citation coverage, source independence (distinct domains), and
   conflict detection.
 - **Priority: high** — advances "smarter" and "research" at once; Rust + self-hosted search is a
@@ -119,7 +122,7 @@ autonomous/"smarter" features drift.
 | 2 | Skill curator (deterministic, skills-only) | smarter | v0.3.0 | medium |
 | 3 | Guardrails warn→block + post-output scan | security 5a | v0.3.0 | medium |
 | 4 | Resilience/recovery + scheduler DLQ replay | stable | **implemented; pending merge** | medium |
-| 5 | Deep-research workflow (contract orchestration) | research | v0.4.0 | medium |
+| 5 | Deep-research workflow (contract orchestration) | research | **shipped v0.3.3** | medium |
 | 6 | Native egress control + per-chat tool authz | security 5a | **implemented; pending merge** | high |
 | 7 | Security vertical (dep-monitor / CVE summarize) | security 5b | v0.4.0 | medium |
 | 8 | Personality growth / inner monologue | human | after eval coverage | high |

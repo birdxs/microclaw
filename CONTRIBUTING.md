@@ -9,6 +9,9 @@
 
 ## Local Setup
 
+Web UI and documentation builds require Node.js 24.x. npm enforces this
+requirement during dependency installation.
+
 ```sh
 cp microclaw.config.example.yaml microclaw.config.yaml
 cargo build

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG NODE_VERSION=20
+ARG NODE_VERSION=24
 ARG RUST_VERSION=1.93.1
 
 # Stage 1: Build embedded web assets so the binary does not depend on checked-in dist files.

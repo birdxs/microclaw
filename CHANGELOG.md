@@ -6,6 +6,60 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+### Changed
+
+- Reworked the root README files into concise project entry points, moved
+  setup and integration detail into task-focused documentation, and added
+  localized overview and quick-start pages for 10 widely used languages.
+
+## 0.3.5 - 2026-08-01
+
+### Changed
+
+- Dependency maintenance now checks Cargo and Web npm updates weekly after a
+  seven-day cooldown, keeps GitHub Actions on a predictable monthly schedule,
+  and splits large update groups by SemVer level or dependency type. Web UI,
+  CI, nightly, and release builds now require Node.js 24.x and enforce package
+  engine compatibility during npm installs.
+
+## 0.3.4 - 2026-07-31
+
+### Added
+
+- **Learning Foundry.** Durable user-directed learning tracks run bounded,
+  read-only research epochs on a cron schedule and produce source-backed,
+  test-bearing skill candidates. Candidates remain inert until an
+  administrator explicitly promotes them; existing skills continue to require
+  comparative reflection and shadow evidence for changes.
+- **Learning Foundry evaluator.** New candidates run paired no-tool
+  baseline/candidate scenarios, persist token use, latency, evidence and
+  regressions, and fail closed unless evaluation improves on baseline before
+  manual promotion.
+
+## 0.3.3 - 2026-07-30
+
+### Added
+
+- **Reliability Proof Pack.** `scripts/ci/reliability_scorecard.sh` now exercises
+  recovery, scheduler replay, durable delivery, payload integrity, rate-limit
+  recovery, command timeout, malformed provider wrappers, output sanitization,
+  cross-chat permissions, and sandbox fail-closed behavior. It emits a
+  machine-readable JSON scorecard, a linked Markdown report, and per-scenario
+  logs; the existing Stability Smoke release gate runs the proof pack.
+- **Contract-governed deep research workflow.** The new built-in
+  `deep-research-workflow` skill decomposes broad questions into distinct
+  parallel research packages, requires source ledgers and completion
+  contracts, runs an adversarial verifier, and reports citation coverage,
+  source independence, conflict disposition, unsupported claims, and a final
+  PASS/FAIL verdict before synthesis.
+
+### Fixed
+
+- Database schema v41 repairs incomplete historical `scheduled_tasks`
+  migrations even when `db_meta.schema_version` was already advanced. Existing
+  databases missing `exit_criteria`, `run_count`, `max_runs`, `not_after`, or
+  `timezone` are repaired on open before scheduler queries execute.
+
 ## 0.3.2 - 2026-07-28
 
 ### Added

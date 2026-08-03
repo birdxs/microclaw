@@ -43,10 +43,21 @@ Handset display remains a human acceptance check because server-side acknowledge
 
 Do not yet claim that MicroClaw is universally “more reliable than ZeroClaw” or any other project. A defensible comparative claim needs the same failure-injection suite, channel, payloads, retry window, and release versions across projects.
 
-The next useful benchmark is a repeatable reliability scorecard covering process termination, network timeout, rate limiting, duplicate acknowledgement, malformed model wrappers, and payloads above each channel's native limit. Publish pass/fail evidence and recovery time rather than a subjective feature count.
+The in-repository baseline is now implemented as
+`scripts/ci/reliability_scorecard.sh`. It covers process recovery, scheduler
+reopen and DLQ replay, delivery idempotency, rate-limit recovery, command
+timeout, malformed model wrappers, output sanitization, payloads above channel
+limits, cross-chat permissions, and sandbox fail-closed behavior. Each run
+publishes pass/fail evidence, duration, and per-scenario logs as JSON and
+Markdown.
+
+This proves the MicroClaw baseline only. A comparative claim still requires the
+same scenarios, channel, payloads, retry window, and release versions across
+projects; missing competitor automation must be reported as N/A rather than
+silently treated as a failure.
 
 The in-repository baseline can be run with:
 
 ```sh
-scripts/ci/stability_smoke.sh
+scripts/ci/reliability_scorecard.sh
 ```

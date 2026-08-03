@@ -13,10 +13,11 @@ cargo run -- start
 ## Prerequisites
 
 - Rust 1.70+ (2021 edition)
+- Node.js 24.x for Web UI and documentation builds
 - At least one enabled channel adapter (Telegram bot token from @BotFather, Discord bot token from Discord Developer Portal, Slack app/bot tokens, Feishu/Lark app credentials, or Web UI)
 - A model provider API key (Anthropic or OpenAI-compatible)
 
-No other external dependencies. SQLite is bundled via `rusqlite`.
+No other runtime dependencies. SQLite is bundled via `rusqlite`.
 
 ## Project structure
 

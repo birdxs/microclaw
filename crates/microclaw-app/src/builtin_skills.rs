@@ -368,4 +368,20 @@ body
             assert!(reason.is_some());
         }
     }
+
+    #[test]
+    fn test_ensure_builtin_skills_includes_contract_governed_research_workflow() {
+        let root = temp_root();
+        let skills_root = root.join("skills");
+        ensure_builtin_skills(&skills_root).unwrap();
+
+        let workflow =
+            std::fs::read_to_string(skills_root.join("deep-research-workflow").join("SKILL.md"))
+                .unwrap();
+        assert!(workflow.contains("subagents_orchestrate"));
+        assert!(workflow.contains("VERDICT: PASS"));
+        assert!(workflow.contains("Citation coverage"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
