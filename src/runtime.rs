@@ -35,19 +35,17 @@ use crate::channels::{
 use crate::chat_turn_queue::ChatTurnQueue;
 use crate::config::normalize_model_name;
 use crate::config::Config;
-use crate::embedding::EmbeddingProvider;
 use crate::hooks::HookManager;
-use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
 use crate::memory_backend::MemoryBackend;
 use crate::skills::SkillManager;
 use crate::tools::ToolRegistry;
 use crate::web::WebAdapter;
-use microclaw_channels::channel_adapter::ChannelRegistry;
-use microclaw_observability::logs::OtlpLogExporter;
-use microclaw_observability::metrics::OtlpMetricExporter;
-use microclaw_observability::traces::OtlpTraceExporter;
-use microclaw_storage::db::Database;
+use microclaw_engine::channel_adapter::ChannelRegistry;
+use microclaw_engine::observability::logs::OtlpLogExporter;
+use microclaw_engine::observability::metrics::OtlpMetricExporter;
+use microclaw_engine::observability::traces::OtlpTraceExporter;
+use microclaw_engine::storage::db::Database;
 
 #[cfg(not(feature = "channel-matrix"))]
 fn warn_missing_feature(config: &Config, channel_key: &str, feature_name: &str) {
@@ -59,25 +57,7 @@ fn warn_missing_feature(config: &Config, channel_key: &str, feature_name: &str) 
     }
 }
 
-pub struct AppState {
-    pub config: Config,
-    pub channel_registry: Arc<ChannelRegistry>,
-    pub db: Arc<Database>,
-    pub memory: MemoryManager,
-    pub skills: SkillManager,
-    pub hooks: Arc<HookManager>,
-    pub llm: Box<dyn LlmProvider>,
-    pub llm_provider_overrides: Arc<RwLock<HashMap<String, String>>>,
-    pub llm_model_overrides: Arc<RwLock<HashMap<String, String>>>,
-    pub embedding: Option<Arc<dyn EmbeddingProvider>>,
-    pub memory_backend: Arc<MemoryBackend>,
-    pub tools: ToolRegistry,
-    pub chat_turn_queue: Arc<ChatTurnQueue>,
-    pub skill_review_queue: crate::skill_review::SkillReviewQueue,
-    pub metric_exporter: Option<Arc<OtlpMetricExporter>>,
-    pub trace_exporter: Option<Arc<OtlpTraceExporter>>,
-    pub log_exporter: Option<Arc<OtlpLogExporter>>,
-}
+pub use microclaw_engine::runtime::AppState;
 
 fn prepare_channel_runtimes<T, Build, Register, ModelOverride>(
     config: &Config,
@@ -493,15 +473,15 @@ pub async fn run(
         config,
         channel_registry,
         db,
-        memory,
-        skills,
+        memory: Arc::new(memory),
+        skills: Arc::new(skills),
         hooks,
-        llm,
+        llm: Arc::from(llm),
         llm_provider_overrides: Arc::new(RwLock::new(llm_provider_overrides)),
         llm_model_overrides: Arc::new(RwLock::new(llm_model_overrides)),
         embedding,
         memory_backend,
-        tools,
+        tools: Arc::new(tools),
         chat_turn_queue,
         skill_review_queue,
         metric_exporter,

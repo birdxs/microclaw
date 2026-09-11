@@ -2,74 +2,18 @@ import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
-import {useEffect, useMemo, useState} from 'react';
+import {useEffect, useState} from 'react';
 import styles from './index.module.css';
 import {getHomeMessages} from '../home-i18n';
 
-const SYSTEMS = [
-  {id: 'macos', label: 'macOS', icon: 'macos'},
-  {id: 'windows', label: 'Windows', icon: 'windows'},
-  {id: 'linux', label: 'Linux', icon: 'linux'},
-];
-
-const INSTALL_OPTIONS_BY_SYSTEM = {
-  macos: [
-    {
-      id: 'work-cask',
-      labelKey: 'work',
-      command: 'brew tap microclaw/tap && brew install --cask microclaw-work',
-      hintKey: 'work',
-    },
-    {
-      id: 'install-script',
-      labelKey: 'script',
-      command: 'curl -fsSL https://microclaw.org/install.sh | bash',
-      hintKey: 'macScript',
-    },
-    {
-      id: 'homebrew',
-      labelKey: 'brew',
-      command: 'brew tap microclaw/tap && brew install microclaw',
-      hintKey: 'brew',
-    },
-    {
-      id: 'cargo',
-      labelKey: 'cargo',
-      command:
-        'git clone https://github.com/microclaw/microclaw.git && cd microclaw && cargo build --release',
-      hintKey: 'source',
-    },
-  ],
-  windows: [
-    {
-      id: 'install-script',
-      labelKey: 'powershell',
-      command: 'iwr https://microclaw.org/install.ps1 -UseBasicParsing | iex',
-      hintKey: 'windowsScript',
-    },
-    {
-      id: 'cargo',
-      labelKey: 'cargo',
-      command:
-        'git clone https://github.com/microclaw/microclaw.git; cd microclaw; cargo build --release',
-      hintKey: 'source',
-    },
-  ],
-  linux: [
-    {
-      id: 'install-script',
-      labelKey: 'script',
-      command: 'curl -fsSL https://microclaw.org/install.sh | bash',
-      hintKey: 'linuxScript',
-    },
-    {
-      id: 'cargo',
-      labelKey: 'cargo',
-      command:
-        'git clone https://github.com/microclaw/microclaw.git && cd microclaw && cargo build --release',
-      hintKey: 'source',
-    },
-  ],
+const PATH_COMMANDS = {
+  sdk: 'microclaw-sdk = { version = "0.6.1", features = ["full"] }',
+  work: 'brew tap microclaw/tap && brew install --cask microclaw-work',
+  server: {
+    macos: 'curl -fsSL https://microclaw.org/install.sh | bash',
+    linux: 'curl -fsSL https://microclaw.org/install.sh | bash',
+    windows: 'iwr https://microclaw.org/install.ps1 -UseBasicParsing | iex',
+  },
 };
 
 function detectSystem() {
@@ -96,38 +40,22 @@ function detectSystem() {
 function HomepageHeader() {
   const {i18n} = useDocusaurusContext();
   const messages = getHomeMessages(i18n.currentLocale);
-  const [activeSystem, setActiveSystem] = useState('macos');
-  const [activeInstall, setActiveInstall] = useState(
-    INSTALL_OPTIONS_BY_SYSTEM.macos[0].id,
-  );
-  const [copyStatus, setCopyStatus] = useState('idle');
+  const [system, setSystem] = useState('macos');
+  const [copiedPath, setCopiedPath] = useState(null);
 
   useEffect(() => {
-    const system = detectSystem();
-    const fallbackInstall = INSTALL_OPTIONS_BY_SYSTEM[system]?.[0]?.id ?? INSTALL_OPTIONS_BY_SYSTEM.macos[0].id;
-    setActiveSystem(system);
-    setActiveInstall(fallbackInstall);
+    setSystem(detectSystem());
   }, []);
 
-  const activeSystemOptions = useMemo(
-    () => INSTALL_OPTIONS_BY_SYSTEM[activeSystem] ?? INSTALL_OPTIONS_BY_SYSTEM.macos,
-    [activeSystem],
-  );
-
-  const activeInstallOption = useMemo(
-    () => activeSystemOptions.find((item) => item.id === activeInstall) ?? activeSystemOptions[0],
-    [activeInstall, activeSystemOptions],
-  );
-
-  const copyInstallCommand = async () => {
+  const copyCommand = async (path, command) => {
     let copied = false;
     try {
       if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(activeInstallOption.command);
+        await navigator.clipboard.writeText(command);
         copied = true;
       } else if (typeof document !== 'undefined') {
         const textarea = document.createElement('textarea');
-        textarea.value = activeInstallOption.command;
+        textarea.value = command;
         textarea.style.position = 'fixed';
         textarea.style.opacity = '0';
         document.body.appendChild(textarea);
@@ -141,20 +69,45 @@ function HomepageHeader() {
     }
 
     if (copied) {
-      setCopyStatus('copied');
-      window.setTimeout(() => setCopyStatus('idle'), 1800);
+      setCopiedPath(path);
+      window.setTimeout(() => setCopiedPath(null), 1800);
     }
   };
+
+  const paths = [
+    {
+      id: 'sdk',
+      className: styles.pathCardSdk,
+      command: PATH_COMMANDS.sdk,
+      href: '/docs/sdk-quickstart',
+      ...messages.paths.sdk,
+    },
+    {
+      id: 'work',
+      className: styles.pathCardWork,
+      command: PATH_COMMANDS.work,
+      href: '/docs/work',
+      ...messages.paths.work,
+    },
+    {
+      id: 'server',
+      className: styles.pathCardServer,
+      command: PATH_COMMANDS.server[system] ?? PATH_COMMANDS.server.linux,
+      href: '/docs/quickstart',
+      environment: messages.systemLabels[system],
+      ...messages.paths.server,
+    },
+  ];
 
   return (
     <header className={styles.hero}>
       <div className={styles.heroBackdrop} />
       <div className={styles.heroPattern} />
       <div className="container">
-        <div className={styles.heroLayout}>
-          <div className={styles.heroContent}>
+        <div className={styles.heroContent}>
+          <div className={styles.heroLead}>
             <div className={styles.eyebrow}>{messages.eyebrow}</div>
-            <Link className={styles.releasePill} href="https://github.com/microclaw/microclaw/releases/tag/v0.5.4">
+            <Link className={styles.releasePill} href="https://github.com/microclaw/microclaw/releases/tag/v0.6.1">
               {messages.release} <span aria-hidden="true">→</span>
             </Link>
             <Heading as="h1" className={styles.heroTitle}>
@@ -164,86 +117,84 @@ function HomepageHeader() {
             <p className={styles.heroSubtext}>
               {messages.heroText}
             </p>
-
-            <div className={styles.heroActions}>
-              <Link className="button button--primary button--lg" to="/docs/quickstart">
-                {messages.start}
-              </Link>
-              <Link className={styles.darkButton} href="https://github.com/microclaw/microclaw">
-                {messages.github}
-              </Link>
-            </div>
-
             <div className={styles.heroMetaRow}>
               {messages.meta.map((item) => <span key={item}>{item}</span>)}
             </div>
           </div>
 
-          <div className={styles.installPanel}>
-            <div className={styles.installHeader}>
-              <span className={styles.installIdentity}>
-                <img className={styles.brandGlyph} src="/img/logo.png" alt="" />
-                {messages.quickstart}
-              </span>
-              <span className={styles.liveSignal} aria-hidden="true" />
-            </div>
-            <div className={styles.systemSwitcher}>
-              <div className={styles.systemTabs}>
-                {SYSTEMS.map((system) => (
-                  <button
-                    key={system.id}
-                    type="button"
-                    onClick={() => {
-                      const fallbackInstall = INSTALL_OPTIONS_BY_SYSTEM[system.id]?.[0]?.id;
-                      setActiveSystem(system.id);
-                      if (fallbackInstall) {
-                        setActiveInstall(fallbackInstall);
-                      }
-                    }}
-                    className={`${styles.systemTab} ${
-                      activeSystem === system.id ? styles.systemTabActive : ''
-                    }`}>
-                    <span
-                      className={`${styles.systemIcon} ${
-                        system.icon === 'macos'
-                          ? styles.systemIconMac
-                          : system.icon === 'windows'
-                            ? styles.systemIconWindows
-                            : styles.systemIconLinux
-                      }`}
-                    />
-                    {system.label}
+          <div className={styles.pathGrid}>
+            {paths.map((path, index) => (
+              <article key={path.id} className={`${styles.pathCard} ${path.className}`}>
+                <div className={styles.pathTopline}>
+                  <span className={styles.pathNumber}>0{index + 1}</span>
+                  <span className={styles.pathBadge}>{path.badge}</span>
+                </div>
+                <h2>{path.title}</h2>
+                <p className={styles.pathAudience}>{path.audience}</p>
+                <p className={styles.pathDescription}>{path.description}</p>
+                <ul className={styles.pathBenefits}>
+                  {path.benefits.map((benefit) => <li key={benefit}>{benefit}</li>)}
+                </ul>
+                <div className={styles.pathCommandLabel}>
+                  <span>{path.commandLabel}</span>
+                  {path.environment && <span>{path.environment}</span>}
+                </div>
+                <div className={styles.pathCommandRow}>
+                  <code>{path.command}</code>
+                  <button type="button" onClick={() => copyCommand(path.id, path.command)}>
+                    {copiedPath === path.id ? messages.copied : messages.copy}
                   </button>
-                ))}
-              </div>
-            </div>
-            <div className={styles.installTabs}>
-              {activeSystemOptions.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setActiveInstall(item.id)}
-                  className={`${styles.installTab} ${
-                    activeInstall === item.id ? styles.installTabActive : ''
-                  }`}>
-                  {messages.installLabels[item.labelKey]}
-                </button>
-              ))}
-            </div>
-            <p className={styles.installHint}>{messages.installHints[activeInstallOption.hintKey]}</p>
-            <div className={styles.installRow}>
-              <code className={styles.installCommand}>{activeInstallOption.command}</code>
-              <button
-                className={`${styles.copyButton} ${copyStatus === 'copied' ? styles.copyButtonCopied : ''}`}
-                type="button"
-                onClick={copyInstallCommand}>
-                {copyStatus === 'copied' ? messages.copied : messages.copy}
-              </button>
-            </div>
+                </div>
+                <Link className={styles.pathAction} to={path.href}>
+                  {path.action} <span aria-hidden="true">→</span>
+                </Link>
+              </article>
+            ))}
           </div>
         </div>
       </div>
     </header>
+  );
+}
+
+function ArchitectureMap({label}) {
+  const capabilities = ['Skills', 'Tools + MCP', 'Memory', 'Policy', 'Workers', 'Observability'];
+
+  return (
+    <div className={styles.archMap} role="img" aria-label={label}>
+      <div className={styles.archEntryRow}>
+        <div className={`${styles.archEntry} ${styles.archEntrySdk}`}>
+          <span>01 · Embed</span>
+          <strong>Rust SDK</strong>
+        </div>
+        <div className={`${styles.archEntry} ${styles.archEntryWork}`}>
+          <span>02 · Desktop</span>
+          <strong>MicroClaw Work</strong>
+        </div>
+        <div className={`${styles.archEntry} ${styles.archEntryServer}`}>
+          <span>03 · Service</span>
+          <strong>MicroClaw Server</strong>
+        </div>
+      </div>
+
+      <div className={styles.archConnector} aria-hidden="true">
+        <span />
+        <em>one shared core</em>
+        <span />
+      </div>
+
+      <div className={styles.archEngine}>
+        <span>PROVIDER-NEUTRAL RUNTIME</span>
+        <strong>MicroClaw Agent Engine</strong>
+        <p>Agent Loop · Run lifecycle · Events · Recovery</p>
+      </div>
+
+      <div className={styles.archCapabilityGrid}>
+        {capabilities.map((capability) => (
+          <span key={capability}>{capability}</span>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -266,28 +217,6 @@ export default function Home() {
                   <span className={styles.proofLabel}>{label}</span>
                   <p>{text}</p>
                 </div>
-              ))}
-            </div>
-          </div>
-        </section>
-
-        <section className={styles.productSection}>
-          <div className="container">
-            <div className={styles.sectionHeader}>
-              <Heading as="h2">{messages.productsTitle}</Heading>
-              <p>{messages.productsText}</p>
-            </div>
-            <div className={styles.productGrid}>
-              {messages.products.map(([name, badge, text, availability, href]) => (
-                <article key={name} className={styles.productCard}>
-                  <div className={styles.productCardHeader}>
-                    <h3>{name}</h3>
-                    <span>{badge}</span>
-                  </div>
-                  <p>{text}</p>
-                  <div className={styles.productAvailability}>{availability}</div>
-                  <Link to={href}>{messages.productAction}</Link>
-                </article>
               ))}
             </div>
           </div>
@@ -318,10 +247,7 @@ export default function Home() {
             </div>
             <div className={styles.archLayout}>
               <div className={styles.archVisualCard}>
-                <img
-                  src="/img/blog/microclaw-runtime/01-system-architecture.svg"
-                  alt={messages.architectureAlt}
-                />
+                <ArchitectureMap label={messages.architectureAlt} />
               </div>
               <div className={styles.archSteps}>
                 {messages.architectureSteps.map(([title, text], index) => (
@@ -343,11 +269,11 @@ export default function Home() {
               <p>{messages.useCasesText}</p>
             </div>
             <div className={styles.useCaseGrid}>
-              {messages.useCases.map(([title, text]) => (
+              {messages.useCases.map(([title, text, href]) => (
                 <article key={title} className={styles.useCaseCard}>
                   <h3>{title}</h3>
                   <p>{text}</p>
-                  <Link to="/docs/overview">{messages.readDetails}</Link>
+                  <Link to={href || '/docs/overview'}>{messages.readDetails}</Link>
                 </article>
               ))}
             </div>
@@ -367,6 +293,9 @@ export default function Home() {
                 </Link>
                 <Link className="button button--secondary button--lg" to="/docs/architecture">
                   {messages.architectureDocs}
+                </Link>
+                <Link className="button button--secondary button--lg" to="/docs/sdk">
+                  {messages.sdkDocs}
                 </Link>
                 <Link className={styles.inlineLink} to="/docs/generated-tools">
                   {messages.toolsReference}

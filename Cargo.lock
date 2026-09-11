@@ -891,7 +891,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -4375,12 +4375,12 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.6.1",
+ "windows-registry 0.5.3",
 ]
 
 [[package]]
@@ -6009,7 +6009,7 @@ dependencies = [
 
 [[package]]
 name = "microclaw"
-version = "0.5.4"
+version = "0.6.1"
 dependencies = [
  "aes",
  "agent-client-protocol",
@@ -6032,13 +6032,8 @@ dependencies = [
  "include_dir",
  "matrix-sdk",
  "md5",
- "microclaw-app",
- "microclaw-channels",
- "microclaw-clawhub",
  "microclaw-core",
- "microclaw-observability",
- "microclaw-storage",
- "microclaw-tools",
+ "microclaw-engine",
  "native-tls",
  "opentelemetry-proto 0.28.0",
  "opentelemetry-semantic-conventions",
@@ -6078,56 +6073,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "microclaw-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "include_dir",
- "microclaw-observability",
- "opentelemetry-appender-tracing",
- "opentelemetry_sdk 0.30.0",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "serde_yaml",
- "tracing",
- "tracing-journald",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "microclaw-channels"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "microclaw-core",
- "microclaw-storage",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "microclaw-clawhub"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "microclaw-core",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "uuid",
- "zip",
-]
-
-[[package]]
 name = "microclaw-core"
-version = "0.1.0"
+version = "0.6.1"
 dependencies = [
  "once_cell",
  "regex",
@@ -6140,60 +6087,81 @@ dependencies = [
 ]
 
 [[package]]
-name = "microclaw-observability"
-version = "0.1.0"
+name = "microclaw-engine"
+version = "0.6.1"
 dependencies = [
- "base64",
- "opentelemetry 0.30.0",
- "opentelemetry-otlp",
- "opentelemetry-proto 0.28.0",
- "opentelemetry_sdk 0.30.0",
- "prost",
- "reqwest 0.12.28",
- "serde_yaml",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "microclaw-storage"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "microclaw-core",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlite-vec",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "microclaw-tools"
-version = "0.1.0"
-dependencies = [
+ "agent-client-protocol",
  "anyhow",
  "async-trait",
  "base64",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "cron",
+ "futures-util",
+ "glob",
+ "http",
+ "iana-time-zone",
+ "include_dir",
+ "md5",
  "microclaw-core",
+ "native-tls",
+ "opentelemetry 0.30.0",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry-proto 0.28.0",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk 0.30.0",
+ "prost",
+ "pulldown-cmark",
+ "qrcode",
  "regex",
  "reqwest 0.12.28",
+ "rmcp",
+ "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
+ "shellexpand",
+ "sqlite-vec",
  "tempfile",
+ "thiserror 2.0.19",
  "tokio",
+ "tokio-native-tls",
+ "tokio-tungstenite 0.24.0",
+ "tokio-util",
+ "toml 0.8.23",
  "tracing",
+ "tracing-journald",
+ "tracing-subscriber",
+ "typst",
+ "typst-layout",
+ "typst-pdf",
+ "url",
  "urlencoding",
  "uuid",
+ "yaml-edit",
+ "zip",
+]
+
+[[package]]
+name = "microclaw-sdk"
+version = "0.6.1"
+dependencies = [
+ "async-trait",
+ "microclaw-core",
+ "microclaw-engine",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
 name = "microclaw-work"
-version = "0.5.4"
+version = "0.6.1"
 dependencies = [
  "dirs",
  "embed-resource",
@@ -6212,7 +6180,7 @@ dependencies = [
 
 [[package]]
 name = "microclaw-work-app"
-version = "0.1.0"
+version = "0.6.1"
 dependencies = [
  "microclaw-core",
  "serde",
@@ -6223,10 +6191,9 @@ dependencies = [
 
 [[package]]
 name = "microclaw-work-headless"
-version = "0.1.0"
+version = "0.6.1"
 dependencies = [
- "microclaw",
- "microclaw-core",
+ "microclaw-sdk",
  "microclaw-work-app",
  "serde_json",
  "tempfile",
@@ -6235,12 +6202,16 @@ dependencies = [
 
 [[package]]
 name = "microclaw-work-runtime"
-version = "0.1.0"
+version = "0.6.1"
 dependencies = [
+ "anyhow",
+ "chrono",
  "dirs",
- "microclaw",
  "microclaw-core",
+ "microclaw-engine",
+ "microclaw-sdk",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror 2.0.19",
@@ -7961,7 +7932,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -7999,7 +7970,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -10099,7 +10070,7 @@ version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
 dependencies = [
- "skrifa 0.42.1",
+ "skrifa 0.40.0",
  "yazi",
  "zeno",
 ]
@@ -12838,17 +12809,6 @@ dependencies = [
  "windows-link 0.1.3",
  "windows-result 0.3.4",
  "windows-strings 0.4.2",
-]
-
-[[package]]
-name = "windows-registry"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02752bf7fbdcce7f2a27a742f798510f3e5ad88dbe84871e5168e2120c3d5720"
-dependencies = [
- "windows-link 0.2.1",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
 ]
 
 [[package]]

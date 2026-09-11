@@ -4,6 +4,34 @@
 
 Use this guide for rolling upgrades that may include schema/auth/hooks/session/metrics changes.
 
+### SDK and products v0.6.1
+
+Version `0.6.1` is a patch release with no intended SDK API or configuration
+breaks. Server, Work, Work Headless, and the three public Rust crates move
+together to `0.6.1`. Release automation now validates the complete artifact
+set and excludes internal Docker Buildx records from GitHub Release uploads.
+
+### SDK and products v0.6.0
+
+Server, Work, all shared Rust crates, and the web package metadata now use one
+`0.6.0` version. SDK consumers should update `microclaw-core`,
+`microclaw-engine`, and `microclaw-sdk` together. The SDK feature tiers remain
+`minimal`, `standard`, and `full`; no compatibility shim is required for 0.5
+Skill or delegated-task APIs.
+
+Work hosts gain the same governed Skill lifecycle and durable Subagent
+projections exposed by the SDK. Custom hosts should keep all Workspace writes
+behind one authorization and mutation boundary even when delegated work runs
+in parallel.
+
+### SDK v0.5.0
+
+The three public Rust crates move together to `0.5.0`. `microclaw-sdk` adds live
+Skill lifecycle management, typed durable delegation projections, cancellation,
+and configurable remote Worker reconnect policy. `DelegatedTask.status` is now
+`DelegatedTaskStatus`; use `as_str()` when displaying it and retain the
+`Unknown` case when matching exhaustively.
+
 ## Pre-Upgrade Checklist
 
 1. Backup SQLite database (`microclaw.db`).

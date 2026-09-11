@@ -11,6 +11,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust-windows:
     name: Rust (windows-latest)
@@ -45,7 +49,9 @@ jobs:
           toolchain: 1.95.0
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-llvm-cov --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
       - run: cargo llvm-cov -p microclaw --all-features --lcov --output-path target/llvm-cov.lcov
       - uses: actions/upload-artifact@v7
         with:
@@ -58,8 +64,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: DeterminateSystems/nix-installer-action@v19
-      - uses: DeterminateSystems/magic-nix-cache-action@v13
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
         with:
           use-gha-cache: enabled
           use-flakehub: disabled
@@ -83,20 +89,3 @@ jobs:
       - run: cargo clippy -p microclaw-work-app --all-targets --locked -- -D warnings
       - run: cargo clippy -p microclaw-work --all-targets --no-deps --locked -- -D warnings
       - run: cargo clippy -p microclaw-work-headless --all-targets --no-deps --locked -- -D warnings
-      - name: Reclaim disk before release bundle
-        run: cargo clean
-      - name: Build release macOS DMG preview
-        run: scripts/build_work_macos_dmg.sh work-release
-        env:
-          MICROCLAW_WORK_RECLAIM_BUILD_ARTIFACTS: '1'
-      - name: Verify macOS release artifacts
-        run: scripts/verify_work_macos_release.sh work-release
-      - name: Launch-smoke macOS app bundle
-        run: scripts/smoke_work_macos_app.sh work-release
-      - name: Upload macOS preview
-        uses: actions/upload-artifact@v7
-        with:
-          name: microclaw-work-macos-dmg
-          path: target/microclaw-work-installer/work-release/*.dmg
-          if-no-files-found: error
-          retention-days: 14

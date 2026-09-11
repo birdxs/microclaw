@@ -6,6 +6,242 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+## 0.6.1 - 2026-09-04
+
+### Changed
+
+- Added reusable per-platform release caches and a bounded timeout for Server
+  release builds, reducing repeated patch-release compilation time.
+- Updated official artifact, Docker, and Nix actions to their current Node
+  24-based major versions.
+- Updated the public Rust SDK install examples and release guide to the stable
+  `0.6.1` release.
+- Allowed the Server Homebrew formula to advance independently when a signed
+  and notarized Work DMG is not available, while preserving the existing Work
+  cask.
+
+### Fixed
+
+- Restricted GitHub Release aggregation to distributable Server, Work, and
+  reliability artifacts so Docker Buildx's internal `.dockerbuild` records
+  cannot break the final upload step.
+- Added a strict release manifest check that rejects missing or unexpected
+  Server, Work, and reliability assets before checksums or publication.
+- Corrected the documentation home page release badge and link, which still
+  referenced v0.5.5 after the v0.6.0 release.
+- Added a release-version guard for public SDK snippets and stable-version
+  references across the README files and documentation home page.
+
+## 0.6.0 - 2026-09-04
+
+### Added
+
+- Added a CI release invariant that keeps Server, Work, Work Headless, the
+  internal Work crates, Core, Engine, SDK, and web package metadata on one
+  product version.
+- Extended the release asset CI guard to accommodate cold Docker and stability
+  builds without timing out a healthy tagged release.
+- Added native Work management for governed local, GitHub, and ClawHub Skills,
+  including source/version visibility, enablement, compatibility diagnostics,
+  background import, and recoverable removal.
+- Added durable, observable, and cancellable Main Agent delegation in Work and
+  stable SDK projections for delegated tasks.
+
+### Changed
+
+- Aligned the complete MicroClaw product and Rust workspace at 0.6.0.
+- Formalized the single-writer Workspace model: Subagents can perform bounded
+  parallel work while the Main Agent retains approvals, mutation ordering,
+  cancellation, and the final response.
+- Kept Server and Work on one SDK and Agent Engine execution path while
+  preserving the SDK's `minimal`, `standard`, and `full` dependency tiers.
+
+## Rust SDK 0.5.1 - 2026-09-04
+
+### Added
+
+- Added a first-integration acceptance checklist and failure-recovery guidance
+  to the SDK quickstart.
+
+### Changed
+
+- Work now shows each installed Skill's source and declared version alongside
+  its availability and enablement state.
+- Removed the redundant cold `cargo build --release` job from ordinary CI;
+  release-profile builds remain part of the artifact release workflow.
+- Updated the three public Rust crates together to 0.5.1 without changing the
+  0.5 public API.
+
+## 0.5.0 - 2026-09-04
+
+### Added
+
+- Added live SDK Skill lifecycle APIs for refresh, enable/disable, governed
+  local/GitHub/ClawHub installation, and recoverable removal.
+- Added stable SDK projections for observing and cancelling durable tasks
+  delegated by the Main Agent.
+- Added configurable remote Worker reconnect attempts and backoff.
+
+### Changed
+
+- Work and SDK Skill imports now share one Engine service with staged local
+  copies, symlink rejection, injection scanning, and path-safe Skill names.
+
+## 0.4.0 - 2026-09-04
+
+### Added
+
+- Added stable `SdkErrorCode` classification and graceful `Runtime::shutdown`
+  lifecycle support for embedded hosts.
+- Added a post-publication registry smoke test that downloads the immutable SDK
+  release and verifies `minimal`, `standard`, and `full` consumers.
+
+### Changed
+
+- Made Core HTTP and SQLite error conversions opt-in compatibility features.
+  Protocol-only SDK consumers no longer compile Reqwest, SQLite, Tokio, Typst,
+  OpenTelemetry, or the Agent Engine.
+- Moved the Typst/PDF renderer behind the Engine `document-tools` feature.
+  `standard` SDK hosts avoid that dependency graph, while `full`, Server, and
+  Work retain document generation.
+- SDK errors no longer expose `RuntimeBuildError` as a public enum payload.
+
+## 0.3.0 - 2026-09-04
+
+### Changed
+
+- Consolidated reusable runtime, storage, tool, channel, observability, ClawHub,
+  and Worker implementations into `microclaw-engine`, removing eight duplicate
+  implementation crates from the workspace.
+- Replaced the public `microclaw_engine::internal` namespace with explicit
+  Engine integration modules used by Server and Work.
+- Made SDK presets real dependency tiers: `minimal` is protocol-only,
+  `standard` adds the embeddable runtime, and `full` adds configured Engine and
+  Skill discovery.
+- Updated SDK documentation and release validation for the 0.3 crates.io set.
+
+### Added
+
+- **Programmatic full-SDK configuration.** Rust hosts can now initialize the
+  complete Agent Engine with `FullRuntimeConfig` and `MicroClaw::configure`
+  without creating a Server-oriented YAML file.
+- **Downstream SDK compatibility fixture.** CI now compiles a standalone Rust
+  application outside the MicroClaw workspace against the `minimal`,
+  `standard`, and `full` SDK feature presets and executes the minimal preset.
+
+- **Embeddable Rust runtime foundation.** `microclaw-core` now defines stable
+  Agent, Run, control, capability, and Worker contracts. The new
+  `microclaw-runtime` crate owns reusable run handles, event streaming,
+  cancellation, steering, concurrency, and Local Worker execution, while
+  `microclaw-sdk` provides a small third-party facade and compiling example.
+  The versioned remote Worker protocol covers discovery, health, submission,
+  resumable events, controls, acknowledgements, and terminal results.
+- **SDK-first Agent and Skill API.** `microclaw-sdk` now provides stable
+  `MicroClawBuilder`, `MicroClaw`, `AgentBuilder`, and `SkillCatalog` entry
+  points, validates selected Skills before execution, and reports setup
+  failures through SDK-owned errors instead of leaking Engine internals.
+- **Operational Local Workers.** Local Workers now report active and queued
+  runs, support labels, draining, resume, unavailable state, and waiting for
+  idle. Submission returns an explicit error when a Worker has stopped
+  accepting work instead of creating an ambiguous failed run.
+- **Transport-neutral Remote Worker client.** The SDK can discover a versioned
+  remote Worker, validate frame and run identity, stream its events into a
+  normal `RunHandle`, forward acknowledged controls, refresh health, and map
+  terminal frames into the same result contract used by Local Workers.
+- **Authenticated WebSocket Worker transport.** The new `microclaw-worker`
+  crate hosts Local or custom Workers over WebSocket, uses constant-time Bearer
+  token checks, and provides an SDK transport for discovery, health, events,
+  controls, and terminal results without pulling Server or UI dependencies into
+  the Worker boundary.
+
+### Changed
+
+- **Public Rust SDK 0.2.0.** The crates.io surface is now intentionally limited
+  to `microclaw-core`, `microclaw-engine`, and `microclaw-sdk`. Runtime,
+  persistence, tools, channels, observability, bundled Skills, ClawHub, and
+  Worker implementation now ship inside the Engine package; application and
+  migration-only workspace crates are marked non-publishable.
+
+- **SDK-first project documentation.** The README and public documentation now
+  present Server, Work, and the Rust SDK as three explicit entry points. The
+  website gives each path a separate, color-coded quickstart card instead of a
+  mixed installer, with reduced-motion-safe entrance and interaction animation,
+  and gives the SDK first-class navigation plus task-focused
+  guides for setup, lifecycle contracts, Skills, Workers, and feature/crate
+  selection.
+
+- **Publishable Rust SDK crate set.** Reusable crates now carry crates.io
+  metadata, and a protected manual workflow publishes them in dependency order
+  with exact version checks, duplicate-release handling, and index propagation
+  waits before publishing `microclaw-sdk`. After the initial release, the same
+  workflow blocks SemVer-incompatible public API changes before publication.
+
+- **Resumable remote Worker runs.** WebSocket-hosted runs now survive client
+  disconnects, retain ordered events for protocol resume, and treat repeated
+  submissions with the same run ID as one execution. Remote SDK clients
+  reconnect automatically and suppress already-delivered events.
+- **Bounded Worker replay memory.** Worker hosts retain at most 256 completed
+  runs and 4,096 events per run by default, expose configurable replay limits,
+  and return an explicit retryable error when requested history has expired.
+
+- **Faster non-release CI.** CI and Extended CI now cancel superseded runs on
+  the same branch. The final Rust release build reuses the already-required Web
+  and docs jobs instead of rebuilding them, and Extended CI stops producing a
+  disposable Work DMG on every push; signed bundles remain gated by the release
+  workflow.
+  Security and coverage tools are downloaded as checksum-verified release
+  binaries instead of being recompiled from source on every run.
+- **Removed redundant nightly build.** The scheduled Nightly Stability workflow
+  duplicated the required stability-smoke job and a metrics test already run by
+  the main test suite, so it no longer consumes a daily runner or creates noisy
+  failure issues.
+
+- **Shared Work and headless execution API.** Headless CLI and native Work task
+  execution now enter the existing Agent Engine through the same embeddable
+  Runtime contract while preserving session persistence, cancellation,
+  steering, and versioned events.
+- **Work dogfoods the stable SDK.** Native Work and its headless acceptance
+  runner now create foreground Agents through `MicroClawBuilder` instead of
+  assembling `HeadlessRuntime` themselves. CI rejects a regression back to the
+  root Server package or around the SDK execution boundary.
+- **One execution lifecycle for every product surface.** Server channels, Web,
+  ACP, Scheduler, headless, and Work now enter Agent execution through the same
+  `RunRequest`, `RunHandle`, and `RunResult` path. Runtime controls support
+  explicit acceptance or rejection instead of reporting only queue delivery.
+- **Effective embedded Agent profiles.** SDK Agent profiles now apply their
+  custom system prompt, explicit Skill selection, and read-only tool policy to
+  the real shared Agent Engine. Work consumes the full SDK facade instead of
+  declaring a direct dependency on the root product package.
+- **Physical Agent Engine library boundary.** The concrete provider-neutral
+  Agent loop and its default runtime services now compile in
+  `microclaw-engine`. Server re-exports that shared implementation, while SDK
+  full and Work depend on the Engine crate without pulling in the root Server
+  product package, Web console, or concrete channel adapters.
+
+## 0.5.5 - 2026-09-02
+
+### Added
+
+- **Work Skills management.** Native Work Settings now lists skills discovered
+  by the shared runtime, explains unavailable skills, and lets users enable or
+  disable them without editing configuration files. One import field installs
+  or updates a local Skill tree, GitHub Skill reference, or ClawHub slug while
+  reusing runtime compatibility, security, and lockfile verification.
+- **Durable Work Subagent controls.** Work now reads Subagent state from SQLite,
+  continues refreshing workers after the Main Agent turn finishes, and exposes
+  cancellation with progress, result, and error details in the inspector.
+
+### Changed
+
+- **Focused Work agent roadmap.** The canonical plan now defines one visible
+  Main Agent, bounded and observable Subagents, Skills as the extension model,
+  and a single-writer Workspace rule. Named agent teams and a free-form
+  multi-agent canvas remain explicitly out of scope.
+- **Single-writer Work execution.** Work Subagents are enforced read-only at
+  the shared tool choke point, leaving Workspace mutation and approval with the
+  Main Agent. Accepted background runs execute on a process-lifetime Tokio
+  runtime instead of being aborted when a foreground Work turn exits.
+
 ## 0.5.4 - 2026-08-27
 
 ### Changed
@@ -740,6 +976,8 @@ hardened packaging/release automation.
 
 ### Changed
 
+- Replaced the homepage's external architecture image with a responsive, theme-aware native diagram.
+- Refined the documentation site's mobile navigation, typography, and neutral-first visual palette for clearer small-screen browsing.
 - Heavy integrations are now optional build features; MCP returned to the default build, with `full` reserved for Matrix only (#313)
 - Reduced release artifact size via release-profile tuning (#310)
 - Raised the default web inflight limit to 10

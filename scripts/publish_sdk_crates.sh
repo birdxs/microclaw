@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:---check}"
+if [[ "${mode}" != "--check" && "${mode}" != "--execute" ]]; then
+  echo "usage: $0 [--check|--execute]" >&2
+  exit 2
+fi
+
+crates=(
+  microclaw-core
+  microclaw-engine
+  microclaw-sdk
+)
+
+crates_io_curl=(
+  curl
+  --fail
+  --silent
+  --user-agent "microclaw-release/0.1 (https://github.com/microclaw/microclaw)"
+)
+
+workspace_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "microclaw-sdk") | .version')"
+if [[ -z "${workspace_version}" || "${workspace_version}" == "null" ]]; then
+  echo "could not resolve microclaw-sdk version" >&2
+  exit 1
+fi
+
+for crate_name in "${crates[@]}"; do
+  crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r --arg name "${crate_name}" '.packages[] | select(.name == $name) | .version')"
+  if [[ "${crate_version}" != "${workspace_version}" ]]; then
+    echo "${crate_name} is ${crate_version}; expected ${workspace_version}" >&2
+    exit 1
+  fi
+done
+
+if [[ "${mode}" == "--check" ]]; then
+  cargo package -p microclaw-core --locked --allow-dirty --no-verify
+  cargo check -p microclaw-engine --all-features
+  cargo check -p microclaw-sdk --all-features
+  echo "SDK crate metadata and leaf packages are valid at ${workspace_version}."
+  echo "Run with --execute only from the protected publication workflow."
+  exit 0
+fi
+
+cargo package -p microclaw-core --locked
+
+if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+  echo "CARGO_REGISTRY_TOKEN is required" >&2
+  exit 1
+fi
+
+publish_crate() {
+  local crate_name="$1"
+  local publish_log
+  local publish_status
+  publish_log="$(mktemp)"
+
+  for attempt in 1 2 3; do
+    set +e
+    cargo publish -p "${crate_name}" --locked 2>&1 | tee "${publish_log}"
+    publish_status="${PIPESTATUS[0]}"
+    set -e
+
+    if [[ "${publish_status}" == "0" ]]; then
+      return 0
+    fi
+    if grep -q "429 Too Many Requests" "${publish_log}" && [[ "${attempt}" != "3" ]]; then
+      echo "crates.io rate limit reached; waiting 10 minutes before retrying ${crate_name}"
+      sleep 600
+      continue
+    fi
+    return "${publish_status}"
+  done
+}
+
+for crate_name in "${crates[@]}"; do
+  if "${crates_io_curl[@]}" "https://crates.io/api/v1/crates/${crate_name}/${workspace_version}" >/dev/null; then
+    echo "${crate_name} ${workspace_version} is already published; skipping"
+    continue
+  fi
+  publish_crate "${crate_name}"
+  for attempt in $(seq 1 30); do
+    if "${crates_io_curl[@]}" "https://crates.io/api/v1/crates/${crate_name}/${workspace_version}" >/dev/null; then
+      break
+    fi
+    if [[ "${attempt}" == "30" ]]; then
+      echo "timed out waiting for ${crate_name} ${workspace_version} to reach the index" >&2
+      exit 1
+    fi
+    sleep 10
+  done
+done
+
+echo "Published MicroClaw SDK crate set ${workspace_version}."

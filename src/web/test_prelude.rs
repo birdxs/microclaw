@@ -18,9 +18,9 @@ pub(crate) use axum::http::{Request, StatusCode};
 
 pub(crate) use futures_util::{SinkExt, StreamExt};
 
-pub(crate) use microclaw_channels::channel_adapter::ChannelRegistry;
+pub(crate) use microclaw_engine::channel_adapter::ChannelRegistry;
 
-pub(crate) use microclaw_storage::db::call_blocking;
+pub(crate) use microclaw_engine::storage::db::call_blocking;
 
 pub(crate) use serde_json::json;
 
@@ -242,17 +242,22 @@ pub(crate) fn test_state_with_config(llm: Box<dyn LlmProvider>, mut cfg: Config)
         config: cfg.clone(),
         channel_registry: channel_registry.clone(),
         db: db.clone(),
-        memory: MemoryManager::new(&runtime_dir),
-        skills: SkillManager::from_skills_dir(&cfg.skills_data_dir()),
+        memory: Arc::new(MemoryManager::new(&runtime_dir)),
+        skills: Arc::new(SkillManager::from_skills_dir(&cfg.skills_data_dir())),
         hooks: Arc::new(crate::hooks::HookManager::for_tests()),
-        llm,
+        llm: Arc::from(llm),
         llm_provider_overrides: Arc::new(
             tokio::sync::RwLock::new(std::collections::HashMap::new()),
         ),
         llm_model_overrides: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         embedding: None,
         memory_backend: memory_backend.clone(),
-        tools: ToolRegistry::new(&cfg, channel_registry, db, memory_backend),
+        tools: Arc::new(ToolRegistry::new(
+            &cfg,
+            channel_registry,
+            db,
+            memory_backend,
+        )),
         chat_turn_queue: Arc::new(crate::chat_turn_queue::ChatTurnQueue::new(20)),
         skill_review_queue: crate::skill_review::build_skill_review_channel().0,
         metric_exporter: None,

@@ -33,7 +33,10 @@ jobs:
       - name: Ensure CI succeeded for tag commit
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_WAIT_TIMEOUT_SECONDS: "900"
+          # Cold Docker and stability builds can exceed 15 minutes after a
+          # workspace-wide version bump. Keep polling the exact tag commit
+          # rather than failing a healthy release before CI can finish.
+          CI_WAIT_TIMEOUT_SECONDS: "3600"
           CI_WAIT_INTERVAL_SECONDS: "30"
           REQUIRED_CI_JOBS_JSON: '["Web And Docs Build (node 22)","Web And Docs Build (node 24)","Docker Build","Security Audit","Rust (ubuntu-latest)","Rust (macos-latest)","Stability Smoke"]'
         shell: bash
@@ -123,6 +126,7 @@ jobs:
   build-assets:
     name: Build ${{ matrix.target.label }}-${{ matrix.flavor }}
     runs-on: ${{ matrix.target.os }}
+    timeout-minutes: 120
     needs: verify-ci
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
@@ -182,6 +186,11 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust release cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-server-${{ matrix.target.label }}-${{ matrix.flavor }}
 
       - name: Build release binary
         shell: bash
@@ -354,14 +363,23 @@ jobs:
           path: work-release-assets/*
           if-no-files-found: error
 
-  publish-container:
-    name: Publish Container Image
-    runs-on: ubuntu-latest
+  build-container:
+    name: Build Container (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     needs: verify-ci
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
     steps:
       - name: Checkout tag commit
@@ -369,11 +387,65 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=MicroClaw
+            org.opencontainers.image.description=Multi-channel agent runtime for Telegram, Discord, Web, and more.
+          cache-from: type=gha,scope=release-container-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-container-${{ matrix.arch }}
+
+      - name: Export image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/container-digests"
+          touch "${RUNNER_TEMP}/container-digests/${IMAGE_DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/container-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-container:
+    name: Publish Container Image
+    runs-on: ubuntu-24.04
+    needs: build-container
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/container-digests
+          pattern: container-digest-*
+          merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Prepare image names
         id: image_names
@@ -388,31 +460,21 @@ jobs:
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
-      - name: Note Docker Hub publish status
-        shell: bash
-        run: |
-          if [[ -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_TOKEN}" ]]; then
-            echo "Docker Hub publishing enabled for docker.io/microclaw/microclaw"
-          else
-            echo "Docker Hub publishing secrets are not configured; publishing GHCR only."
-          fi
-
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ steps.image_names.outputs.images }}
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
             type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }}
             type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }}
             type=raw,value=latest
-          labels: |
-            org.opencontainers.image.title=MicroClaw
-            org.opencontainers.image.description=Multi-channel agent runtime for Telegram, Discord, Web, and more.
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -420,21 +482,52 @@ jobs:
 
       - name: Log in to Docker Hub
         if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
 
-      - name: Build and push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=release-container
-          cache-to: type=gha,mode=max,scope=release-container
+      - name: Create GHCR multi-platform manifest
+        working-directory: ${{ runner.temp }}/container-digests
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+        shell: bash
+        run: |
+          mapfile -t tags < <(
+            jq -r '.tags[] | select(startswith("ghcr.io/")) | "--tag\n" + .' \
+              <<<"${DOCKER_METADATA_OUTPUT_JSON}"
+          )
+
+          shopt -s nullglob
+          digest_files=(*)
+          if [[ "${#digest_files[@]}" -ne 2 ]]; then
+            echo "Expected exactly 2 platform digests, found ${#digest_files[@]}." >&2
+            exit 1
+          fi
+
+          digests=()
+          for digest in "${digest_files[@]}"; do
+            if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Invalid SHA-256 digest filename: ${digest}" >&2
+              exit 1
+            fi
+            digests+=("ghcr.io/${GITHUB_REPOSITORY}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create "${tags[@]}" "${digests[@]}"
+
+      - name: Copy multi-platform manifest to Docker Hub
+        if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+        shell: bash
+        run: |
+          mapfile -t tags < <(
+            jq -r '.tags[] | select(startswith("docker.io/")) | "--tag\n" + .' \
+              <<<"${DOCKER_METADATA_OUTPUT_JSON}"
+          )
+          source="ghcr.io/${GITHUB_REPOSITORY}:${RELEASE_TAG#v}"
+          docker buildx imagetools create "${tags[@]}" "${source}"
 
   reliability-scorecard:
     name: Reliability Scorecard
@@ -481,7 +574,8 @@ jobs:
   publish-assets:
     name: Upload to GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-assets, build-work-portable-assets, reliability-scorecard]
+    needs:
+      [build-assets, build-work-portable-assets, publish-container, reliability-scorecard]
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
 
@@ -493,9 +587,41 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      # Download only distributable artifacts. Docker Buildx also uploads internal
+      # `.dockerbuild` records; merging those into `dist` is unnecessary and can
+      # make the release fail when GitHub's artifact service cannot extract one.
+      - name: Download Linux Server artifacts
+        uses: actions/download-artifact@v8
         with:
+          pattern: linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download macOS Server artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: macos-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download Windows Server artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: windows-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download Work artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: microclaw-work-portable-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download reliability scorecard
+        uses: actions/download-artifact@v8
+        with:
+          name: reliability-scorecard
           path: dist
           merge-multiple: true
 
@@ -516,6 +642,10 @@ jobs:
           else
             echo "No locally notarized Work DMG is present for ${RELEASE_TAG}."
           fi
+
+      - name: Verify release artifact set
+        shell: bash
+        run: scripts/ci/check_release_assets.sh dist "${RELEASE_TAG}"
 
       - name: Generate checksums
         shell: bash

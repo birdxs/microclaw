@@ -21,10 +21,9 @@ cargo run -- start
 ```
 crates/
     microclaw-core/      # Shared error/types/text modules
-    microclaw-storage/   # SQLite + memory + usage reporting
-    microclaw-tools/     # Tool runtime primitives and shared helper engines
-    microclaw-channels/  # Channel abstraction boundary
-    microclaw-app/       # App support modules (logging/skills/transcribe)
+    microclaw-engine/    # Agent loop plus storage/tools/channels/runtime services
+    microclaw-sdk/       # Stable public embedding facade
+    microclaw-work-*/    # UI-independent Work application services
 
 src/
     main.rs             # CLI entrypoint
@@ -45,23 +44,23 @@ src/
 | Type | Location | Description |
 |---|---|---|
 | `AppState` | `runtime.rs` | Shared runtime state for all adapters |
-| `Database` | `microclaw_storage::db` | SQLite wrapper with `Mutex<Connection>` |
+| `Database` | `microclaw_engine::storage::db` | SQLite wrapper with `Mutex<Connection>` |
 | `ToolRegistry` | `tools/mod.rs` | `Vec<Box<dyn Tool>>` dispatch |
-| `Tool` / `ToolResult` | `microclaw_tools::runtime` | Shared tool trait + result/auth primitives |
-| `LlmProvider` | `llm.rs` | Provider abstraction for Anthropic and OpenAI-compatible APIs |
+| `Tool` / `ToolResult` | `microclaw_engine::tool_runtime::runtime` | Shared tool trait + result/auth primitives |
+| `LlmProvider` | `crates/microclaw-engine/src/llm/` | Provider abstraction for Anthropic and OpenAI-compatible APIs |
 
 ## LLM provider conventions
 
-- Keep `src/llm.rs` model-agnostic: do not branch on specific model names.
+- Keep `crates/microclaw-engine/src/llm/` model-agnostic: do not branch on specific model names.
 - Encode provider-specific behavior as capability flags (for example reasoning-field bridging or optional request params), then branch on capabilities.
 - Add provider/model presets in setup/config surfaces, but keep request/translation logic in `llm.rs` driven by capabilities.
 - Add tests for capability combinations rather than individual model name strings.
 
 ## Adding a new tool
 
-1. Create `src/tools/my_tool.rs`
-2. Implement the `Tool` trait from `microclaw_tools::runtime`
-3. Add `pub mod my_tool;` to `src/tools/mod.rs`
+1. Create `crates/microclaw-engine/src/tools/my_tool.rs`
+2. Implement the `Tool` trait from `microclaw_engine::tool_runtime::runtime`
+3. Add `pub mod my_tool;` to `crates/microclaw-engine/src/tools/mod.rs`
 4. Register it in `ToolRegistry::new()`
 
 If your tool needs shared state (Bot or Database), add a constructor and pass it in at registration time.

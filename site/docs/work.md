@@ -81,6 +81,9 @@ tools. File contents are not copied into the desktop session database.
 
 Settings includes:
 
+- Skills discovery, compatibility status, enable/disable controls, and one
+  import field for local directories, GitHub references, or ClawHub slugs;
+
 - provider presets, current model suggestions, custom model ID and compatible
   base URL;
 - masked API-key replacement that never loads an existing secret into the UI;
@@ -100,14 +103,16 @@ microclaw-work-app       commands, projections, versioned session snapshots
       |
 microclaw-work-runtime   foreground worker, cancellation, runtime event bridge
       |
+microclaw-sdk
+      |
 shared MicroClaw Agent Engine, providers, tools, policy, memory, checkpoints
 ```
 
-The Work runtime disables the root crate's `embedded-web-ui` feature, so its
-binary and app bundle contain no React operator-console distribution. Model
-calls, checkpoints, restore, and other blocking work run off the GPUI thread.
-Server enables the feature by default and continues to own Web, channels,
-schedules, remote delivery, and long-running automation.
+Work depends on the SDK's `full` Engine facade rather than the root Server
+package, so its binary and app bundle contain no React operator-console
+distribution or concrete channel adapters. Model calls, checkpoints, restore,
+and other blocking work run off the GPUI thread. Server continues to own Web,
+channels, schedules, remote delivery, and long-running automation.
 
 See the [architecture guide](./architecture) for the complete Server/Work
 boundary and the public [roadmap](./roadmap) for current acceptance gates.

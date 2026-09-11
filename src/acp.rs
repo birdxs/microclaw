@@ -18,9 +18,9 @@ use agent_client_protocol::{
     SessionId, SessionMode, SessionModeState, SessionUpdate, SetSessionModeRequest,
     SetSessionModeResponse, StopReason,
 };
-use microclaw_channels::channel::ConversationKind;
-use microclaw_channels::channel_adapter::{ChannelAdapter, ChannelRegistry};
-use microclaw_storage::db::{call_blocking, Database, StoredMessage};
+use microclaw_engine::channel::ConversationKind;
+use microclaw_engine::channel_adapter::{ChannelAdapter, ChannelRegistry};
+use microclaw_engine::storage::db::{call_blocking, Database, StoredMessage};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,15 +70,15 @@ pub async fn serve(
         config: config.clone(),
         channel_registry,
         db: db.clone(),
-        memory,
-        skills,
+        memory: Arc::new(memory),
+        skills: Arc::new(skills),
         hooks: Arc::new(HookManager::from_config(&config).with_db(db.clone())),
-        llm,
+        llm: Arc::from(llm),
         llm_provider_overrides: Arc::new(RwLock::new(HashMap::new())),
         llm_model_overrides: Arc::new(RwLock::new(HashMap::new())),
         embedding,
         memory_backend,
-        tools,
+        tools: Arc::new(tools),
         chat_turn_queue,
         skill_review_queue,
         metric_exporter: None,

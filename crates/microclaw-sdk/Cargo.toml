@@ -1,0 +1,51 @@
+[package]
+name = "microclaw-sdk"
+version = "0.6.1"
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Official Rust SDK for embedding MicroClaw agents, Skills, and Workers"
+documentation = "https://docs.rs/microclaw-sdk"
+keywords = ["ai", "agent", "sdk", "llm", "microclaw"]
+categories = ["api-bindings", "asynchronous"]
+
+[features]
+default = ["standard"]
+minimal = []
+standard = ["dep:microclaw-engine", "dep:serde_json", "dep:thiserror"]
+remote-worker = ["standard"]
+full = ["remote-worker", "microclaw-engine/document-tools"]
+
+[dependencies]
+microclaw-core = { version = "0.6.1", path = "../microclaw-core", default-features = false }
+microclaw-engine = { version = "0.6.1", path = "../microclaw-engine", optional = true, default-features = false }
+serde_json = { version = "1", optional = true }
+thiserror = { version = "2", optional = true }
+
+[[example]]
+name = "configured_skilled_agent"
+required-features = ["full"]
+
+[[example]]
+name = "custom_executor"
+required-features = ["standard"]
+
+[[example]]
+name = "minimal_protocol"
+required-features = ["minimal"]
+
+[[example]]
+name = "managed_skills"
+required-features = ["full"]
+
+[[example]]
+name = "delegated_tasks"
+required-features = ["full"]
+
+[dev-dependencies]
+async-trait = "0.1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

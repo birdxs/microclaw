@@ -1,0 +1,77 @@
+[package]
+name = "microclaw-engine"
+version = "0.6.1"
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Channel-independent Agent Engine and default services for MicroClaw"
+keywords = ["ai", "agent", "llm", "microclaw"]
+categories = ["development-tools"]
+
+[features]
+default = ["document-tools"]
+document-tools = ["dep:typst", "dep:typst-pdf", "dep:typst-layout"]
+test-support = []
+sqlite-vec = ["dep:sqlite-vec"]
+journald = ["dep:tracing-journald"]
+
+[dependencies]
+microclaw-core = { version = "0.6.1", path = "../microclaw-core", features = ["http-errors", "sqlite-errors"] }
+tokio = { version = "1", features = ["full"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+reqwest = { version = "0.12", features = ["json", "blocking", "stream", "multipart"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = { version = "0.3", optional = true }
+regex = "1"
+glob = "0.3"
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+agent-client-protocol = "0.10.4"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
+urlencoding = "2"
+base64 = "0.22"
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
+zip = "2"
+sha2 = "0.10"
+md5 = "0.7"
+include_dir = "0.7"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["compat"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+opentelemetry-proto = { version = "0.28", features = ["gen-tonic-messages"] }
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio", "experimental_async_runtime", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_logs_batch_log_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime"] }
+opentelemetry-otlp = { version = "0.30", features = ["http-proto", "trace", "metrics", "logs", "reqwest-client"] }
+opentelemetry-appender-tracing = "0.30"
+opentelemetry-semantic-conventions = { version = "0.30", features = ["semconv_experimental"] }
+prost = "0.13"
+rmcp = { version = "1.7", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+shellexpand = "3.1.2"
+yaml-edit = "0.2.0"
+pulldown-cmark = { version = "0.12", default-features = false }
+qrcode = "0.14"
+clap = { version = "4.6", features = ["derive"] }
+http = "1"
+typst = { version = "0.15", optional = true }
+typst-pdf = { version = "0.15", optional = true }
+typst-layout = { version = "0.15", optional = true }
+toml = "0.8"
+url = "2"
+sqlite-vec = { version = "0.1.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

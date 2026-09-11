@@ -4,11 +4,17 @@
 //! Agent Engine to versioned runtime events. UI packages consume this port;
 //! they do not create Tokio runtimes or call the Agent Engine directly.
 
-use microclaw::config::{Config, WorkingDirIsolation};
+use microclaw::config::Config;
+#[cfg(test)]
+use microclaw::config::WorkingDirIsolation;
 use microclaw::headless::{HeadlessRunRequest, HeadlessRuntime};
 use microclaw::llm::create_provider;
+use microclaw::storage::db::Database;
 use microclaw_core::llm_types::{Message, MessageContent, ResponseContentBlock};
+use microclaw_core::run_protocol::{RunId, RunRequest, SessionId};
 use microclaw_core::runtime_event::RuntimeEventEnvelope;
+use microclaw_engine as microclaw;
+use microclaw_sdk::MicroClaw;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -140,6 +146,47 @@ pub struct AgentSettingsDraft {
     pub context_dir: String,
 }
 
+/// UI-safe projection of one locally installed Agent Skill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkSkill {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub version: Option<String>,
+    pub enabled: bool,
+    pub available: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInstallResult {
+    pub message: String,
+    pub warnings: Vec<String>,
+    pub skills: Vec<WorkSkill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillRemovalResult {
+    pub name: String,
+    pub archived_to: String,
+    pub skills: Vec<WorkSkill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkSubagent {
+    pub run_id: String,
+    pub label: String,
+    pub task: String,
+    pub status: String,
+    pub progress: Option<String>,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+    pub elapsed_seconds: u64,
+    pub cancel_requested: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ModelSettingsError {
     #[error("provider is required")]
@@ -165,6 +212,16 @@ pub enum AgentSettingsError {
     #[error("configuration error: {0}")]
     Config(String),
     #[error("configuration I/O error: {0}")]
+    Io(#[from] io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SkillSettingsError {
+    #[error("configuration error: {0}")]
+    Config(String),
+    #[error("skill error: {0}")]
+    Skill(String),
+    #[error("skills I/O error: {0}")]
     Io(#[from] io::Error),
 }
 
@@ -582,6 +639,168 @@ impl WorkRuntimeService {
         })
     }
 
+    /// List the skills visible to Work using the exact same config, runtime
+    /// state, compatibility checks, and ClawHub verification as Agent Engine.
+    pub fn skills(&self) -> Result<Vec<WorkSkill>, SkillSettingsError> {
+        let config = Config::load_from_path_for_headless(&self.config_path)
+            .map_err(|error| SkillSettingsError::Config(error.to_string()))?;
+        let skills_dir = config.skills_data_dir();
+        microclaw::builtin_skills::ensure_builtin_skills(Path::new(&skills_dir))?;
+        let manager = microclaw::skills::SkillManager::from_skills_and_runtime(
+            &skills_dir,
+            &config.runtime_data_dir(),
+        )
+        .with_config_verification(&config);
+
+        Ok(manager
+            .discover_skills_with_status(true)
+            .into_iter()
+            .map(|skill| {
+                let user_disabled =
+                    skill.reason.as_deref() == Some("Skill is disabled for this runtime.");
+                WorkSkill {
+                    name: skill.meta.name,
+                    description: skill.meta.description,
+                    source: skill.meta.source,
+                    version: skill.meta.version,
+                    enabled: !user_disabled,
+                    available: skill.available,
+                    reason: skill.reason,
+                }
+            })
+            .collect())
+    }
+
+    /// Change only Work's runtime-scoped enablement state. Skill files are
+    /// never rewritten or removed by this operation.
+    pub fn set_skill_enabled(
+        &self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<Vec<WorkSkill>, SkillSettingsError> {
+        let config = Config::load_from_path_for_headless(&self.config_path)
+            .map_err(|error| SkillSettingsError::Config(error.to_string()))?;
+        let manager = microclaw::skills::SkillManager::from_skills_and_runtime(
+            &config.skills_data_dir(),
+            &config.runtime_data_dir(),
+        )
+        .with_config_verification(&config);
+        manager
+            .set_enabled(name, enabled)
+            .map_err(SkillSettingsError::Skill)?;
+        self.skills()
+    }
+
+    /// Install or update a Skill from a local directory, GitHub reference, or
+    /// ClawHub slug. The source is intentionally inferred so Work needs one
+    /// compact import control rather than three package-manager screens.
+    pub fn install_skill(&self, reference: &str) -> Result<SkillInstallResult, SkillSettingsError> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(SkillSettingsError::Skill("skill source is required".into()));
+        }
+        let config = Config::load_from_path_for_headless(&self.config_path)
+            .map_err(|error| SkillSettingsError::Config(error.to_string()))?;
+        let skills_dir = PathBuf::from(config.skills_data_dir());
+        fs::create_dir_all(&skills_dir)?;
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|error| SkillSettingsError::Skill(error.to_string()))?;
+
+        let manager = microclaw::skills::SkillManager::from_skills_and_runtime(
+            &config.skills_data_dir(),
+            &config.runtime_data_dir(),
+        )
+        .with_config_verification(&config);
+        let outcome = runtime
+            .block_on(microclaw::skill_management::install_skill(
+                &config, &manager, reference,
+            ))
+            .map_err(SkillSettingsError::Skill)?;
+        Ok(SkillInstallResult {
+            message: outcome.message,
+            warnings: outcome.warnings,
+            skills: self.skills()?,
+        })
+    }
+
+    pub fn install_skill_background(
+        &self,
+        reference: String,
+    ) -> Receiver<Result<SkillInstallResult, SkillSettingsError>> {
+        let (tx, rx) = mpsc::channel();
+        let service = self.clone();
+        std::thread::Builder::new()
+            .name("microclaw-skill-import".into())
+            .spawn(move || {
+                let _ = tx.send(service.install_skill(&reference));
+            })
+            .expect("failed to start skill import worker");
+        rx
+    }
+
+    /// Recoverably remove a Skill by moving its directory below `.archived`.
+    pub fn remove_skill(&self, name: &str) -> Result<SkillRemovalResult, SkillSettingsError> {
+        let config = Config::load_from_path_for_headless(&self.config_path)
+            .map_err(|error| SkillSettingsError::Config(error.to_string()))?;
+        let manager = microclaw::skills::SkillManager::from_skills_and_runtime(
+            &config.skills_data_dir(),
+            &config.runtime_data_dir(),
+        )
+        .with_config_verification(&config);
+        let archived_to = microclaw::skill_management::archive_skill(&manager, name)
+            .map_err(SkillSettingsError::Skill)?;
+        Ok(SkillRemovalResult {
+            name: name.to_string(),
+            archived_to: archived_to.display().to_string(),
+            skills: self.skills()?,
+        })
+    }
+
+    pub fn subagents(&self, session: &str) -> Result<Vec<WorkSubagent>, SkillSettingsError> {
+        let config = Config::load_from_path_for_headless(&self.config_path)
+            .map_err(|error| SkillSettingsError::Config(error.to_string()))?;
+        let db = Database::new(&config.runtime_data_dir())
+            .map_err(|error| SkillSettingsError::Skill(error.to_string()))?;
+        let Some(chat_id) = find_work_session_chat_id(&db, session)? else {
+            return Ok(Vec::new());
+        };
+        db.list_subagent_runs(chat_id, 100)
+            .map_err(|error| SkillSettingsError::Skill(error.to_string()))
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        let elapsed_seconds =
+                            subagent_elapsed_seconds(&row.created_at, row.finished_at.as_deref());
+                        WorkSubagent {
+                            run_id: row.run_id,
+                            label: row.label.unwrap_or_else(|| "Subagent".into()),
+                            task: row.task,
+                            status: row.status,
+                            progress: row.progress_text,
+                            result: row.result_text,
+                            error: row.error_text,
+                            created_at: row.created_at,
+                            finished_at: row.finished_at,
+                            elapsed_seconds,
+                            cancel_requested: row.cancel_requested,
+                        }
+                    })
+                    .collect()
+            })
+    }
+
+    pub fn cancel_subagent(&self, session: &str, run_id: &str) -> Result<bool, SkillSettingsError> {
+        let config = Config::load_from_path_for_headless(&self.config_path)
+            .map_err(|error| SkillSettingsError::Config(error.to_string()))?;
+        let db = Database::new(&config.runtime_data_dir())
+            .map_err(|error| SkillSettingsError::Skill(error.to_string()))?;
+        let Some(chat_id) = find_work_session_chat_id(&db, session)? else {
+            return Ok(false);
+        };
+        microclaw::tools::subagents::request_subagent_cancel(&config, &db, chat_id, run_id)
+            .map_err(|error| SkillSettingsError::Skill(error.to_string()))
+    }
+
     pub fn save_agent_settings(
         &self,
         draft: AgentSettingsDraft,
@@ -886,56 +1105,43 @@ fn run_worker(
     };
 
     let result = tokio_runtime.block_on(async {
-        let config = configure_work_runtime(
-            Config::load_from_path_for_headless(&config_path)?,
-            request.workspace,
-        );
-        let runtime = HeadlessRuntime::load(config).await?;
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let event_message_tx = message_tx.clone();
-        let event_forwarder = tokio::spawn(async move {
-            while let Some(envelope) = event_rx.recv().await {
-                if event_message_tx
-                    .send(WorkRuntimeMessage::Envelope(envelope))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+        let embedded_runtime = MicroClaw::builder(config_path)
+            .caller_channel("work")
+            .workspace(request.workspace)
+            .max_concurrent_runs(1)
+            .build()
+            .await?;
 
-        let session = request.session.clone();
-        let run = runtime.run(
-            HeadlessRunRequest::work(request.task, Some(request.session), run_id.clone()),
-            Some(event_tx),
-        );
-        tokio::pin!(run);
-        let result = loop {
+        let mut runtime_request = RunRequest::new(request.task);
+        runtime_request.run_id = Some(RunId::new(run_id.clone()));
+        runtime_request.session_id = Some(SessionId::new(request.session));
+        let agent = embedded_runtime.agent("MicroClaw Work").build()?;
+        let mut run = agent.run_request(runtime_request);
+        let controller = run.controller();
+        'run_loop: loop {
             tokio::select! {
-                result = &mut run => break result,
+                event = run.next_event() => {
+                    match event {
+                        Some(envelope) => {
+                            if message_tx.send(WorkRuntimeMessage::Envelope(envelope)).is_err() {
+                                break run.result().await.map_err(anyhow::Error::from);
+                            }
+                        }
+                        None => break run.result().await.map_err(anyhow::Error::from),
+                    }
+                }
                 signal = cancel_rx.recv() => {
-                    if signal.is_some() {
-                        let completed_while_waiting = loop {
-                            let aborted = runtime.cancel_work_session(&session).await?;
-                            if aborted > 0 {
-                                break None;
-                            }
-                            tokio::select! {
-                                result = &mut run => break Some(result),
-                                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
-                            }
-                        };
-                        break match completed_while_waiting {
-                            Some(result) => result,
-                            None => run.await,
-                        };
+                    if signal.is_some() && controller.cancel_confirmed().await.is_ok() {
+                        while let Some(envelope) = run.next_event().await {
+                            let _ = message_tx.send(WorkRuntimeMessage::Envelope(envelope));
+                        }
+                        break 'run_loop run.result().await.map_err(anyhow::Error::from);
                     }
                 }
                 update = steer_rx.recv() => {
                     if let Some(update) = update {
-                        let (accepted, message) = match runtime.steer_work_session(&session, &update).await {
-                            Ok(true) => (true, update),
-                            Ok(false) => (false, "The task finished before the update could be queued.".into()),
+                        let (accepted, message) = match controller.steer_confirmed(&update).await {
+                            Ok(()) => (true, update),
                             Err(error) => (false, error.to_string()),
                         };
                         let _ = message_tx.send(WorkRuntimeMessage::SteeringResult {
@@ -946,21 +1152,20 @@ fn run_worker(
                     }
                 }
             }
-        };
-        event_forwarder.await?;
-        result
+        }
     });
 
     match result {
         Ok(result) => {
             let _ = message_tx.send(WorkRuntimeMessage::Completed {
-                run_id: result.run_id,
+                run_id: result.run_id.to_string(),
             });
         }
         Err(error) => send_failure(&message_tx, &run_id, error.to_string()),
     }
 }
 
+#[cfg(test)]
 fn configure_work_runtime(mut config: Config, workspace: String) -> Config {
     config.working_dir = workspace;
     // Work is an explicit foreground project session. Its tools must operate
@@ -969,6 +1174,43 @@ fn configure_work_runtime(mut config: Config, workspace: String) -> Config {
     config.working_dir_isolation = WorkingDirIsolation::Direct;
     config.checkpoints_enabled = true;
     config
+}
+
+#[cfg(test)]
+fn work_session_chat_id(db: &Database, session: &str) -> Result<i64, SkillSettingsError> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Err(SkillSettingsError::Skill("Work session is required".into()));
+    }
+    db.resolve_or_create_chat_id(
+        "headless",
+        &format!("headless:{session}"),
+        Some(&format!("headless-{session}")),
+        "headless",
+    )
+    .map_err(|error| SkillSettingsError::Skill(error.to_string()))
+}
+
+fn find_work_session_chat_id(
+    db: &Database,
+    session: &str,
+) -> Result<Option<i64>, SkillSettingsError> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Err(SkillSettingsError::Skill("Work session is required".into()));
+    }
+    db.find_chat_id("headless", &format!("headless:{session}"))
+        .map_err(|error| SkillSettingsError::Skill(error.to_string()))
+}
+
+fn subagent_elapsed_seconds(created_at: &str, finished_at: Option<&str>) -> u64 {
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return 0;
+    };
+    let finished = finished_at
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .unwrap_or_else(|| chrono::Utc::now().fixed_offset());
+    finished.signed_duration_since(created).num_seconds().max(0) as u64
 }
 
 fn codex_account_available_at(home: Option<&Path>, access_token_present: bool) -> bool {
@@ -1654,7 +1896,7 @@ mod tests {
         fs::write(workspace.join("tracked.txt"), "after").unwrap();
         fs::write(workspace.join("created.txt"), "created").unwrap();
 
-        let service = WorkRuntimeService::new(config_path);
+        let service = WorkRuntimeService::new(&config_path);
         service
             .restore_workspace(workspace.clone(), commit)
             .recv_timeout(Duration::from_secs(10))
@@ -1666,5 +1908,245 @@ mod tests {
             "before"
         );
         assert!(!workspace.join("created.txt").exists());
+    }
+
+    #[test]
+    fn work_skills_list_and_toggle_runtime_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let skills_dir = directory.path().join("skills");
+        let config_path = directory.path().join("microclaw.config.yaml");
+        fs::create_dir_all(skills_dir.join("fixture-skill")).unwrap();
+        fs::write(
+            skills_dir.join("fixture-skill/SKILL.md"),
+            "---\nname: fixture-skill\ndescription: Work skill fixture\nsource: local\n---\nUse the fixture.\n",
+        )
+        .unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "llm_provider: ollama\napi_key: ''\nmodel: local\nweb_enabled: false\ndata_dir: '{}'\nskills_dir: '{}'\n",
+                data_dir.display(),
+                skills_dir.display()
+            ),
+        )
+        .unwrap();
+        let service = WorkRuntimeService::new(config_path);
+
+        let listed = service.skills().unwrap();
+        let fixture = listed
+            .iter()
+            .find(|skill| skill.name == "fixture-skill")
+            .unwrap();
+        assert!(fixture.enabled);
+        assert!(fixture.available);
+
+        let disabled = service.set_skill_enabled("fixture-skill", false).unwrap();
+        let fixture = disabled
+            .iter()
+            .find(|skill| skill.name == "fixture-skill")
+            .unwrap();
+        assert!(!fixture.enabled);
+        assert!(!fixture.available);
+        assert_eq!(
+            fixture.reason.as_deref(),
+            Some("Skill is disabled for this runtime.")
+        );
+
+        let state = fs::read_to_string(data_dir.join("runtime/skills_state.json")).unwrap();
+        assert!(state.contains("fixture-skill"));
+
+        let enabled = service.set_skill_enabled("fixture-skill", true).unwrap();
+        let fixture = enabled
+            .iter()
+            .find(|skill| skill.name == "fixture-skill")
+            .unwrap();
+        assert!(fixture.enabled);
+        assert!(fixture.available);
+    }
+
+    #[test]
+    fn work_imports_and_updates_local_skill_trees() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let skills_dir = directory.path().join("skills");
+        let source = directory.path().join("local-skill");
+        let config_path = directory.path().join("microclaw.config.yaml");
+        fs::create_dir_all(source.join("scripts")).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: local-skill\ndescription: Local fixture\nsource: local\n---\nUse it.\n",
+        )
+        .unwrap();
+        fs::write(source.join("scripts/helper.txt"), "v1").unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "llm_provider: ollama\napi_key: ''\nmodel: local\nweb_enabled: false\ndata_dir: '{}'\nskills_dir: '{}'\n",
+                data_dir.display(),
+                skills_dir.display()
+            ),
+        )
+        .unwrap();
+        let service = WorkRuntimeService::new(config_path);
+
+        let result = service.install_skill(source.to_str().unwrap()).unwrap();
+        assert!(
+            result
+                .skills
+                .iter()
+                .any(|skill| skill.name == "local-skill")
+        );
+        assert_eq!(
+            fs::read_to_string(skills_dir.join("local-skill/scripts/helper.txt")).unwrap(),
+            "v1"
+        );
+
+        fs::write(source.join("scripts/helper.txt"), "v2").unwrap();
+        service.install_skill(source.to_str().unwrap()).unwrap();
+        assert_eq!(
+            fs::read_to_string(skills_dir.join("local-skill/scripts/helper.txt")).unwrap(),
+            "v2"
+        );
+        assert!(!skills_dir.join(".local-skill.work-backup").exists());
+        assert!(!skills_dir.join(".local-skill.work-import").exists());
+
+        let removed = service.remove_skill("local-skill").unwrap();
+        assert_eq!(removed.name, "local-skill");
+        assert!(
+            removed
+                .skills
+                .iter()
+                .all(|skill| skill.name != "local-skill")
+        );
+        assert!(!skills_dir.join("local-skill").exists());
+        assert!(Path::new(&removed.archived_to).join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn work_lists_and_cancels_durable_subagents() {
+        use microclaw::storage::db::subagents::CreateSubagentRunParams;
+
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let config_path = directory.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                "llm_provider: ollama\napi_key: ''\nmodel: local\nweb_enabled: false\ndata_dir: '{}'\n",
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+        let service = WorkRuntimeService::new(config_path);
+        let config = Config::load_from_path_for_headless(service.config_path()).unwrap();
+        let db = Database::new(&config.runtime_data_dir()).unwrap();
+        let chat_id = work_session_chat_id(&db, "session-1").unwrap();
+        db.create_subagent_run(CreateSubagentRunParams {
+            run_id: "subrun-fixture",
+            parent_run_id: None,
+            depth: 1,
+            token_budget: 1000,
+            chat_id,
+            caller_channel: "work",
+            task: "inspect the project",
+            context: "",
+            provider: "ollama",
+            model: "local",
+            label: Some("Inspector"),
+        })
+        .unwrap();
+
+        let runs = service.subagents("session-1").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].label, "Inspector");
+        assert_eq!(runs[0].status, "accepted");
+        assert!(
+            service
+                .cancel_subagent("session-1", "subrun-fixture")
+                .unwrap()
+        );
+        assert!(service.subagents("session-1").unwrap()[0].cancel_requested);
+    }
+
+    #[test]
+    #[ignore = "requires OPENAI_APIKEY and live network access"]
+    fn live_openai_work_first_response() {
+        let api_key = std::env::var("OPENAI_APIKEY")
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .expect("set OPENAI_APIKEY or OPENAI_API_KEY");
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.yaml");
+        let service = WorkRuntimeService::new(&config_path);
+        service
+            .save_model_settings(ModelSettingsDraft {
+                provider: "openai".into(),
+                model: "gpt-5-mini".into(),
+                base_url: String::new(),
+                api_key: Some(api_key),
+            })
+            .unwrap();
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        config.push_str(&format!(
+            "data_dir: {}\n",
+            directory.path().join("runtime-data").display()
+        ));
+        fs::write(&config_path, config).unwrap();
+        let workspace = directory.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+
+        let report = service
+            .test_first_response(workspace)
+            .recv_timeout(Duration::from_secs(90))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.provider, "openai");
+        assert_eq!(report.model, "gpt-5-mini");
+        assert!(report.event_count > 0);
+        assert!(report.response_preview.contains("first response ok"));
+    }
+
+    #[test]
+    #[ignore = "requires live GitHub and ClawHub network access"]
+    fn live_remote_skill_imports() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("data");
+        let skills_dir = directory.path().join("skills");
+        let config_path = directory.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                "llm_provider: ollama\napi_key: ''\nmodel: local\nweb_enabled: false\ndata_dir: '{}'\nskills_dir: '{}'\n",
+                data_dir.display(),
+                skills_dir.display()
+            ),
+        )
+        .unwrap();
+        let service = WorkRuntimeService::new(&config_path);
+
+        let github = service
+            .install_skill("https://github.com/vercel-labs/skills/tree/main/skills/find-skills")
+            .unwrap();
+        assert!(
+            github
+                .skills
+                .iter()
+                .any(|skill| skill.name == "find-skills")
+        );
+
+        let clawhub = service.install_skill("skills-weather").unwrap();
+        assert!(
+            clawhub
+                .skills
+                .iter()
+                .any(|skill| skill.name == "skills-weather")
+        );
+        assert!(
+            config_path
+                .parent()
+                .unwrap()
+                .join("data/clawhub.lock.json")
+                .is_file()
+        );
     }
 }

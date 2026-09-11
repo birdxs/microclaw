@@ -1,0 +1,79 @@
+name: Publish Rust SDK Crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing SDK release tag (for example sdk-v0.4.0)'
+        required: true
+        type: string
+      version:
+        description: 'Expected SDK crate version (for example 0.3.0)'
+        required: true
+        type: string
+      confirm:
+        description: 'Type publish to release immutable crates.io versions'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-sdk-crates
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Validate immutable release inputs
+        env:
+          EXPECTED_TAG: ${{ inputs.tag }}
+          EXPECTED_VERSION: ${{ inputs.version }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          [[ "${CONFIRM}" == "publish" ]]
+          [[ "${EXPECTED_TAG}" =~ ^(sdk-)?v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]
+          git fetch --force origin "refs/tags/${EXPECTED_TAG}:refs/tags/${EXPECTED_TAG}"
+          [[ "$(git rev-parse HEAD)" == "$(git rev-list -n 1 "refs/tags/${EXPECTED_TAG}")" ]]
+          actual_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "microclaw-sdk") | .version')"
+          [[ "${actual_version}" == "${EXPECTED_VERSION}" ]]
+      - name: Detect published API baseline
+        id: baseline
+        run: |
+          if curl --fail --silent \
+            --user-agent "microclaw-release/0.1 (https://github.com/microclaw/microclaw)" \
+            "https://crates.io/api/v1/crates/microclaw-sdk" >/dev/null; then
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+            echo "No published SDK baseline exists; this is the initial release."
+          fi
+      - name: Enforce public API compatibility
+        if: steps.baseline.outputs.available == 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: microclaw-core,microclaw-engine,microclaw-sdk
+          feature-group: all-features
+          rust-toolchain: 1.95.0
+      - name: Publish dependency-ordered crate set
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # A retry of an immutable older tag must still use the current release
+          # runner. Crate sources remain checked out at and packaged from the tag.
+          git fetch --no-tags --depth=1 origin "${GITHUB_SHA}"
+          git show "${GITHUB_SHA}:scripts/publish_sdk_crates.sh" > /tmp/publish_sdk_crates.sh
+          chmod +x /tmp/publish_sdk_crates.sh
+          /tmp/publish_sdk_crates.sh --execute
+      - name: Verify published SDK from crates.io
+        run: scripts/ci/check_sdk_registry_release.sh "${{ inputs.version }}"
