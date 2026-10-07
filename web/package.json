@@ -1,7 +1,7 @@
 {
   "name": "microclaw-web-ui",
   "private": true,
-  "version": "0.6.1",
+  "version": "0.8.0",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -11,27 +11,27 @@
     "dev": "vite"
   },
   "dependencies": {
-    "@assistant-ui/react": "^0.14.23",
-    "@assistant-ui/react-markdown": "^0.14.4",
+    "@assistant-ui/react": "^0.14.29",
+    "@assistant-ui/react-markdown": "^0.14.7",
     "@assistant-ui/react-ui": "^0.2.1",
     "@radix-ui/themes": "^3.2.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "react-markdown": "^10.1.0",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
-    "tailwind-merge": "^3.6.0",
+    "tailwind-merge": "^3.7.0",
     "use-stick-to-bottom": "^1.1.6"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.3.1",
+    "@tailwindcss/vite": "^4.3.3",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
-    "@vitejs/plugin-react": "^6.0.5",
+    "@vitejs/plugin-react": "^6.1.1",
     "tailwindcss": "^4.2.1",
     "typescript": "^5.6.3",
-    "vite": "^8.2.1"
+    "vite": "^8.3.1"
   }
 }

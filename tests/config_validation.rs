@@ -1,6 +1,6 @@
 //! Integration tests for configuration loading and validation.
 
-use microclaw::config::{Config, WorkingDirIsolation};
+use microclaw::config::{Config, SystemPromptTimeDetail, WorkingDirIsolation};
 
 /// Helper to create a minimal valid config for testing.
 fn minimal_config() -> Config {
@@ -41,6 +41,7 @@ fn minimal_config() -> Config {
         max_session_messages: 40,
         diff_max_lines: 120,
         file_diffs_in_chat: true,
+        allow_governance_file_writes: false,
         model_context_window: 200_000,
         context_pressure_compact_pct: 85,
         self_recheck: microclaw::config::SelfRecheckConfig::default(),
@@ -131,6 +132,7 @@ fn minimal_config() -> Config {
         checkpoints_enabled: false,
         skill_archive_after_days: 30,
         skills_catalog_top_k: 3,
+        system_prompt_time_detail: SystemPromptTimeDetail::Date,
     }
 }
 
@@ -246,6 +248,50 @@ fn test_yaml_unknown_fields_ignored() {
         assert_eq!(c.telegram_bot_token, "tok");
     }
     // If it errors, that's also acceptable behavior (strict mode)
+}
+
+#[test]
+fn test_yaml_system_prompt_time_detail_parses_each_variant() {
+    for (raw, expected) in [
+        ("none", SystemPromptTimeDetail::None),
+        ("date", SystemPromptTimeDetail::Date),
+        ("full", SystemPromptTimeDetail::Full),
+    ] {
+        let yaml = format!(
+            "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nsystem_prompt_time_detail: {raw}\n"
+        );
+        let config: Config =
+            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("failed to parse {raw:?}: {e}"));
+        assert_eq!(config.system_prompt_time_detail, expected, "for {raw:?}");
+    }
+}
+
+#[test]
+fn test_yaml_system_prompt_time_detail_defaults_to_date_when_absent() {
+    // The field is `#[serde(default)]`; omitting it must silently fall back to
+    // `date` rather than erroring, so existing configs keep working.
+    let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\n";
+    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(
+        config.system_prompt_time_detail,
+        SystemPromptTimeDetail::Date
+    );
+    assert_eq!(
+        SystemPromptTimeDetail::default(),
+        SystemPromptTimeDetail::Date
+    );
+}
+
+#[test]
+fn test_yaml_system_prompt_time_detail_rejects_unknown_value() {
+    // A typo must fail loudly at load time instead of silently degrading the
+    // prompt (e.g. `hourly` quietly behaving like `date`).
+    let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nsystem_prompt_time_detail: hourly\n";
+    let parsed: Result<Config, _> = serde_yaml::from_str(yaml);
+    assert!(
+        parsed.is_err(),
+        "unknown system_prompt_time_detail value should not deserialize"
+    );
 }
 
 #[test]

@@ -6,6 +6,101 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+### Changed
+
+- Unified website, CLI help, Snap contact, and all localized README Discord links with the shared XNU community invite.
+
+- The optional Matrix channel (`channel-matrix`, included in `full`) moved from
+  matrix-sdk 0.16 to 0.19. Its TLS backend is now rustls with aws-lc
+  (`rustls-aws-lc-rs`, matrix-sdk 0.19 dropped `native-tls`), and building it
+  needs Rust 1.96. The pinned toolchain moves to 1.96.1; the workspace MSRV
+  stays 1.93 for builds without Matrix (#510).
+- rusqlite moved from 0.37 to 0.40 across the workspace (matrix-sdk-sqlite 0.19
+  links the same `sqlite3`). `microclaw-core`'s optional `sqlite-errors`
+  feature exposes `MicroClawError::Database(rusqlite::Error)`, so SDK consumers
+  that match on that variant or convert their own rusqlite errors need
+  rusqlite 0.40 too.
+
+### Security
+
+- matrix-sdk 0.19 fixes RUSTSEC-2026-0318 (matrix-sdk-crypto to-device panic)
+  and, through imbl 7, RUSTSEC-2026-0292 (imbl-sized-chunks) and drops the
+  unmaintained `bitmaps` (RUSTSEC-2026-0247); their audit/deny exceptions are
+  removed. `anymap2` (RUSTSEC-2026-0319) is still pulled in by matrix-sdk 0.19
+  and stays ignored.
+
+## 0.8.0 - 2026-10-05
+
+### Changed
+
+- `microclaw-engine` `Config` gained the public `allow_governance_file_writes`
+  field (default `false`). Code that builds `Config` with a struct literal must
+  set it.
+
+### Security
+
+- `write_file` and `edit_file` now refuse to modify MicroClaw's own governance
+  files: the active config file, `AGENTS.md` / `SOUL.md` / `USER.md` under the
+  data directory, `souls_dir`, `context_dir` (and chat-scoped `context/`
+  folders), configured `soul_path`s and the path allowlist. Previously these
+  tools sidestepped the `write_memory` scope checks, so a prompt-injected agent
+  could plant global memory that reached other users' chats (#501). Set
+  `allow_governance_file_writes: true` to restore the old behavior. This guards
+  the file tools only; `bash` without the sandbox still runs as the service
+  user.
+
+### Fixed
+
+- `write_memory` no longer appends a duplicate structured memory row on every
+  save. Rows store the first 180 characters of the written content, and
+  global/bot writes resend the whole file, so repeated saves produced
+  byte-identical rows. An existing live row with the same content is now
+  refreshed in place (archived history is left alone); re-saving without
+  `ttl_days` makes the fact durable again (#505).
+- Telegram replies that quote part of a message now forward the selected text
+  to the agent, and cross-chat quotes forward their text instead of nothing
+  (#506).
+- Dependency updates (cargo patch/minor groups, web dev dependencies).
+  Dependabot now holds `@assistant-ui/react` below 0.15 and
+  `@assistant-ui/react-markdown` below 0.14.8, which `@assistant-ui/react-ui`
+  cannot use yet, and leaves the Zed git crates to move with gpui-component.
+- Security Audit ignores RUSTSEC-2026-0318 and RUSTSEC-2026-0319: both come
+  from matrix-sdk 0.16 behind the non-default `channel-matrix` feature, and the
+  affected code path is not reachable. They are removed with the matrix-sdk
+  0.19 upgrade (#510).
+
+- Removed the retired `Build (Release)` job from the release finalizer CI gate,
+  which made the Homebrew tap update wait until it timed out.
+
+## 0.7.0 - 2026-09-29
+
+### Changed
+
+- `microclaw-core` `Usage` gained the public `cache_read_input_tokens` and
+  `cache_creation_input_tokens` fields. Code that builds `Usage` with a struct
+  literal must set them or use `..Default::default()`.
+
+### Fixed
+
+- Stabilized the cached prompt prefix so prompt caching actually takes effect
+  across turns. The live clock, query-matched memories, ranked skill bodies,
+  mood read, verified prior experiences, plugin context, and relationship hint
+  moved out of the system prompt into a transient `<turn_context>` block that
+  is attached to the latest user message at request time and never persisted,
+  leaving the system prompt and the stored history byte-identical between turns.
+- Stabilized plugin tool ordering by sorting manifests by name, so the tool
+  definitions in the cached prefix no longer reshuffle between restarts.
+- Rendered stored message timestamps in `<user_message ts="...">` at whole-second
+  UTC precision, so re-rendering an unchanged history produces identical text.
+
+### Added
+
+- Added `system_prompt_time_detail` config (`none` / `date` / `full`), defaulting
+  to `date`, controlling how much clock detail the system prompt carries.
+- Added prompt-cache token accounting (`cache_read_input_tokens` and
+  `cache_creation_input_tokens`) to LLM usage, provider response parsing, and
+  agent metrics, so cache effectiveness is observable per run.
+
 ## 0.6.1 - 2026-09-04
 
 ### Changed
