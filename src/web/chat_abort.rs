@@ -39,6 +39,12 @@ pub async fn register_chat_run(run_id: String, session_key: String) -> ChatAbort
     entry
 }
 
+/// Session key of a registered run, if it is still active.
+pub async fn session_key_for_run(run_id: &str) -> Option<String> {
+    let guard = CHAT_ABORT_CONTROLLERS.read().await;
+    guard.get(run_id).map(|entry| entry.session_key.clone())
+}
+
 /// Remove a chat abort controller entry.
 pub async fn unregister_chat_run(run_id: &str) {
     let mut guard = CHAT_ABORT_CONTROLLERS.write().await;

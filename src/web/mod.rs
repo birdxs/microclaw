@@ -42,6 +42,7 @@ mod config;
 mod governance;
 mod metrics;
 mod middleware;
+mod pairing;
 mod sessions;
 mod skills;
 mod stream;

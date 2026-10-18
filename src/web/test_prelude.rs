@@ -279,6 +279,7 @@ pub(crate) fn test_web_state_from_app_state(state: Arc<AppState>, limits: WebLim
         session_hub: SessionHub::default(),
         request_hub: RequestHub::default(),
         auth_hub: AuthHub::default(),
+        pairing_hub: pairing::PairingHub::default(),
         metrics: Arc::new(Mutex::new(WebMetrics::default())),
         otlp: None,
         limits,
