@@ -42,7 +42,7 @@ MicroClaw 是一个用 Rust 编写、可自行托管的智能体平台，包含�
 
 有关本地任务闭环、平台支持等级、原生设置、安全边界和打包方式，请阅读
 [MicroClaw Work 产品指南](site/docs/work.md)。当前稳定交付基线是
-[MicroClaw v0.9.0](docs/roadmap/v0.9.0-plan.md)。
+[MicroClaw v0.10.0](docs/roadmap/v0.10.0-plan.md)。
 
 <p align="center">
   <img src="screenshots/screenshot1.png" alt="MicroClaw 对话界面" width="45%" />
@@ -68,7 +68,7 @@ brew install --cask microclaw-work
 ```
 
 Linux x86_64/arm64 与 Windows x86_64 portable 预览包可从
-[v0.9.0 版本页面](https://github.com/microclaw/microclaw/releases/tag/v0.9.0)下载。
+[v0.10.0 版本页面](https://github.com/microclaw/microclaw/releases/tag/v0.10.0)下载。
 macOS 仍是 Work 当前正式支持的桌面平台，其他平台继续完成验收。
 
 如需运行 MicroClaw Server，在 macOS 或 Linux 上安装：
@@ -93,7 +93,7 @@ microclaw start
 
 然后打开 [http://127.0.0.1:10961](http://127.0.0.1:10961)。
 
-最新版本为 **v0.9.0**。可选的 Matrix 通道升级到 matrix-sdk 0.19，修复了两个上游安全公告，Matrix 的 TLS 改用 rustls；整个工作区升级到 rusqlite 0.40，工具链升级到 Rust 1.96。详情见[更新日志](CHANGELOG.md)与[版本下载](https://github.com/microclaw/microclaw/releases/tag/v0.9.0)。
+最新版本为 **v0.10.0**。MicroClaw Work 可以与你自己部署的 Server 配对：Web 控制台生成一次性配对码，Work 换取可随时撤销的设备令牌，并通过明确的「本地 / Server」执行目标把任务交给 Server 运行，进度、取消和审批与本地一致。同时清理了最新的 zip、rustls、quinn 安全公告。详情见[更新日志](CHANGELOG.md)与[版本下载](https://github.com/microclaw/microclaw/releases/tag/v0.10.0)。
 
 Homebrew、Docker、源码构建、Linux 兼容性、升级和常驻服务安装请查看[快速上手指南](docs/getting-started.md)。
 
@@ -142,7 +142,7 @@ Web 控制台、具体渠道适配器或 Work UI。
 
 ```toml
 [dependencies]
-microclaw-sdk = { version = "0.9.0", features = ["full"] }
+microclaw-sdk = { version = "0.10.0", features = ["full"] }
 ```
 
 ```rust

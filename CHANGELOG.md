@@ -6,6 +6,8 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+## 0.10.0 - 2026-10-18
+
 ### Added
 
 - Work ↔ Server pairing (roadmap Stage 4, first slice). The Web console's
