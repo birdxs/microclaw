@@ -6220,8 +6220,10 @@ dependencies = [
 name = "microclaw-work-headless"
 version = "0.9.0"
 dependencies = [
+ "dirs",
  "microclaw-sdk",
  "microclaw-work-app",
+ "microclaw-work-runtime",
  "serde_json",
  "tempfile",
  "tokio",
@@ -6234,9 +6236,11 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
+ "futures-util",
  "microclaw-core",
  "microclaw-engine",
  "microclaw-sdk",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",

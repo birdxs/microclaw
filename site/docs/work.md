@@ -116,8 +116,10 @@ engine on this computer. Pairing is explicit and revocable:
 
 To disconnect, click **Unpair** in Work (removes the local token) or
 **Revoke** in the Server console (the device's next request is rejected and
-Work shows that it has to pair again). `microclaw-work-headless server
-"<task>"` runs one task against the paired Server from a terminal.
+Work shows that it has to pair again). From a terminal,
+`microclaw-work-headless pair <server_url> <code>` pairs without the desktop
+UI and `microclaw-work-headless server "<task>"` runs one task against the
+paired Server.
 
 ## Architecture
 
