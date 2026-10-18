@@ -4,6 +4,18 @@
 
 Use this guide for rolling upgrades that may include schema/auth/hooks/session/metrics changes.
 
+### SDK and products v0.10.0
+
+Server, Work, Work Headless, and the three public Rust crates move together to
+`0.10.0`. The SQLite schema migrates automatically to v44 (new
+`paired_devices` table); no configuration change is required.
+
+Device tokens issued by pairing are accepted wherever API keys are (`Bearer`
+header, WebSocket `connect`) but only with `operator.read` and
+`operator.write`. Operators who audit `auth` events will see new
+`pairing.claim`, `pairing.device.revoke`, `pairing.code.create` and
+`run.cancel` actions and `device:<id>` actors.
+
 ### SDK and products v0.9.0
 
 Server, Work, Work Headless, and the three public Rust crates move together to

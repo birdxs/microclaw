@@ -94,6 +94,31 @@ Settings includes:
 - offline filesystem/configuration diagnostics and explicit provider and full
   first-response tests.
 
+## Connect Work to a MicroClaw Server
+
+Work can submit tasks to a MicroClaw Server you run instead of the embedded
+engine on this computer. Pairing is explicit and revocable:
+
+1. In the Server's Web console open **Settings → Access → Paired devices** and
+   click **Create pairing code**. The code is eight characters, single-use,
+   and expires after the chosen number of minutes (10 by default).
+2. In Work open **Settings → Server**, enter the Server URL
+   (for example `https://claw.example.com`) and the code, then click **Pair**.
+   Work stores the issued device token in `remote-server.json` under its data
+   directory with owner-only permissions. The token carries
+   `operator.read` and `operator.write` only; it cannot change Server
+   configuration or manage credentials.
+3. Switch the execution target to **Server**. The composer chip changes from
+   `Local` to `Server · <device label>` so it is always visible where a task
+   runs. Progress, tool activity, approvals, and Stop work the same way as
+   locally; the Server owns the working directory and permission scope for
+   those runs.
+
+To disconnect, click **Unpair** in Work (removes the local token) or
+**Revoke** in the Server console (the device's next request is rejected and
+Work shows that it has to pair again). `microclaw-work-headless server
+"<task>"` runs one task against the paired Server from a terminal.
+
 ## Architecture
 
 ```text

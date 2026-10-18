@@ -6,6 +6,31 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+### Added
+
+- Work ↔ Server pairing (roadmap Stage 4, first slice). The Web console's
+  Access tab mints single-use pairing codes; `POST /api/pairing/claim` trades
+  a code for a hashed, revocable device token (`operator.read` +
+  `operator.write`, actor `device:<id>`), listed and revoked under
+  `/api/pairing/devices`, with `GET /api/pairing/whoami` for clients to verify
+  their identity. `POST /api/runs/:run_id/cancel` cancels one run over HTTP.
+- MicroClaw Work: Settings → Server pairs with a Server, and an explicit
+  Local / Server execution target in the composer routes tasks either to the
+  embedded engine or to the paired Server with live progress, cancellation
+  and approvals. `microclaw-work-headless server "<task>"` runs one task
+  against the paired Server.
+
+### Changed
+
+- Schema v44 adds the `paired_devices` table (automatic migration).
+
+### Security
+
+- zip 2 → 9 with only the deflate feature (RUSTSEC-2026-0367/0368/0369; the
+  ClawHub installer never used `ZipArchive::extract`), rustls 0.23.46
+  (RUSTSEC-2026-0346..0349) and quinn-proto 0.11.19
+  (RUSTSEC-2026-0338/0340/0343).
+
 ## 0.9.0 - 2026-10-07
 
 ### Changed
