@@ -20,6 +20,7 @@ import '@radix-ui/themes/styles.css'
 import '@assistant-ui/react-ui/styles/index.css'
 import './styles.css'
 import { ApiKeysSettings } from './components/api-keys-settings'
+import { PairedDevicesSettings } from './components/paired-devices-settings'
 import { SessionSidebar } from './components/session-sidebar'
 import { UsagePanel, type InjectionLogPoint, type MemoryObservability, type ReflectorRunPoint, type SubagentObservability } from './components/usage-panel'
 import { SkillsSettings } from './components/skills-settings'
@@ -2291,6 +2292,15 @@ function App() {
                         </Text>
                         <div className="mt-4">
                           <ApiKeysSettings open={configOpen} authenticated={authAuthenticated} />
+                        </div>
+                      </div>
+                      <div className={`${sectionCardClass} mt-4`} style={sectionCardStyle}>
+                        <Text size="3" weight="bold">Paired devices</Text>
+                        <Text size="1" color="gray" className="mt-1 block">
+                          Connect MicroClaw Work desktop clients to this Server with revocable device credentials.
+                        </Text>
+                        <div className="mt-4">
+                          <PairedDevicesSettings open={configOpen} authenticated={authAuthenticated} />
                         </div>
                       </div>
                     </Tabs.Content>
