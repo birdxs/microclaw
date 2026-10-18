@@ -75,7 +75,7 @@ aes = "0.8"
 ecb = { version = "0.1", features = ["alloc"] }
 chrono-tz = "0.10"
 iana-time-zone = "0.1"
-zip = "2"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 md5 = "0.7"
 axum = { version = "0.7", features = ["ws"] }

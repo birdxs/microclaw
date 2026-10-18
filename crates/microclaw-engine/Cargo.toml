@@ -44,7 +44,7 @@ urlencoding = "2"
 base64 = "0.22"
 chrono-tz = "0.10"
 iana-time-zone = "0.1"
-zip = "2"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 md5 = "0.7"
 include_dir = "0.7"
