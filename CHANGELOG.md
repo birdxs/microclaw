@@ -6,6 +6,26 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+## 0.10.1 - 2026-10-24
+
+### Fixed
+
+- Web UI: the first keystroke in the message composer threw
+  `Maximum update depth exceeded` and froze the page (#517). The 2026-10-05
+  dependency bump let the transitive `@assistant-ui/tap` float to 0.9.20,
+  whose `getSnapshot` loop guard fires against the unfixed
+  `@assistant-ui/core` 0.2.23 that the 0.14 line is frozen on; v0.8.0,
+  v0.9.0 and v0.10.0 all shipped that pair. `web/package.json` now pins
+  `@assistant-ui/tap` to 0.9.12 through `overrides`, and Dependabot holds it
+  there until the UI moves to `@assistant-ui/react` 0.15.
+
+### Security
+
+- Targeted dependency updates for advisories published after 0.10.0:
+  ctutils 0.4.5 (RUSTSEC-2026-0385), rustls-webpki 0.103.16
+  (RUSTSEC-2026-0382), tokio 1.54.1 (RUSTSEC-2026-0386), webpki-root-certs
+  1.0.11 (RUSTSEC-2026-0383) and webpki-roots 1.0.11 (RUSTSEC-2026-0381).
+
 ## 0.10.0 - 2026-10-18
 
 ### Added
