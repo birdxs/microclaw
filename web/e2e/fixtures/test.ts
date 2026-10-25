@@ -12,13 +12,14 @@ type Fixtures = {
   errors: BrowserErrors
 }
 
-type WorkerFixtures = {
+type ServerFixtures = {
   microclaw: MicroclawServer
 }
 
-export const test = base.extend<Fixtures, WorkerFixtures>({
-  // One server per worker: booting the binary costs a second or two, and the
-  // tests each use their own session key so they do not interfere.
+export const test = base.extend<Fixtures & ServerFixtures>({
+  // One server per test: booting the binary costs a second or two, and a
+  // fresh data dir means each test signs in to an empty session instead of
+  // landing on, and queueing behind, the chat a previous test left running.
   microclaw: [
     async ({}, use) => {
       const server = await startMicroclaw()
@@ -28,7 +29,7 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
         await server.stop()
       }
     },
-    { scope: 'worker' },
+    { scope: 'test' },
   ],
 
   baseURL: async ({ microclaw }, use) => {

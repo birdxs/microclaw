@@ -20,6 +20,41 @@ async function signIn(page: Page): Promise<void> {
   await expect(page.getByPlaceholder(COMPOSER_PLACEHOLDER)).toBeVisible()
 }
 
+// The active session key is the workspace heading; the ?session= URL
+// parameter is synced from state in an effect, so it can lag by a render.
+async function currentSessionKey(page: Page): Promise<string> {
+  const heading = page.getByRole('heading', { level: 1 }).first()
+  await expect(heading).toBeVisible()
+  return (await heading.textContent())?.trim() ?? ''
+}
+
+// User messages the server has stored for a session (same cookie jar as the page).
+async function storedUserMessages(page: Page, sessionKey: string): Promise<string[]> {
+  const res = await page.request.get(`/api/history?session_key=${encodeURIComponent(sessionKey)}&limit=200`)
+  if (!res.ok()) return []
+  const body = (await res.json()) as { messages?: { is_from_bot?: boolean; content?: string }[] }
+  return (body.messages ?? []).filter((m) => !m.is_from_bot).map((m) => m.content ?? '')
+}
+
+// Sends the composer's text and waits until the server has accepted the run
+// and stored the user message, so a later reload finds it in the history.
+async function sendAndWaitForPersisted(page: Page, composer: ReturnType<Page['getByPlaceholder']>, text: string) {
+  const sessionKey = await currentSessionKey(page)
+  const accepted = page.waitForResponse(
+    (res) =>
+      res.request().method() === 'POST' && new URL(res.url()).pathname === '/api/send_stream' && res.status() === 200,
+    { timeout: 15_000 },
+  )
+  await composer.press('Enter')
+  await accepted
+  await expect
+    .poll(() => storedUserMessages(page, sessionKey), {
+      message: `history for ${sessionKey} contains the sent message`,
+      timeout: 30_000,
+    })
+    .toContain(text)
+}
+
 async function typeIntoComposer(page: Page, text: string) {
   const composer = page.getByPlaceholder(COMPOSER_PLACEHOLDER)
   await composer.click()
@@ -58,17 +93,20 @@ test('typing and sending in the composer does not crash the page', async ({ page
 
 test('composer still works after reloading with rendered history', async ({ page, errors }) => {
   await signIn(page)
+  const sessionKey = await currentSessionKey(page)
   const first = await typeIntoComposer(page, 'first message')
-  const firstSend = page.waitForRequest(
-    (req) => req.method() === 'POST' && new URL(req.url()).pathname === '/api/send_stream',
-  )
-  await first.press('Enter')
-  await firstSend
+  await sendAndWaitForPersisted(page, first, 'first message')
   await expect(page.getByText('first message', { exact: true }).first()).toBeVisible()
 
   // Session cookie survives the reload, so we land directly on the thread with
   // the stored history rendered — a different mount path than the empty thread.
-  await page.reload()
+  // The reload must not race the send: the history poll above guarantees the
+  // message is stored server-side before we navigate, and ?session= pins the
+  // session we were in.
+  await page.goto(`/?session=${encodeURIComponent(sessionKey)}`)
+  // The heading shows a fresh default key until the session list has loaded
+  // and the ?session= preference is applied, so this must retry.
+  await expect(page.getByRole('heading', { level: 1 }).first()).toHaveText(sessionKey)
   await expect(page.getByRole('dialog', { name: 'Sign In' })).toBeHidden()
   await expect(page.getByPlaceholder(COMPOSER_PLACEHOLDER)).toBeVisible()
   await expect(page.getByText('first message', { exact: true }).first()).toBeVisible()

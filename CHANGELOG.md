@@ -6,6 +6,13 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+### Changed
+
+- Web UI browser smoke test: one `microclaw` server per test instead of per
+  worker, and the reload test waits until the server has stored the message
+  (via `/api/history`) and navigates with `?session=` before asserting, so a
+  slow provider round-trip on CI can no longer race the reload.
+
 ## 0.11.0 - 2026-10-25
 
 ### Added
