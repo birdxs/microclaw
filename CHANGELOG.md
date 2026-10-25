@@ -6,6 +6,18 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+## 0.11.0 - 2026-10-25
+
+### Added
+
+- Web UI browser smoke test (`web/e2e`, Playwright): boots the built
+  binary with a generated web-only config, signs in, types and sends in the
+  real embedded composer, then reloads and types again; any uncaught browser
+  error fails it. A new `Web UI Browser Smoke` CI job runs it on every push,
+  so the first-keystroke crash class from #517 (shipped unnoticed in v0.8.0
+  to v0.10.0) is now caught before release. `cargo build && npm --prefix
+  web run e2e` runs it locally (#522).
+
 ### Changed
 
 - Web UI: moved to `@assistant-ui/react` 0.15 (0.15.31) with

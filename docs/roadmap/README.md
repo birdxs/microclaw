@@ -8,6 +8,7 @@ plan exists first.
 
 | Document | Status | Notes |
 |---|---|---|
+| [`v0.11.0-plan.md`](./v0.11.0-plan.md) | In progress | Web UI dependency release: `@assistant-ui/react` 0.15 without the tap pin, tool-call cards with arguments, Playwright browser smoke test in CI. |
 | [`v0.10.1-plan.md`](./v0.10.1-plan.md) | Delivered | Web UI hotfix: pin `@assistant-ui/tap` to 0.9.12 so the composer no longer crashes on the first keystroke (#517). |
 | [`v0.10.0-plan.md`](./v0.10.0-plan.md) | Delivered | Work ↔ Server pairing shipped: revocable device credentials, remote task submission/progress/cancel, explicit Local/Server execution target in Work; zip 9 / rustls / quinn advisories cleared. |
 | [`v0.9.0-plan.md`](./v0.9.0-plan.md) | Delivered | Dependency release shipped: matrix-sdk 0.19 with rustls TLS, rusqlite 0.40, Rust 1.96 toolchain. |

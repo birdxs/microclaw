@@ -43,7 +43,7 @@ It is designed for work that lasts longer than one request: multi-step tool use,
 Read the [MicroClaw Work product guide](site/docs/work.md) for the local task
 loop, platform support levels, native settings, safety boundary, and packaging
 model. The current stable delivery baseline is
-[MicroClaw v0.10.1](docs/roadmap/v0.10.1-plan.md).
+[MicroClaw v0.11.0](docs/roadmap/v0.11.0-plan.md).
 
 <p align="center">
   <img src="screenshots/screenshot1.png" alt="MicroClaw conversation view" width="45%" />
@@ -69,7 +69,7 @@ brew install --cask microclaw-work
 ```
 
 Linux x86_64/arm64 and Windows x86_64 portable previews are available from the
-[v0.10.1 release](https://github.com/microclaw/microclaw/releases/tag/v0.10.1).
+[v0.11.0 release](https://github.com/microclaw/microclaw/releases/tag/v0.11.0).
 macOS remains the officially supported Work desktop platform while the preview
 builds complete platform acceptance.
 
@@ -95,7 +95,7 @@ microclaw start
 
 Then open [http://127.0.0.1:10961](http://127.0.0.1:10961).
 
-The latest release is **v0.10.1**. It connects MicroClaw Work to a Server you run: the Web console mints single-use pairing codes, Work pairs with a revocable device token, and an explicit Local / Server execution target sends tasks to the Server with live progress, cancellation, and approvals. It also clears the latest zip, rustls, and quinn security advisories. See the [release notes](CHANGELOG.md) and [downloads](https://github.com/microclaw/microclaw/releases/tag/v0.10.1).
+The latest release is **v0.11.0**. It connects MicroClaw Work to a Server you run: the Web console mints single-use pairing codes, Work pairs with a revocable device token, and an explicit Local / Server execution target sends tasks to the Server with live progress, cancellation, and approvals. It also clears the latest zip, rustls, and quinn security advisories. See the [release notes](CHANGELOG.md) and [downloads](https://github.com/microclaw/microclaw/releases/tag/v0.11.0).
 
 For Homebrew, Docker, source builds, Linux compatibility, upgrades, and service installation, see the [getting-started guide](docs/getting-started.md).
 
@@ -144,7 +144,7 @@ Worker support without pulling in the Server, Web console, concrete channel adap
 
 ```toml
 [dependencies]
-microclaw-sdk = { version = "0.10.1", features = ["full"] }
+microclaw-sdk = { version = "0.11.0", features = ["full"] }
 ```
 
 ```rust
