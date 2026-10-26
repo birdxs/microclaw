@@ -7,7 +7,7 @@
 
 use super::*;
 
-pub(crate) const SCHEMA_VERSION_CURRENT: i64 = 43;
+pub(crate) const SCHEMA_VERSION_CURRENT: i64 = 44;
 
 pub(crate) fn table_has_column(
     conn: &Connection,
@@ -1732,6 +1732,25 @@ pub(crate) fn apply_schema_migrations(conn: &Connection) -> Result<(), MicroClaw
         )?;
         set_schema_version(conn, 43)?;
         version = 43;
+    }
+    if version < 44 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS paired_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL UNIQUE,
+                label TEXT NOT NULL,
+                platform TEXT,
+                token_hash TEXT NOT NULL UNIQUE,
+                prefix TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT,
+                revoked_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_paired_devices_token_hash
+                ON paired_devices(token_hash);",
+        )?;
+        set_schema_version(conn, 44)?;
+        version = 44;
     }
     if version != SCHEMA_VERSION_CURRENT {
         set_schema_version(conn, SCHEMA_VERSION_CURRENT)?;

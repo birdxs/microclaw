@@ -113,7 +113,11 @@ async fn start_stream_run_internal(
                                 )
                                 .await;
                         }
-                        AgentEvent::ToolStart { call_id, name, .. } => {
+                        AgentEvent::ToolStart {
+                            call_id,
+                            name,
+                            input,
+                        } => {
                             super::metrics_apply_agent_event(
                                 &state_for_events,
                                 &AgentEvent::ToolStart {
@@ -127,7 +131,8 @@ async fn start_stream_run_internal(
                                 .publish(
                                     &run_id_for_events,
                                     "tool_start",
-                                    json!({"call_id": call_id, "name": name}).to_string(),
+                                    json!({"call_id": call_id, "name": name, "input": input})
+                                        .to_string(),
                                     run_history_limit,
                                 )
                                 .await;
@@ -561,6 +566,65 @@ pub(super) async fn api_stream(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("keepalive"),
+    ))
+}
+
+/// HTTP twin of the WebSocket `chat.abort` method, scoped to one run so a
+/// paired device can stop exactly the task it submitted.
+pub(super) async fn api_run_cancel(
+    headers: HeaderMap,
+    State(state): State<WebState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    metrics_http_inc(&state).await;
+    let identity = require_scope(&state, &headers, AuthScope::Write).await?;
+    let (done, _) = match state
+        .run_hub
+        .status(&run_id, &identity.actor, identity.allows(AuthScope::Admin))
+        .await
+    {
+        Ok(v) => v,
+        Err(RunLookupError::NotFound) => {
+            return Err((StatusCode::NOT_FOUND, "run not found".into()))
+        }
+        Err(RunLookupError::Forbidden) => return Err((StatusCode::FORBIDDEN, "forbidden".into())),
+    };
+    if done {
+        return Ok(Json(
+            json!({"ok": true, "run_id": run_id, "aborted": false}),
+        ));
+    }
+    let Some(session_key) = chat_abort::session_key_for_run(&run_id).await else {
+        return Ok(Json(
+            json!({"ok": true, "run_id": run_id, "aborted": false}),
+        ));
+    };
+    let (signalled, _) = chat_abort::abort_chat_run_by_id(&run_id, &session_key).await;
+    let mut aborted_runs = 0;
+    if let Ok(chat_id) = resolve_chat_id_for_session_key_read(&state, &session_key).await {
+        aborted_runs = microclaw_engine::run_control::abort_runs("web", chat_id).await;
+    }
+    let aborted = signalled || aborted_runs > 0;
+    audit_log(
+        &state,
+        "operator",
+        &identity.actor,
+        "run.cancel",
+        Some(&run_id),
+        if aborted { "ok" } else { "miss" },
+        None,
+    )
+    .await;
+    info!(
+        target: "web",
+        endpoint = "/api/runs/:run_id/cancel",
+        run_id = %run_id,
+        session_key = %session_key,
+        aborted_count = aborted_runs,
+        "run cancel requested"
+    );
+    Ok(Json(
+        json!({"ok": true, "run_id": run_id, "aborted": aborted}),
     ))
 }
 

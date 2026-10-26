@@ -246,6 +246,22 @@ pub(crate) struct SetPasswordRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct CreatePairingCodeRequest {
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+    #[serde(default)]
+    pub(crate) expires_minutes: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ClaimPairingCodeRequest {
+    pub(crate) code: String,
+    pub(crate) device_name: String,
+    #[serde(default)]
+    pub(crate) platform: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct CreateApiKeyRequest {
     pub(crate) label: String,
     pub(crate) scopes: Vec<String>,

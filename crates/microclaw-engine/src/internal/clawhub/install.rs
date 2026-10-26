@@ -252,10 +252,12 @@ fn extract_bounded<R: Read + Seek>(archive: &mut ZipArchive<R>, dest: &Path) -> 
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("unreadable archive entry {i}: {e}"))?;
+        // zip 9 makes `name()` fallible (it re-validates the stored bytes);
+        // the raw bytes are enough for a diagnostic and never used as a path.
+        let display_name = String::from_utf8_lossy(entry.name_raw()).into_owned();
         let Some(rel) = entry.enclosed_name() else {
             return Err(format!(
-                "entry '{}' has an unsafe path (traversal)",
-                entry.name()
+                "entry '{display_name}' has an unsafe path (traversal)"
             ));
         };
         let out_path = dest.join(rel);
@@ -271,12 +273,11 @@ fn extract_bounded<R: Read + Seek>(archive: &mut ZipArchive<R>, dest: &Path) -> 
         // Copy at most one byte past the cap so we can tell "at cap" from
         // "over cap" without trusting the entry's declared size.
         let written = std::io::copy(&mut (&mut entry).take(MAX_FILE_BYTES + 1), &mut out)
-            .map_err(|e| format!("failed to extract '{}': {e}", entry.name()))?;
+            .map_err(|e| format!("failed to extract '{display_name}': {e}"))?;
         if written > MAX_FILE_BYTES {
             return Err(format!(
-                "entry '{}' exceeds {MAX_FILE_BYTES} bytes uncompressed; oversized files \
-                 are a known scanner-bypass pattern",
-                entry.name()
+                "entry '{display_name}' exceeds {MAX_FILE_BYTES} bytes uncompressed; \
+                 oversized files are a known scanner-bypass pattern"
             ));
         }
         total = total.saturating_add(written);

@@ -432,6 +432,40 @@ async fn auth_identity_from_bearer_token(
         return Ok(Some(AuthIdentity { scopes, actor }));
     }
 
+    let device_hash = sha256_hex(token);
+    if let Some(device) = call_blocking(state.app_state.db.clone(), move |db| {
+        db.validate_paired_device_token_hash(&device_hash)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        let actor = pairing::device_actor(&device.device_id);
+        let (max_requests, window) = api_key_limits(&state.app_state.config);
+        let allowed = state
+            .auth_hub
+            .allow_api_key_request(&actor, max_requests, window)
+            .await;
+        if !allowed {
+            audit_auth_event(
+                state,
+                &actor,
+                "device.rate_limited",
+                None,
+                "deny",
+                Some("api_key_rate_limit_exceeded"),
+            )
+            .await;
+            return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+        }
+        return Ok(Some(AuthIdentity {
+            scopes: pairing::DEVICE_SCOPES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            actor,
+        }));
+    }
+
     Ok(None)
 }
 

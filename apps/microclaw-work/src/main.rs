@@ -16,6 +16,7 @@ use microclaw_work_app::session::{
     ConversationRole, WorkCommand, WorkEventKind, WorkReviewStatus, WorkSessionSnapshot, WorkStatus,
 };
 use microclaw_work_app::store::{WorkSessionStore, WorkSessionSummary, startup_workspace};
+use microclaw_work_runtime::remote::{RemoteRuntimeService, RemoteServerCredentials};
 use microclaw_work_runtime::{
     AgentSettingsDraft, DiagnosticStatus, ModelProviderPreset, ModelSettingsDraft,
     RuntimeConfigSummary, WorkDiagnosticsReport, WorkRunCancellation, WorkRunRequest,
@@ -27,6 +28,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, mpsc::TryRecvError};
 use std::time::Duration;
+
+mod remote_ui;
+use remote_ui::ExecutionTarget;
 
 actions!(
     microclaw_work,
@@ -98,6 +102,7 @@ enum SettingsSection {
     Appearance,
     #[default]
     Models,
+    Server,
     Agent,
     Skills,
     Workspace,
@@ -105,10 +110,11 @@ enum SettingsSection {
 }
 
 impl SettingsSection {
-    const ALL: [(Self, &'static str, &'static str); 7] = [
+    const ALL: [(Self, &'static str, &'static str); 8] = [
         (Self::General, "General", "⌘"),
         (Self::Appearance, "Appearance", "◐"),
         (Self::Models, "Models", "◇"),
+        (Self::Server, "Server", "⇄"),
         (Self::Agent, "Agent", "✦"),
         (Self::Skills, "Skills", "◇"),
         (Self::Workspace, "Workspace", "▱"),
@@ -242,6 +248,16 @@ struct WorkApp {
     settings_section: SettingsSection,
     appearance_preference: AppearancePreference,
     appearance_preferences_path: PathBuf,
+    execution_target: ExecutionTarget,
+    execution_target_path: PathBuf,
+    remote_credentials_path: PathBuf,
+    remote_credentials: Option<RemoteServerCredentials>,
+    server_url_input: Entity<InputState>,
+    pairing_code_input: Entity<InputState>,
+    device_name_input: Entity<InputState>,
+    server_message: String,
+    server_action_active: bool,
+    remote_run_active: bool,
     settings_has_api_key: bool,
     codex_account_available: bool,
     provider_input: Entity<InputState>,
@@ -290,6 +306,17 @@ impl WorkApp {
         let appearance_preference = AppearancePreference::load(&appearance_preferences_path);
         appearance_preference.apply(window, cx);
         cx.set_global(appearance_preference);
+        let execution_target_path = work_data_root.join("execution-target");
+        let remote_credentials_path =
+            microclaw_work_runtime::remote::credentials_path(&work_data_root);
+        let remote_credentials = RemoteServerCredentials::load(&remote_credentials_path)
+            .ok()
+            .flatten();
+        let execution_target = if remote_credentials.is_some() {
+            ExecutionTarget::load(&execution_target_path)
+        } else {
+            ExecutionTarget::Local
+        };
         let session_root = work_data_root.join("work-sessions");
         let runtime_service =
             WorkRuntimeService::discover(work_data_root.join("microclaw.config.yaml"));
@@ -453,6 +480,24 @@ impl WorkApp {
             InputState::new(window, cx)
                 .placeholder("Local folder, GitHub URL, owner/repo/skill, or ClawHub slug")
         });
+        let server_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(
+                    remote_credentials
+                        .as_ref()
+                        .map(|c| c.server_url.clone())
+                        .unwrap_or_default(),
+                )
+                .placeholder("https://your-microclaw-server.example.com")
+        });
+        let pairing_code_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("8-character code from the Server console")
+        });
+        let device_name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(remote_ui::default_device_name())
+                .placeholder("Name shown in the Server console")
+        });
         let _subscriptions = vec![
             cx.subscribe_in(
                 &provider_input,
@@ -546,6 +591,16 @@ impl WorkApp {
             settings_section: SettingsSection::default(),
             appearance_preference,
             appearance_preferences_path,
+            execution_target,
+            execution_target_path,
+            remote_credentials_path,
+            remote_credentials,
+            server_url_input,
+            pairing_code_input,
+            device_name_input,
+            server_message: String::new(),
+            server_action_active: false,
+            remote_run_active: false,
             settings_has_api_key,
             codex_account_available,
             provider_input,
@@ -1542,6 +1597,7 @@ impl WorkApp {
 
     fn resolve_approval(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
         if !self.last_run_was_demo
+            && !self.remote_target_ready()
             && (self.session.workspace.is_empty()
                 || !PathBuf::from(&self.session.workspace).is_dir())
         {
@@ -1603,7 +1659,7 @@ impl WorkApp {
             return;
         }
         self.runtime_config = self.runtime_service.config_summary();
-        if !self.runtime_config.ready {
+        if !self.runtime_config.ready && !self.remote_target_ready() {
             self.persistence_message = "Open Model Settings to configure the runtime.".into();
             cx.notify();
             return;
@@ -1689,18 +1745,57 @@ impl WorkApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.active_run_id = self.active_run_id.saturating_add(1);
-        self.runtime_active = true;
-        let generation = self.active_run_id;
-        let handle = self.runtime_service.start(WorkRunRequest {
+        let request = WorkRunRequest {
             task: prompt,
             workspace: self.session.workspace.clone(),
             session: self.session.session_id.clone(),
-        });
+        };
+        let remote = self.remote_target_ready();
+        let handle = if remote {
+            let credentials = self
+                .remote_credentials
+                .clone()
+                .expect("remote target ready implies credentials");
+            match RemoteRuntimeService::new(credentials) {
+                Ok(service) => match service.start(request) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        let message = format!("Could not start the Server run: {error}");
+                        let _ = self.session.apply(WorkCommand::FailRun {
+                            message: message.clone(),
+                        });
+                        self.persistence_message = message;
+                        self.persist();
+                        cx.notify();
+                        return;
+                    }
+                },
+                Err(error) => {
+                    let message = format!("Could not reach the Server: {error}");
+                    let _ = self.session.apply(WorkCommand::FailRun {
+                        message: message.clone(),
+                    });
+                    self.persistence_message = message;
+                    self.persist();
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            self.runtime_service.start(request)
+        };
+        self.active_run_id = self.active_run_id.saturating_add(1);
+        self.runtime_active = true;
+        self.remote_run_active = remote;
+        let generation = self.active_run_id;
         let receiver = handle.messages;
         self.runtime_cancellation = Some(handle.cancellation);
         self.runtime_steering = Some(handle.steering);
-        self.persistence_message = "Connecting to the MicroClaw runtime…".into();
+        self.persistence_message = if remote {
+            format!("Submitting to {}…", self.remote_target_label())
+        } else {
+            "Connecting to the MicroClaw runtime…".into()
+        };
         let window_handle = window.window_handle();
         cx.notify();
 
@@ -1725,10 +1820,12 @@ impl WorkApp {
                                         {
                                             this.persistence_message = error.to_string();
                                         }
-                                        this.durable_subagents = this
-                                            .runtime_service
-                                            .subagents(&this.session.session_id)
-                                            .unwrap_or_default();
+                                        if !remote {
+                                            this.durable_subagents = this
+                                                .runtime_service
+                                                .subagents(&this.session.session_id)
+                                                .unwrap_or_default();
+                                        }
                                         None
                                     }
                                     WorkRuntimeMessage::SteeringResult {
@@ -1757,12 +1854,15 @@ impl WorkApp {
                                     }
                                     WorkRuntimeMessage::Completed { run_id } => {
                                         this.runtime_active = false;
+                                        this.remote_run_active = false;
                                         this.runtime_cancellation = None;
                                         this.runtime_steering = None;
-                                        this.durable_subagents = this
-                                            .runtime_service
-                                            .subagents(&this.session.session_id)
-                                            .unwrap_or_default();
+                                        if !remote {
+                                            this.durable_subagents = this
+                                                .runtime_service
+                                                .subagents(&this.session.session_id)
+                                                .unwrap_or_default();
+                                        }
                                         let (message, notification) = match this.session.status {
                                             WorkStatus::AwaitingApproval => {
                                                 (format!("Runtime {run_id} paused for approval."), None)
@@ -1784,6 +1884,7 @@ impl WorkApp {
                                     }
                                     WorkRuntimeMessage::Failed { run_id, message } => {
                                         this.runtime_active = false;
+                                        this.remote_run_active = false;
                                         this.runtime_cancellation = None;
                                         this.runtime_steering = None;
                                         let display = format!("Runtime {run_id} failed: {message}");
@@ -1820,7 +1921,7 @@ impl WorkApp {
                                 );
                             });
                         }
-                        if terminal {
+                        if terminal && !remote {
                             loop {
                                 Timer::after(Duration::from_millis(500)).await;
                                 let active = this.update(cx, |this, cx| {
@@ -1856,6 +1957,7 @@ impl WorkApp {
                                 return;
                             }
                             this.runtime_active = false;
+                            this.remote_run_active = false;
                             this.runtime_cancellation = None;
                             this.runtime_steering = None;
                             let message = "The runtime message channel disconnected.".to_string();
@@ -3052,6 +3154,7 @@ impl WorkApp {
             SettingsSection::General => self.render_general_settings(cx),
             SettingsSection::Appearance => self.render_appearance_settings(cx),
             SettingsSection::Models => self.render_model_settings_content(cx),
+            SettingsSection::Server => self.render_server_settings(cx),
             SettingsSection::Agent => self.render_agent_settings(cx),
             SettingsSection::Skills => self.render_skills_settings(cx),
             SettingsSection::Workspace => self.render_workspace_settings(cx),
@@ -3690,11 +3793,21 @@ impl Render for WorkApp {
                                         self.runtime_config.provider, self.runtime_config.model
                                     )),
                             )
-                            .children((!self.runtime_config.ready).then(|| {
+                            .children(
+                                (!self.runtime_config.ready && !self.remote_target_ready()).then(
+                                    || {
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(cx.theme().warning)
+                                            .child("Model setup required")
+                                    },
+                                ),
+                            )
+                            .children(self.remote_target_ready().then(|| {
                                 div()
                                     .text_size(px(10.))
-                                    .text_color(cx.theme().warning)
-                                    .child("Model setup required")
+                                    .text_color(cx.theme().success)
+                                    .child(self.remote_target_label())
                             })),
                     ),
             )
@@ -4399,11 +4512,7 @@ impl Render for WorkApp {
                                                     .rounded_full()
                                                     .bg(cx.theme().accent)
                                                     .text_xs()
-                                                    .child(format!(
-                                                        "{} / {}",
-                                                        self.runtime_config.provider,
-                                                        self.runtime_config.model
-                                                    )),
+                                                    .child(self.execution_target_chip()),
                                             ),
                                     )
                                     .child(
@@ -4439,8 +4548,10 @@ impl Render for WorkApp {
                                                                 .value()
                                                                 .trim()
                                                                 .is_empty())
-                                                            || !self.runtime_config.ready
-                                                            || self.session.workspace.is_empty()
+                                                            || !(self.runtime_config.ready
+                                                                || self.remote_target_ready())
+                                                            || (self.session.workspace.is_empty()
+                                                                && !self.remote_target_ready())
                                                     })
                                                     .label(if self.runtime_active {
                                                         "Send Update"
@@ -4653,13 +4764,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(SettingsSection::default(), SettingsSection::Models);
-        assert_eq!(titles.len(), 7);
+        assert_eq!(titles.len(), 8);
         assert_eq!(
             titles,
             [
                 "General",
                 "Appearance",
                 "Models",
+                "Server",
                 "Agent",
                 "Skills",
                 "Workspace",

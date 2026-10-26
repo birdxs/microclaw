@@ -6,6 +6,100 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+### Removed
+
+- Dependabot version-update configuration (`.github/dependabot.yml`). The
+  grouped cargo and npm bump PRs were more noise than signal; dependency
+  updates are now done deliberately per release, as the 0.10.1 and 0.11.0
+  security updates were.
+
+### Changed
+
+- Web UI browser smoke test: one `microclaw` server per test instead of per
+  worker, and the reload test waits until the server has stored the message
+  (via `/api/history`) and navigates with `?session=` before asserting, so a
+  slow provider round-trip on CI can no longer race the reload.
+
+## 0.11.0 - 2026-10-25
+
+### Added
+
+- Web UI browser smoke test (`web/e2e`, Playwright): boots the built
+  binary with a generated web-only config, signs in, types and sends in the
+  real embedded composer, then reloads and types again; any uncaught browser
+  error fails it. A new `Web UI Browser Smoke` CI job runs it on every push,
+  so the first-keystroke crash class from #517 (shipped unnoticed in v0.8.0
+  to v0.10.0) is now caught before release. `cargo build && npm --prefix
+  web run e2e` runs it locally (#522).
+
+### Changed
+
+- Web UI: moved to `@assistant-ui/react` 0.15 (0.15.31) with
+  `@assistant-ui/react-markdown` 0.14.24. `@assistant-ui/react-ui` has no
+  release that works with 0.15 (it still imports `useThread`, see #496), so
+  the chat thread is now built directly on the `@assistant-ui/react`
+  primitives, keeping the same `aui-*` class names, a vendored base
+  stylesheet (`web/src/assistant-ui.css`) and the existing look and
+  behaviour (tool-call cards, think-segment disclosure, timestamps, approval
+  button bar, no attachments or message editing). This retires the
+  `@assistant-ui/tap` 0.9.12 override in `web/package.json` and the three
+  assistant-ui Dependabot ignores from 0.10.1 (#517).
+
+### Fixed
+
+- Web UI: tool-call cards never appeared during a run. The server publishes
+  `call_id` and `preview` on `tool_start` / `tool_result` stream events, but
+  the chat adapter still looked for `tool_use_id` / `output` and dropped the
+  events; both key names are accepted now, and `tool_start` also carries the
+  tool `input` so the card shows the arguments.
+
+## 0.10.1 - 2026-10-24
+
+### Fixed
+
+- Web UI: the first keystroke in the message composer threw
+  `Maximum update depth exceeded` and froze the page (#517). The 2026-10-05
+  dependency bump let the transitive `@assistant-ui/tap` float to 0.9.20,
+  whose `getSnapshot` loop guard fires against the unfixed
+  `@assistant-ui/core` 0.2.23 that the 0.14 line is frozen on; v0.8.0,
+  v0.9.0 and v0.10.0 all shipped that pair. `web/package.json` now pins
+  `@assistant-ui/tap` to 0.9.12 through `overrides`, and Dependabot holds it
+  there until the UI moves to `@assistant-ui/react` 0.15.
+
+### Security
+
+- Targeted dependency updates for advisories published after 0.10.0:
+  ctutils 0.4.5 (RUSTSEC-2026-0385), rustls-webpki 0.103.16
+  (RUSTSEC-2026-0382), tokio 1.54.1 (RUSTSEC-2026-0386), webpki-root-certs
+  1.0.11 (RUSTSEC-2026-0383) and webpki-roots 1.0.11 (RUSTSEC-2026-0381).
+
+## 0.10.0 - 2026-10-18
+
+### Added
+
+- Work ↔ Server pairing (roadmap Stage 4, first slice). The Web console's
+  Access tab mints single-use pairing codes; `POST /api/pairing/claim` trades
+  a code for a hashed, revocable device token (`operator.read` +
+  `operator.write`, actor `device:<id>`), listed and revoked under
+  `/api/pairing/devices`, with `GET /api/pairing/whoami` for clients to verify
+  their identity. `POST /api/runs/:run_id/cancel` cancels one run over HTTP.
+- MicroClaw Work: Settings → Server pairs with a Server, and an explicit
+  Local / Server execution target in the composer routes tasks either to the
+  embedded engine or to the paired Server with live progress, cancellation
+  and approvals. `microclaw-work-headless server "<task>"` runs one task
+  against the paired Server.
+
+### Changed
+
+- Schema v44 adds the `paired_devices` table (automatic migration).
+
+### Security
+
+- zip 2 → 9 with only the deflate feature (RUSTSEC-2026-0367/0368/0369; the
+  ClawHub installer never used `ZipArchive::extract`), rustls 0.23.46
+  (RUSTSEC-2026-0346..0349) and quinn-proto 0.11.19
+  (RUSTSEC-2026-0338/0340/0343).
+
 ## 0.9.0 - 2026-10-07
 
 ### Changed

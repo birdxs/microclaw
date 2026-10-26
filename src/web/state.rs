@@ -35,6 +35,7 @@ pub(crate) struct WebState {
     pub(crate) session_hub: SessionHub,
     pub(crate) request_hub: RequestHub,
     pub(crate) auth_hub: AuthHub,
+    pub(crate) pairing_hub: pairing::PairingHub,
     pub(crate) metrics: Arc<Mutex<WebMetrics>>,
     pub(crate) otlp: Option<Arc<OtlpMetricExporter>>,
     pub(crate) limits: WebLimits,

@@ -10,10 +10,13 @@ MicroClaw develops around a small set of durable priorities instead of promising
 
 ## Current baseline
 
-Version **v0.9.0** defines two product surfaces on one execution model. MicroClaw Server is the supported cross-platform, deployable Agent Runtime. MicroClaw Work is the local-first native GPUI desktop coworker, formally supported on Apple Silicon macOS with Linux and Windows portable previews published on every release.
+Version **v0.10.0** defines two product surfaces on one execution model. MicroClaw Server is the supported cross-platform, deployable Agent Runtime. MicroClaw Work is the local-first native GPUI desktop coworker, formally supported on Apple Silicon macOS with Linux and Windows portable previews published on every release. Since v0.10.0 a Work client can pair with a user-owned Server (revocable device credentials) and run tasks there with live progress, cancellation, and approvals.
 
 ## Active priorities
 
+- Deepen the Work ↔ Server connection: steering and attachments for remote
+  runs, Server-owned scheduling and background survival from Work, and
+  protocol tests that preserve identity, budget, audit, and cancellation.
 - Finish the macOS Work acceptance gates: clean-account install, first task,
   update/uninstall, VoiceOver, completion notification, and sustained daily use.
 - Deepen the local Workspace loop with repository orientation, clear permission

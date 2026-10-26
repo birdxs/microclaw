@@ -15,6 +15,13 @@ use microclaw_core::run_protocol::{RunId, RunRequest, SessionId};
 use microclaw_core::runtime_event::RuntimeEventEnvelope;
 use microclaw_engine as microclaw;
 use microclaw_sdk::MicroClaw;
+
+pub mod remote;
+pub use remote::{
+    MappedServerEvent, RemoteError, RemoteIdentity, RemoteRuntimeService, RemoteServerClient,
+    RemoteServerCredentials, ServerSseEvent, credentials_path, map_server_event,
+    normalize_server_url,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};

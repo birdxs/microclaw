@@ -60,6 +60,7 @@ pub async fn start_web_server(state: Arc<AppState>) {
         session_hub: SessionHub::default(),
         request_hub: RequestHub::default(),
         auth_hub: AuthHub::default(),
+        pairing_hub: pairing::PairingHub::default(),
         metrics: Arc::new(Mutex::new(WebMetrics::default())),
         otlp: state.metric_exporter.clone(),
         limits,
@@ -164,6 +165,14 @@ pub(crate) fn build_router(web_state: WebState) -> Router {
             "/api/auth/api_keys/:id/rotate",
             post(auth::api_auth_rotate_api_key),
         )
+        .route("/api/pairing/codes", post(pairing::api_pairing_create_code))
+        .route("/api/pairing/claim", post(pairing::api_pairing_claim))
+        .route("/api/pairing/devices", get(pairing::api_pairing_devices))
+        .route(
+            "/api/pairing/devices/:id",
+            axum::routing::delete(pairing::api_pairing_revoke_device),
+        )
+        .route("/api/pairing/whoami", get(pairing::api_pairing_whoami))
         .route(
             "/api/config",
             get(config::api_get_config).put(config::api_update_config),
@@ -235,6 +244,7 @@ pub(crate) fn build_router(web_state: WebState) -> Router {
         .route("/hooks/wake", post(api_hook_wake))
         .route("/api/stream", get(stream::api_stream))
         .route("/api/run_status", get(stream::api_run_status))
+        .route("/api/runs/:run_id/cancel", post(stream::api_run_cancel))
         .route("/api/reset", post(sessions::api_reset))
         .route("/api/delete_session", post(sessions::api_delete_session))
         .route("/api/skills", get(skills::api_list_skills))

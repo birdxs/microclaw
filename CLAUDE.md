@@ -56,6 +56,7 @@ Rust 2021, Tokio, teloxide 0.17, serenity 0.12, provider-agnostic LLM runtime (A
 - **API key rotation**: `api_keys` (top-level or per provider profile) forms a round-robin pool rotated on 401/403/429 (`KeyPool` in `src/llm/key_pool.rs`)
 - **Per-chat model override**: `/model here <name>` / `/provider here <alias>` scope overrides to one chat (runtime-only, key `channel#chat_id`)
 - **Interrupted-turn recovery**: interactive turns are tracked in the `active_turns` table (with a rolling `progress_text` checkpoint per tool iteration); on restart `src/turn_recovery.rs` notifies chats whose turn was killed mid-run — including how far it got — and retires orphaned sub-agent runs as `interrupted`
+- **Work ↔ Server pairing**: `src/web/pairing.rs` mints single-use codes (in-memory `PairingHub`) and trades them for hashed device tokens in `paired_devices` (schema v44, `db/pairing.rs`); `middleware.rs` resolves them to `device:<id>` actors with read+write scopes; `POST /api/runs/:run_id/cancel` is the HTTP twin of WS `chat.abort`. Work's `microclaw-work-runtime::remote` maps the Server SSE stream back onto `RuntimeEventEnvelope`s so the same session state machine drives local and remote runs
 - **Delivery outbox**: final replies whose channel send fails are queued in `outbox_messages` and redelivered with backoff by `src/outbox.rs` (supervised loop); depth surfaces in the web Governance tab
 
 ## Build & run
@@ -66,6 +67,10 @@ cargo run -- start    # requires config.yaml with at least one enabled channel p
 cargo run -- setup    # interactive setup wizard to create config.yaml
 cargo run -- help
 ```
+
+Web UI browser smoke test (Playwright, `web/e2e/`; needs `cargo build` first):
+`npm --prefix web run e2e` — boots the built binary with a web-only config and
+types/sends in the real embedded composer. See `docs/operations/web-ui.md`.
 
 ## Configuration
 

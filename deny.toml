@@ -37,6 +37,11 @@ yanked = "deny"
 #   local documents, not untrusted network XML. Remove once typst's chain
 #   moves to quick-xml 0.41+.
 #
+# RUSTSEC-2024-0449: `unsafe-libyaml` is unmaintained — transitive via
+#   serde_yaml 0.9 (itself archived upstream), which the config, Work runtime
+#   and engine still parse with. Moving to a maintained YAML crate is a
+#   separate migration; the advisory is informational (no vulnerability).
+#
 # RUSTSEC-2026-0319: `anymap2` is unmaintained (replacement: anymap3) —
 #   transitive via matrix-sdk 0.19 only (non-default `channel-matrix`); no
 #   first-party use and no safe upgrade until matrix-sdk drops it.
@@ -55,6 +60,7 @@ ignore = [
   "RUSTSEC-2026-0192",
   "RUSTSEC-2026-0206",
   "RUSTSEC-2026-0319",
+  "RUSTSEC-2024-0449",
 ]
 
 [bans]
