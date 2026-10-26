@@ -6,6 +6,13 @@ The format is loosely based on Keep a Changelog. Dates use UTC.
 
 ## Unreleased
 
+### Removed
+
+- Dependabot version-update configuration (`.github/dependabot.yml`). The
+  grouped cargo and npm bump PRs were more noise than signal; dependency
+  updates are now done deliberately per release, as the 0.10.1 and 0.11.0
+  security updates were.
+
 ### Changed
 
 - Web UI browser smoke test: one `microclaw` server per test instead of per
